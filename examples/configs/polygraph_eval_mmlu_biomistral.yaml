@@ -1,0 +1,66 @@
+# Hydra configuration: defines output directory structure
+# Output will be saved to: ${cache_path}/${task}/${model.path}/${dataset}/${date}/${time}
+hydra:
+  run:
+    dir: ${cache_path}/${task}/${model.path}/${dataset}/${now:%Y-%m-%d}/${now:%H-%M-%S}
+
+# Default configurations to include (merged with this file)
+defaults:
+  - model: biomistral-7b              # Model configuration (device, loading args, etc.)
+  - estimators: default_estimators # Uncertainty estimation methods to evaluate
+  - stat_calculators: auto_only       # Disable training-stat calculator (auto calculators only)
+  - base_processing_mmlu           # Dataset-specific processing functions to extract answer letters
+  - _self_                         # Include this config file
+# Add this section to override the default estimators
+estimators:
+  - name: MaximumSequenceProbability
+  - name: Perplexity
+  - name: MeanTokenEntropy
+  - name: SemanticEntropy
+
+# Paths and directories
+cache_path: ./workdir/output        # Base directory for experiment outputs
+save_path: '${hydra:run.dir}'       # Where to save results (uses Hydra's run directory)
+
+# Task configuration
+task: qa                            # Task type: "qa" (question answering), "ats" (summarization), "nmt" (translation)
+instruct: true                     # Whether model is instruction-tuned (affects prompt formatting)
+
+# Dataset configuration
+# MMLU dataset from HuggingFace - uses pre-built dataset format
+# The dataset provides question + choices as input and answer (A/B/C/D) as output
+dataset: ['LM-Polygraph/mmlu', 'simple_instruct']
+text_column: input                  # Input column name (contains formatted question + choices)
+label_column: output                # Output column name (contains answer: A, B, C, or D)
+train_split: train                  # Training split name (for few-shot examples)
+eval_split: test                    # Evaluation split name
+load_from_disk: false               # Load dataset from local disk (false = download from HF)
+size: null                          # Max dataset size (null = use all)
+max_prompt_tokens: 1200              # Drop inputs longer than this many tokens
+
+# Text generation configuration
+max_new_tokens: 3                   # Maximum tokens to generate per input (just need A, B, C, or D)
+generation_params:                   # Additional generation parameters
+  stop_strings:                     # Stop generation when these strings are encountered
+    - "\n"
+
+# Evaluation configuration
+subsample_eval_dataset: -1           # Number of samples to evaluate (-1 = use all)
+batch_size: 8                          # Batch size for processing (single GPU: 4-16 for small models, 1-4 for large models)
+
+# Metrics configuration
+generation_metrics:                  # Use Accuracy metric to compare LLM output with answer
+  - name: AccuracyMetric
+
+# Error handling
+ignore_exceptions: false            # Continue on errors (false = stop on first error)
+output_attentions: false            # Don't request full attention tensors from stat calculators
+
+# Weights & Biases (wandb) integration
+report_to_wandb: true              # Set to true to log results to wandb (default project: "my-polygraph-project", or set WANDB_PROJECT env var)
+# Wandb API key should be set in .wandb_config.yaml file in the project root, or use wandb login
+
+# Reproducibility
+seed:                               # Random seeds for reproducibility (runs once per seed)
+    - 1
+
