@@ -276,6 +276,342 @@ class Dataset:
                     y.append(inst.get("answer_idx", ""))
             
             log.info(f"Formatted {len(x)} MedQA samples")
+        elif "gsm8k-mc" in dataset_name.lower() or (isinstance(dataset_path, str) and "gsm8k-mc" in dataset_path.lower()):
+            # Special handling for GSM8K-MC format
+            # Format: Question, A, B, C, D, Answer columns (separate columns, not dict)
+            log.info("Detected GSM8K-MC dataset format, formatting question and options")
+            x, y = [], []
+            for inst in dataset:
+                # Get question and options from separate columns
+                question = inst.get("Question", inst.get("question", ""))
+                option_a = inst.get("A", "")
+                option_b = inst.get("B", "")
+                option_c = inst.get("C", "")
+                option_d = inst.get("D", "")
+                
+                # Format the prompt
+                if prompt:
+                    formatted_input = prompt.format(
+                        question=question.strip() if question else "",
+                        option_a=option_a if option_a else "",
+                        option_b=option_b if option_b else "",
+                        option_c=option_c if option_c else "",
+                        option_d=option_d if option_d else "",
+                        text=question.strip() if question else "",  # For backward compatibility
+                    )
+                else:
+                    # Default format if no prompt provided
+                    formatted_input = (
+                        f"Q: {question.strip() if question else ''}\n"
+                        f"A. {option_a if option_a else ''}\n"
+                        f"B. {option_b if option_b else ''}\n"
+                        f"C. {option_c if option_c else ''}\n"
+                        f"D. {option_d if option_d else ''}\n"
+                    )
+                
+                if description:
+                    formatted_input = description + "\n\n" + formatted_input
+                
+                x.append(formatted_input)
+                
+                # Use Answer column as target (A, B, C, or D)
+                if y_column:
+                    answer = inst.get(y_column, inst.get("Answer", inst.get("answer", "")))
+                    y.append(answer)
+                else:
+                    y.append(inst.get("Answer", inst.get("answer", "")))
+            
+            log.info(f"Formatted {len(x)} GSM8K-MC samples")
+        elif "ai2_arc" in dataset_name.lower() or (isinstance(dataset_path, str) and "ai2_arc" in dataset_path.lower()) or (isinstance(dataset_path, list) and any("ai2_arc" in str(p).lower() for p in dataset_path)):
+            # Special handling for ARC dataset format
+            # Format: question, choices (dict with A, B, C, D, etc.), answerKey
+            log.info("Detected ARC dataset format, formatting question and options")
+            x, y = [], []
+            valid_answer_keys = {"A", "B", "C", "D"}
+            skipped_count = 0
+            
+            for inst in dataset:
+                # Get answer key and filter to only A, B, C, D
+                answer_key = inst.get("answerKey", "")
+                if answer_key not in valid_answer_keys:
+                    skipped_count += 1
+                    continue
+                
+                # Get question and choices
+                question = inst.get("question", "")
+                choices = inst.get("choices", {})
+                
+                # Extract options - ARC dataset format: choices is a dict with "label" and "text" lists
+                # Format: {"label": ["A", "B", "C", "D"], "text": ["option1", "option2", "option3", "option4"]}
+                option_a = ""
+                option_b = ""
+                option_c = ""
+                option_d = ""
+                
+                if isinstance(choices, dict):
+                    # Check if it's the ARC format with "label" and "text" lists
+                    if "label" in choices and "text" in choices and isinstance(choices["label"], list):
+                        # ARC format: {"label": ["A", "B", "C", "D"], "text": ["...", "...", "...", "..."]}
+                        labels = choices.get("label", [])
+                        texts = choices.get("text", [])
+                        for label, text in zip(labels, texts):
+                            if label == "A":
+                                option_a = text
+                            elif label == "B":
+                                option_b = text
+                            elif label == "C":
+                                option_c = text
+                            elif label == "D":
+                                option_d = text
+                    elif isinstance(choices, list):
+                        # Format: [{"label": "A", "text": "..."}, {"label": "B", "text": "..."}, ...]
+                        for choice in choices:
+                            if isinstance(choice, dict):
+                                label = choice.get("label", "")
+                                text = choice.get("text", "")
+                                if label == "A":
+                                    option_a = text
+                                elif label == "B":
+                                    option_b = text
+                                elif label == "C":
+                                    option_c = text
+                                elif label == "D":
+                                    option_d = text
+                    else:
+                        # Format: {"A": "...", "B": "...", ...}
+                        option_a = choices.get("A", "")
+                        option_b = choices.get("B", "")
+                        option_c = choices.get("C", "")
+                        option_d = choices.get("D", "")
+                
+                # Format the prompt
+                # Support both old format (option_a, option_b, etc.) and new bayesian-peft format (choices)
+                if prompt:
+                    # Check if prompt uses {choices} format (bayesian-peft style)
+                    if "{choices}" in prompt:
+                        # Format choices as "A) option_text\nB) option_text\n..." to match bayesian-peft
+                        choices_list = []
+                        for label, text in [("A", option_a), ("B", option_b), ("C", option_c), ("D", option_d)]:
+                            if text:  # Only include if option text is not empty
+                                choices_list.append(f"{label}) {text}")
+                        choices_str = "\n".join(choices_list)
+                        formatted_input = prompt.format(
+                            question=question.strip() if question else "",
+                            choices=choices_str,
+                            # Also support old format for backward compatibility
+                            option_a=option_a if option_a else "",
+                            option_b=option_b if option_b else "",
+                            option_c=option_c if option_c else "",
+                            option_d=option_d if option_d else "",
+                            text=question.strip() if question else "",
+                        )
+                    else:
+                        # Old format with individual options
+                        formatted_input = prompt.format(
+                            question=question.strip() if question else "",
+                            option_a=option_a if option_a else "",
+                            option_b=option_b if option_b else "",
+                            option_c=option_c if option_c else "",
+                            option_d=option_d if option_d else "",
+                            text=question.strip() if question else "",  # For backward compatibility
+                        )
+                else:
+                    # Default format: use bayesian-peft style as default for ARC
+                    choices_list = []
+                    for label, text in [("A", option_a), ("B", option_b), ("C", option_c), ("D", option_d)]:
+                        if text:
+                            choices_list.append(f"{label}) {text}")
+                    choices_str = "\n".join(choices_list)
+                    formatted_input = (
+                        f"Return the label of the correct answer for the question below.\n\n"
+                        f"Question: {question.strip() if question else ''}\n"
+                        f"Choices:\n{choices_str}\n"
+                        f"Answer:"
+                    )
+                
+                if description:
+                    formatted_input = description + "\n\n" + formatted_input
+                
+                x.append(formatted_input)
+                
+                # Use answerKey as target (A, B, C, or D)
+                if y_column:
+                    y.append(inst.get(y_column, answer_key))
+                else:
+                    y.append(answer_key)
+            
+            log.info(f"Formatted {len(x)} ARC samples (skipped {skipped_count} with answer keys other than A, B, C, D)")
+        elif "medmcqa" in dataset_name.lower() or (isinstance(dataset_path, str) and "medmcqa" in dataset_path.lower()):
+            # Special handling for MedMCQA dataset format
+            # Format: question + opa/opb/opc/opd as options, cop (0-3) as correct answer
+            log.info("Detected MedMCQA dataset format, formatting question and options")
+            x, y = [], []
+            option_map = {0: "A", 1: "B", 2: "C", 3: "D"}
+            skipped_count = 0
+            
+            # Log first example to debug structure
+            if len(dataset) > 0:
+                first_example = dataset[0]
+                log.info(f"MedMCQA dataset sample keys: {list(first_example.keys())}")
+                log.info(f"MedMCQA first example sample: {first_example}")
+            
+            # Count cop value distribution for debugging
+            cop_distribution = {}
+            for inst in dataset:
+                cop = inst.get("cop", None)
+                if cop is not None:
+                    cop_distribution[cop] = cop_distribution.get(cop, 0) + 1
+            if cop_distribution:
+                log.info(f"MedMCQA cop value distribution: {cop_distribution}")
+                log.info(f"Note: cop=-1 indicates no answer/unknown. Only cop values 0-3 (A-D) are valid.")
+            
+            for inst in dataset:
+                # Format the question and options
+                # Try multiple possible column names
+                question = inst.get("question", inst.get("Question", ""))
+                
+                # Try different option column name variations
+                option_a = inst.get("opa", inst.get("option_a", inst.get("A", "")))
+                option_b = inst.get("opb", inst.get("option_b", inst.get("B", "")))
+                option_c = inst.get("opc", inst.get("option_c", inst.get("C", "")))
+                option_d = inst.get("opd", inst.get("option_d", inst.get("D", "")))
+                
+                # Get correct option (cop is 0, 1, 2, 3 for A, B, C, D)
+                # Note: cop = -1 means "no answer" or "unknown" and should be skipped
+                # Try multiple possible column names
+                cop = inst.get("cop", inst.get("correct_idx", inst.get("correct_option", None)))
+                if cop is not None:
+                    # Convert 0-3 to A-D
+                    # Handle both int and string representations
+                    if isinstance(cop, str):
+                        try:
+                            cop = int(cop)
+                        except (ValueError, TypeError):
+                            cop = None
+                    # Skip if cop is -1 (no answer) or not in valid range (0-3)
+                    if cop == -1:
+                        skipped_count += 1
+                        continue
+                    if cop is not None and cop in option_map:
+                        answer_letter = option_map[cop]
+                    else:
+                        skipped_count += 1
+                        continue
+                else:
+                    # Fallback to answer_idx if cop is not available
+                    answer_idx = inst.get("answer_idx", inst.get("answer", ""))
+                    if isinstance(answer_idx, int):
+                        if answer_idx in option_map:
+                            answer_letter = option_map[answer_idx]
+                        else:
+                            skipped_count += 1
+                            continue
+                    elif isinstance(answer_idx, str) and answer_idx.upper() in ["A", "B", "C", "D"]:
+                        answer_letter = answer_idx.upper()
+                    else:
+                        skipped_count += 1
+                        continue
+                
+                # Skip if we don't have valid question or options
+                if not question or not (option_a or option_b or option_c or option_d):
+                    skipped_count += 1
+                    continue
+                
+                # Format the prompt
+                # Support both old format (option_a, option_b, etc.) and new bayesian-peft format (choices)
+                if prompt:
+                    # Check if prompt uses {choices} format (bayesian-peft style)
+                    if "{choices}" in prompt:
+                        # Format choices as "A) option_text\nB) option_text\n..." to match bayesian-peft
+                        choices_list = []
+                        for label, text in [("A", option_a), ("B", option_b), ("C", option_c), ("D", option_d)]:
+                            if text:  # Only include if option text is not empty
+                                choices_list.append(f"{label}) {text}")
+                        choices_str = "\n".join(choices_list)
+                        try:
+                            formatted_input = prompt.format(
+                                question=question.strip() if question else "",
+                                choices=choices_str,
+                                # Also support old format for backward compatibility
+                                option_a=option_a if option_a else "",
+                                option_b=option_b if option_b else "",
+                                option_c=option_c if option_c else "",
+                                option_d=option_d if option_d else "",
+                                text=question.strip() if question else "",
+                            )
+                        except KeyError as e:
+                            log.warning(f"Prompt format error: {e}, using default format")
+                            formatted_input = (
+                                f"Q: {question.strip() if question else ''}\n"
+                                f"A. {option_a if option_a else ''}\n"
+                                f"B. {option_b if option_b else ''}\n"
+                                f"C. {option_c if option_c else ''}\n"
+                                f"D. {option_d if option_d else ''}\n"
+                            )
+                    else:
+                        # Old format with individual options
+                        try:
+                            formatted_input = prompt.format(
+                                question=question.strip() if question else "",
+                                option_a=option_a if option_a else "",
+                                option_b=option_b if option_b else "",
+                                option_c=option_c if option_c else "",
+                                option_d=option_d if option_d else "",
+                                text=question.strip() if question else "",  # For backward compatibility
+                            )
+                        except KeyError as e:
+                            log.warning(f"Prompt format error: {e}, using default format")
+                            formatted_input = (
+                                f"Q: {question.strip() if question else ''}\n"
+                                f"A. {option_a if option_a else ''}\n"
+                                f"B. {option_b if option_b else ''}\n"
+                                f"C. {option_c if option_c else ''}\n"
+                                f"D. {option_d if option_d else ''}\n"
+                            )
+                else:
+                    # Default format: use bayesian-peft style as default
+                    choices_list = []
+                    for label, text in [("A", option_a), ("B", option_b), ("C", option_c), ("D", option_d)]:
+                        if text:
+                            choices_list.append(f"{label}) {text}")
+                    choices_str = "\n".join(choices_list)
+                    formatted_input = (
+                        f"Answer the multiple choice question below by returning the answer label (A to D)\n\n"
+                        f"Question: {question.strip() if question else ''}\n"
+                        f"Choices:\n{choices_str}\n"
+                        f"Answer:"
+                    )
+                
+                if description:
+                    formatted_input = description + "\n\n" + formatted_input
+                
+                x.append(formatted_input)
+                
+                # Use answer_letter as target (A, B, C, or D)
+                y.append(answer_letter)
+            
+            if len(x) == 0:
+                # Check if all samples had cop=-1 (no answer)
+                all_cop_neg_one = all(
+                    inst.get("cop", None) == -1 
+                    for inst in dataset
+                )
+                if all_cop_neg_one:
+                    raise ValueError(
+                        f"No valid MedMCQA samples found. All {skipped_count} samples have cop=-1 (no answer). "
+                        f"The '{split}' split may not have labels. "
+                        f"Try using '--split validation' or '--split train' instead, "
+                        f"or check if the dataset split has labeled examples."
+                    )
+                else:
+                    raise ValueError(
+                        f"No valid MedMCQA samples found after processing. "
+                        f"Skipped {skipped_count} samples. "
+                        f"Please check the dataset format and column names. "
+                        f"Expected cop values: 0, 1, 2, 3 (for A, B, C, D). "
+                        f"cop=-1 indicates no answer and is skipped."
+                    )
+            log.info(f"Formatted {len(x)} MedMCQA samples (skipped {skipped_count} invalid samples)")
         else:
             # Convert to lists to ensure we only have the selected samples
             # This is important because dataset[x_column] on a lazy dataset might access all rows
