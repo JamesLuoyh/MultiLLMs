@@ -379,7 +379,7 @@ class BlackboxModel(Model):
                 # Store the last response for later use
                 self.last_response = response
 
-        elif (self.hf_api_token is not None) & (self.model_path is not None):
+        elif (self.hf_api_token is not None) and (self.model_path is not None):
             for prompt in input_texts:
                 start = time.time()
                 while True:
@@ -391,7 +391,7 @@ class BlackboxModel(Model):
                     output = self._query(messages)
 
                     if isinstance(output, dict):
-                        if (list(output.keys())[0] == "error") & (
+                        if (list(output.keys())[0] == "error") and (
                             "estimated_time" in output.keys()
                         ):
                             estimated_time = float(output["estimated_time"])
@@ -400,7 +400,7 @@ class BlackboxModel(Model):
                                 f"{output['error']}. Estimated time: {round(estimated_time - elapsed_time, 2)} sec."
                             )
                             time.sleep(5)
-                        elif (list(output.keys())[0] == "error") & (
+                        elif (list(output.keys())[0] == "error") and (
                             "estimated_time" not in output.keys()
                         ):
                             log.error(f"{output['error']}")
@@ -552,9 +552,7 @@ class WhiteboxModel(Model):
         Returns:
             ModelOutput: HuggingFace generation output with scores overriden with original probabilities.
         """
-        print(f"[DEBUG generate] Called with args keys: {list(args.keys())}", file=sys.stderr, flush=True)
         default_params = asdict(self.generation_parameters)
-        print(f"[DEBUG generate] Default params keys: {list(default_params.keys())}", file=sys.stderr, flush=True)
 
         # add ScoresProcessor to collect original scores
         processor = self._ScoresProcessor()
@@ -574,18 +572,11 @@ class WhiteboxModel(Model):
             args["tokenizer"] = self.tokenizer
 
         args = self._validate_args(args)
-        print(f"[DEBUG generate] About to call self.model.generate() with max_new_tokens={args.get('max_new_tokens', 'not set')}", file=sys.stderr, flush=True)
-        print(f"[DEBUG generate] Input shape: {args.get('input_ids', 'N/A').shape if hasattr(args.get('input_ids', None), 'shape') else 'N/A'}", file=sys.stderr, flush=True)
-        import time
-        gen_start = time.time()
         generation = self.model.generate(**args)
-        gen_elapsed = time.time() - gen_start
-        print(f"[DEBUG generate] Model.generate() completed in {gen_elapsed:.2f} seconds", file=sys.stderr, flush=True)
 
         # override generation.scores with original scores from model
         generation.generation_scores = generation.scores
         generation.scores = processor.scores
-        print(f"[DEBUG generate] Returning generation output", file=sys.stderr, flush=True)
 
         return generation
 
@@ -598,33 +589,20 @@ class WhiteboxModel(Model):
         Return:
             List[str]: corresponding model generations. Have the same length as `input_texts`.
         """
-        import sys
-        # DEBUG: Log tool_manager status at the start
-        print(f"[DEBUG WhiteboxModel.generate_texts] ENTRY: input_texts count={len(input_texts)}, "
-              f"tool_manager={self.tool_manager is not None}, "
-              f"has_tools={self.tool_manager.has_tools() if self.tool_manager else False}, "
-              f"tool_mandatory={self.tool_mandatory}, tool_name={self.tool_name}", 
-              file=sys.stderr, flush=True)
-        
         # Check if tool calling is enabled (backward compatible - only if tools are configured)
         # Use get() first to check, then pop() only if needed to avoid modifying args unnecessarily
         use_tools = args.get("use_tools", None)
-        print(f"[DEBUG WhiteboxModel.generate_texts] use_tools from args: {use_tools}", file=sys.stderr, flush=True)
         
         if use_tools is None:
             # Default: use tools only if tool_manager is set and has tools
             # When tool_manager is None (no tools configured), this will be False
             use_tools = self.tool_manager is not None and self.tool_manager.has_tools()
-            print(f"[DEBUG WhiteboxModel.generate_texts] use_tools computed from tool_manager: {use_tools}", file=sys.stderr, flush=True)
         else:
             # Remove use_tools from args if it was explicitly provided
             args.pop("use_tools")
-            print(f"[DEBUG WhiteboxModel.generate_texts] use_tools was explicitly set to: {use_tools}", file=sys.stderr, flush=True)
         
         # Only use tool calling workflow if tools are configured and enabled
         if use_tools and self.tool_manager is not None and self.tool_manager.has_tools():
-            print(f"[DEBUG WhiteboxModel.generate_texts] ===== USING TOOL CALLING WORKFLOW =====", file=sys.stderr, flush=True)
-            print(f"[DEBUG WhiteboxModel.generate_texts] tool_manager.tools: {[t.get_name() for t in self.tool_manager.tools]}", file=sys.stderr, flush=True)
             
             # Use tool calling workflow
             results = []
@@ -662,42 +640,20 @@ class WhiteboxModel(Model):
                     log.info(f"No tool used for input {i}")
             
             return results
-        else:
-            print(f"[DEBUG WhiteboxModel.generate_texts] ===== SKIPPING TOOL CALLING =====", file=sys.stderr, flush=True)
-            print(f"[DEBUG WhiteboxModel.generate_texts] Reason: use_tools={use_tools}, "
-                  f"tool_manager={self.tool_manager is not None}, "
-                  f"has_tools={self.tool_manager.has_tools() if self.tool_manager else False}", 
-                  file=sys.stderr, flush=True)
-            print(f"[DEBUG WhiteboxModel.generate_texts] Continuing with normal generation path for {len(input_texts)} inputs", file=sys.stderr, flush=True)
         
         # Normal generation path (backward compatible - no tools)
         # Apply default parameters first, then override with provided args
-        print(f"[DEBUG generate_texts] Step 1: Getting default params", file=sys.stderr, flush=True)
         default_params = asdict(self.generation_parameters)
-        print(f"[DEBUG generate_texts] Step 2: Updating with args, args keys: {list(args.keys())}", file=sys.stderr, flush=True)
         default_params.update(args)
-        print(f"[DEBUG generate_texts] Step 3: Validating args", file=sys.stderr, flush=True)
         args = self._validate_args(default_params)
-        print(f"[DEBUG generate_texts] Step 4: Setting return_dict_in_generate=True", file=sys.stderr, flush=True)
 
         args["return_dict_in_generate"] = True
-        print(f"[DEBUG generate_texts] Step 5: Tokenizing {len(input_texts)} inputs", file=sys.stderr, flush=True)
         batch: Dict[str, torch.Tensor] = self.tokenize(input_texts)
-        print(f"[DEBUG generate_texts] Step 6: Moving batch to device {self.device()}", file=sys.stderr, flush=True)
         batch = {k: v.to(self.device()) for k, v in batch.items()}
-        print(f"[DEBUG generate_texts] Step 7: Calling model.generate() with batch shape {batch['input_ids'].shape}", file=sys.stderr, flush=True)
-        print(f"[DEBUG generate_texts] Generation args: max_new_tokens={args.get('max_new_tokens', 'not set')}, other keys: {[k for k in args.keys() if k not in ['input_ids', 'attention_mask', 'return_dict_in_generate']]}", file=sys.stderr, flush=True)
-        print(f"[DEBUG generate_texts] About to call self.generate() - this may take a while...", file=sys.stderr, flush=True)
         try:
-            import time
-            start_time = time.time()
             generation_output = self.generate(**batch, **args)
-            elapsed_time = time.time() - start_time
-            print(f"[DEBUG generate_texts] Step 8: Generation completed in {elapsed_time:.2f} seconds, getting sequences", file=sys.stderr, flush=True)
             sequences = generation_output.sequences.cpu()
-            print(f"[DEBUG generate_texts] Step 9: Sequences shape: {sequences.shape}", file=sys.stderr, flush=True)
         except Exception as e:
-            print(f"[DEBUG generate_texts] ERROR in generation: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
             import traceback
             traceback.print_exc(file=sys.stderr)
             raise
@@ -708,20 +664,14 @@ class WhiteboxModel(Model):
         if self.tokenizer.chat_template is not None:
             decode_args["skip_special_tokens"] = True
 
-        print(f"[DEBUG generate_texts] Generated {len(sequences)} sequences, decoding...", file=sys.stderr, flush=True)
         for i, seq in enumerate(sequences):
             if self.model_type == "CausalLM":
                 decoded = self.tokenizer.decode(seq[input_len:], **decode_args)
                 texts.append(decoded)
-                if i == 0:
-                    print(f"[DEBUG generate_texts] First decoded text (first 200 chars): {decoded[:200]}", file=sys.stderr, flush=True)
             else:
                 decoded = self.tokenizer.decode(seq[1:], **decode_args)
                 texts.append(decoded)
-                if i == 0:
-                    print(f"[DEBUG generate_texts] First decoded text (first 200 chars): {decoded[:200]}", file=sys.stderr, flush=True)
 
-        print(f"[DEBUG generate_texts] Returning {len(texts)} decoded texts", file=sys.stderr, flush=True)
         return texts
 
     def __call__(self, **args):
@@ -817,9 +767,18 @@ class WhiteboxModel(Model):
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
 
+        # Use the model's generation_config (if available) as the native config
+        # rather than calling dataclasses.asdict on model.config, which is not
+        # a dataclass for most HF models.
+        if hasattr(model, "generation_config") and model.generation_config is not None:
+            native_cfg = model.generation_config.to_dict()
+        else:
+            # Fallback: use the underlying config's __dict__ as a best-effort.
+            native_cfg = dict(getattr(model, "config", {}).__dict__)
+
         generation_params = GenerationParametersFactory.from_params(
             yaml_config=generation_params,
-            native_config=asdict(model.config),
+            native_config=native_cfg,
         )
 
         instance = WhiteboxModel(
@@ -848,6 +807,7 @@ class WhiteboxModel(Model):
         if self.instruct:
             # Check if tokenizer has a chat template
             if hasattr(self.tokenizer, 'chat_template') and self.tokenizer.chat_template is not None:
+                log.debug(f"Applying chat template (instruct=True, has_chat_template=True)")
                 formatted_texts = []
                 for chat in texts:
                     if isinstance(chat, str):
@@ -857,6 +817,9 @@ class WhiteboxModel(Model):
                             chat, add_generation_prompt=True, tokenize=False
                         )
                         formatted_texts.append(formatted_chat)
+                        # Log first example to show chat template format
+                        if len(formatted_texts) == 1:
+                            log.debug(f"Chat template applied. First example preview (first 200 chars): {formatted_chat[:200]}...")
                     except (ValueError, TypeError) as e:
                         # If chat template fails (e.g., doesn't support tools), fall back to plain text
                         log.warning(f"Chat template application failed: {e}. Falling back to plain text formatting.")
@@ -868,6 +831,8 @@ class WhiteboxModel(Model):
                 # This can happen with base models - log a warning and proceed with plain text
                 log.warning("instruct=True but tokenizer has no chat_template. Using plain text formatting.")
                 add_start_symbol = True
+        else:
+            log.debug(f"Not applying chat template (instruct=False)")
         return self.tokenizer(
             texts,
             padding=True,
