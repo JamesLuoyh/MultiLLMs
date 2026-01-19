@@ -1,0 +1,36 @@
+# Cursor Agent Configuration
+
+## Virtual Environment
+- Always use the virtual environment at `.venv/bin/activate` when running Python commands or scripts
+- When executing terminal commands that require Python, prefix them with `source .venv/bin/activate &&` or use `.venv/bin/python` directly
+- For shell scripts, ensure the virtual environment is activated before running Python code
+
+## Python Interpreter
+- Default Python interpreter: `.venv/bin/python`
+- Use `.venv/bin/python` instead of `python` or `python3` when executing Python scripts directly
+
+## Command Execution
+- When running commands that need the virtual environment:
+  - Use: `source .venv/bin/activate && <command>`
+  - Or use: `.venv/bin/python <script.py>`
+  - Or use: `.venv/bin/pip` for package management
+
+## CUDA_VISIBLE_DEVICES
+- **IMPORTANT**: When using `CUDA_VISIBLE_DEVICES` with virtual environment activation, set it RIGHT BEFORE the `python` command, NOT before `source`
+- **CORRECT**: `source .venv/bin/activate && CUDA_VISIBLE_DEVICES=2,3 python <script.py>`
+- **INCORRECT**: `CUDA_VISIBLE_DEVICES=2,3 source .venv/bin/activate && python <script.py>` (this will use all GPUs)
+- The environment variable must be set in the same command as the Python process to properly restrict GPU visibility
+
+## Large File Storage
+- **CRITICAL**: All large files must be stored in `/common/users/yl2310/MultiLLMs` instead of the home disk
+- This includes:
+  - **Checkpoints**: Model training checkpoints, wagering checkpoints, etc.
+  - **Caches**: Hugging Face model caches, dataset caches, evaluation caches
+  - **Datasets**: Downloaded or processed datasets
+  - **Models**: Downloaded model files, fine-tuned models
+- When configuring paths in code or config files:
+  - Use `/common/users/yl2310/MultiLLMs` as the base directory for large file storage
+  - Set `cache_path`, `hf_cache`, checkpoint paths, and dataset paths to subdirectories under `/common/users/yl2310/MultiLLMs`
+  - Example: `cache_path: /common/users/yl2310/MultiLLMs/cache` or `hf_cache: /common/users/yl2310/MultiLLMs/hf_cache`
+
+
