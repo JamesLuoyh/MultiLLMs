@@ -306,7 +306,7 @@ def main(args):
             if dataset.images is not None:
                 dataset.images = dataset.images[skip_first:]
 
-        max_prompt_tokens = getattr(args, "max_prompt_tokens", None)
+        max_prompt_tokens = getattr(args, "max_prompt_tokens", 1200)
         if max_prompt_tokens is not None and max_prompt_tokens > 0:
             log.info(f"Dropping samples longer than {max_prompt_tokens} tokens")
             tokenizer = getattr(model, "tokenizer", None)
@@ -788,17 +788,25 @@ def get_whitebox_model(args, cache_kwargs={}):
             "Loading model by directly passing the path to the model is deprecated and will be removed in the next release. Please use loading script instead."
         )
         log.info(f"Loading model with cache_kwargs: {cache_kwargs}")
+        instruct_param = getattr(args, "instruct", False)
+        log.info(f"Loading model with instruct parameter: {instruct_param}")
         model = WhiteboxModel.from_pretrained(
             args.model.path,
             getattr(args, "generation_params", {}),
             device_map=args.model.load_model_args.device_map,
             add_bos_token=getattr(args.model, "add_bos_token", True),
-            instruct=getattr(args, "instruct", False),
+            instruct=instruct_param,
             tool_manager=tool_manager,
             tool_mandatory=tool_mandatory,
             tool_name=tool_name,
             **cache_kwargs,
         )
+        # Log chat template status after loading
+        if instruct_param and hasattr(model.tokenizer, 'chat_template'):
+            has_chat_template = model.tokenizer.chat_template is not None
+            log.info(f"Model loaded. Tokenizer has chat_template: {has_chat_template}")
+            if not has_chat_template:
+                log.warning("WARNING: instruct=True but tokenizer has no chat_template. Chat template will NOT be applied!")
         return model
 
     path_to_load_script = get_abs_path_from_hydra_config(args.model.path_to_load_script)
@@ -844,9 +852,20 @@ def get_whitebox_model(args, cache_kwargs={}):
         native_config=base_model.generation_config.to_dict()
     )
 
-    log.info(f"Creating WhiteboxModel with tool_manager={tool_manager is not None}, "
-            f"has_tools={tool_manager.has_tools() if tool_manager else False}, "
-            f"tool_mandatory={tool_mandatory}, tool_name={tool_name}")
+    instruct_param = getattr(args, "instruct", False)
+    log.info(f"Creating WhiteboxModel with:")
+    log.info(f"  - instruct parameter: {instruct_param}")
+    log.info(f"  - tool_manager: {tool_manager is not None}")
+    log.info(f"  - has_tools: {tool_manager.has_tools() if tool_manager else False}")
+    log.info(f"  - tool_mandatory: {tool_mandatory}")
+    log.info(f"  - tool_name: {tool_name}")
+    
+    # Check if tokenizer has chat template when instruct=True
+    if instruct_param:
+        has_chat_template = hasattr(tokenizer, 'chat_template') and tokenizer.chat_template is not None
+        log.info(f"  - tokenizer has chat_template: {has_chat_template}")
+        if not has_chat_template:
+            log.warning("WARNING: instruct=True but tokenizer has no chat_template. Chat template will NOT be applied!")
 
     model = WhiteboxModel(
         base_model,
@@ -854,7 +873,7 @@ def get_whitebox_model(args, cache_kwargs={}):
         args.model.path,
         args.model.type,
         generation_params,
-        instruct=getattr(args, "instruct", False),
+        instruct=instruct_param,
         tool_manager=tool_manager,
         tool_mandatory=tool_mandatory,
         tool_name=tool_name,
