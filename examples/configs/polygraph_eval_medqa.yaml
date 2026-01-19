@@ -21,7 +21,7 @@ text_column: question  # Used to detect MedQA format, actual input will be forma
 label_column: answer_idx  # The correct answer (A, B, C, or D) - this is what we compare against
 train_split: train
 eval_split: test
-max_new_tokens: 3  # Just need to output A, B, C, or D
+max_new_tokens: 1  # Force single-letter response (A, B, C, or D)
 load_from_disk: false
 size: 100  # Use a smaller subset for testing, set to null for full dataset
 generation_params:
@@ -29,12 +29,11 @@ generation_params:
     - "\n"
 
 # Optional: Custom prompt template for formatting question and options
-# If not provided, default format will be used:
-# "Q: {question}\nA. {option_a}\nB. {option_b}\nC. {option_c}\nD. {option_d}\n"
-prompt: "Q:{question}\nA. {option_a}\nB. {option_b}\nC. {option_c}\nD. {option_d}\nAnswer:"
+# Updated to explicitly request single-letter response for better accuracy alignment
+prompt: "Q:{question}\nA. {option_a}\nB. {option_b}\nC. {option_c}\nD. {option_d}\nAnswer with only the letter (A, B, C, or D):"
 
 # Optional: Description to prepend to each question
-description: "The following are multiple choice questions (with answers) about medical knowledge."
+description: "The following are multiple choice questions (with answers) about medical knowledge. Answer with only the letter (A, B, C, or D), nothing else."
 
 subsample_eval_dataset: -1
 
