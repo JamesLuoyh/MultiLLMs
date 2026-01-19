@@ -103,6 +103,13 @@ This document describes all parameters available in `polygraph_eval` configurati
 - **Example**: `10000` or `null`
 - **Default**: `null`
 
+### `max_prompt_tokens`
+- **Type**: Integer
+- **Description**: Maximum number of tokens allowed per prompt. Samples with prompts exceeding this limit will be automatically filtered out before processing. This prevents out-of-memory errors and input length issues, particularly useful for datasets like MMLU which may contain questions with 5000+ tokens.
+- **Example**: `1200` (filters questions longer than 1200 tokens)
+- **Default**: `1200`
+- **Note**: The token count is calculated using the model's tokenizer. If no tokenizer is available, word count is used as an approximation. This parameter is applied consistently across `polygraph_eval`, `run_mmlu_hidden_state_lr.py`, and `run_multi_llm_ensemble.py` scripts.
+
 ## Few-Shot Learning Configuration
 
 ### `n_shot`
@@ -337,6 +344,7 @@ subsample_eval_dataset: -1          # Use all samples
 batch_size: 1                       # Process one at a time
 generation_metrics: null            # Use default metrics
 ignore_exceptions: false           # Stop on errors
+max_prompt_tokens: 1200            # Filter out prompts longer than 1200 tokens
 seed:                               # Single run with seed 1
     - 1
 ```
