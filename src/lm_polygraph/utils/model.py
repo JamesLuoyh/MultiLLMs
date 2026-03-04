@@ -403,8 +403,7 @@ class BlackboxModel(Model):
                         elif (list(output.keys())[0] == "error") and (
                             "estimated_time" not in output.keys()
                         ):
-                            log.error(f"{output['error']}")
-                            break
+                            raise Exception(f"{output['error']}")
                     elif isinstance(output, list):
                         break
 

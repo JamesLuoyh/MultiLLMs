@@ -211,7 +211,7 @@ class Dataset:
                 Default: None.
         """
         dataset_name, dataset = Dataset.load_hf_dataset(dataset_path, split, **kwargs)
-        log.info(f"Loaded HF dataset '{dataset_name}' split '{split}': {len(dataset)} samples")
+        log.debug(f"Loaded HF dataset '{dataset_name}' split '{split}': {len(dataset)} samples")
 
         if size is not None:
             log.info(f"Size parameter provided: {size}, dataset length: {len(dataset)}")
@@ -233,7 +233,7 @@ class Dataset:
         elif "medqa" in dataset_name.lower() or (isinstance(dataset_path, str) and "medqa" in dataset_path.lower()):
             # Special handling for MedQA-USMLE-4-options format
             # Format: question + options as input, answer_idx as target
-            log.info("Detected MedQA dataset format, formatting question and options")
+            log.debug("Detected MedQA dataset format, formatting question and options")
             x, y = [], []
             for inst in dataset:
                 # Format the question and options
@@ -275,11 +275,11 @@ class Dataset:
                 else:
                     y.append(inst.get("answer_idx", ""))
             
-            log.info(f"Formatted {len(x)} MedQA samples")
+            log.debug(f"Formatted {len(x)} MedQA samples")
         elif "gsm8k-mc" in dataset_name.lower() or (isinstance(dataset_path, str) and "gsm8k-mc" in dataset_path.lower()):
             # Special handling for GSM8K-MC format
             # Format: Question, A, B, C, D, Answer columns (separate columns, not dict)
-            log.info("Detected GSM8K-MC dataset format, formatting question and options")
+            log.debug("Detected GSM8K-MC dataset format, formatting question and options")
             x, y = [], []
             for inst in dataset:
                 # Get question and options from separate columns
@@ -321,11 +321,11 @@ class Dataset:
                 else:
                     y.append(inst.get("Answer", inst.get("answer", "")))
             
-            log.info(f"Formatted {len(x)} GSM8K-MC samples")
+            log.debug(f"Formatted {len(x)} GSM8K-MC samples")
         elif "ai2_arc" in dataset_name.lower() or (isinstance(dataset_path, str) and "ai2_arc" in dataset_path.lower()) or (isinstance(dataset_path, list) and any("ai2_arc" in str(p).lower() for p in dataset_path)):
             # Special handling for ARC dataset format
             # Format: question, choices (dict with A, B, C, D, etc.), answerKey
-            log.info("Detected ARC dataset format, formatting question and options")
+            log.debug("Detected ARC dataset format, formatting question and options")
             x, y = [], []
             valid_answer_keys = {"A", "B", "C", "D"}
             skipped_count = 0
@@ -440,11 +440,11 @@ class Dataset:
                 else:
                     y.append(answer_key)
             
-            log.info(f"Formatted {len(x)} ARC samples (skipped {skipped_count} with answer keys other than A, B, C, D)")
+            log.debug(f"Formatted {len(x)} ARC samples (skipped {skipped_count} with answer keys other than A, B, C, D)")
         elif "medmcqa" in dataset_name.lower() or (isinstance(dataset_path, str) and "medmcqa" in dataset_path.lower()):
             # Special handling for MedMCQA dataset format
             # Format: question + opa/opb/opc/opd as options, cop (0-3) as correct answer
-            log.info("Detected MedMCQA dataset format, formatting question and options")
+            log.debug("Detected MedMCQA dataset format, formatting question and options")
             x, y = [], []
             option_map = {0: "A", 1: "B", 2: "C", 3: "D"}
             skipped_count = 0
@@ -452,8 +452,8 @@ class Dataset:
             # Log first example to debug structure
             if len(dataset) > 0:
                 first_example = dataset[0]
-                log.info(f"MedMCQA dataset sample keys: {list(first_example.keys())}")
-                log.info(f"MedMCQA first example sample: {first_example}")
+                log.debug(f"MedMCQA dataset sample keys: {list(first_example.keys())}")
+                log.debug(f"MedMCQA first example sample: {first_example}")
             
             # Count cop value distribution for debugging
             cop_distribution = {}
@@ -463,7 +463,6 @@ class Dataset:
                     cop_distribution[cop] = cop_distribution.get(cop, 0) + 1
             if cop_distribution:
                 log.info(f"MedMCQA cop value distribution: {cop_distribution}")
-                log.info(f"Note: cop=-1 indicates no answer/unknown. Only cop values 0-3 (A-D) are valid.")
             
             for inst in dataset:
                 # Format the question and options
@@ -611,11 +610,118 @@ class Dataset:
                         f"Expected cop values: 0, 1, 2, 3 (for A, B, C, D). "
                         f"cop=-1 indicates no answer and is skipped."
                     )
-            log.info(f"Formatted {len(x)} MedMCQA samples (skipped {skipped_count} invalid samples)")
+            log.debug(f"Formatted {len(x)} MedMCQA samples (skipped {skipped_count} invalid samples)")
+        elif "cais/mmlu" in dataset_name.lower() or (isinstance(dataset_path, str) and "cais/mmlu" in dataset_path.lower()) or (isinstance(dataset_path, list) and any("cais/mmlu" in str(p).lower() for p in dataset_path)):
+            # Special handling for cais/mmlu dataset format
+            # Format: question + choices (A, B, C, D) as lists, answer as integer (0-3)
+            log.debug("Detected cais/mmlu dataset format, formatting question and options")
+            x, y = [], []
+            option_map = {0: "A", 1: "B", 2: "C", 3: "D"}
+            skipped_count = 0
+            
+            # Log first example to debug structure
+            if len(dataset) > 0:
+                first_example = dataset[0]
+                log.debug(f"cais/mmlu dataset sample keys: {list(first_example.keys())}")
+                log.debug(f"cais/mmlu first example sample: {first_example}")
+            
+            for inst in dataset:
+                # Format the question and options
+                question = inst.get("question", "")
+                choices = inst.get("choices", [])
+                answer = inst.get("answer", None)
+                
+                # Handle answer: can be integer (0-3) or already a letter
+                if answer is None:
+                    skipped_count += 1
+                    continue
+                
+                if isinstance(answer, int):
+                    if answer < 0 or answer >= len(choices):
+                        skipped_count += 1
+                        continue
+                    answer_letter = option_map.get(answer, "")
+                    if not answer_letter:
+                        skipped_count += 1
+                        continue
+                elif isinstance(answer, str):
+                    answer_letter = answer.upper()
+                    if answer_letter not in {"A", "B", "C", "D"}:
+                        skipped_count += 1
+                        continue
+                else:
+                    skipped_count += 1
+                    continue
+                
+                # Extract options - handle list of choices
+                options = {}
+                if isinstance(choices, list) and len(choices) >= 4:
+                    options = {
+                        "A": choices[0],
+                        "B": choices[1],
+                        "C": choices[2],
+                        "D": choices[3],
+                    }
+                elif isinstance(choices, dict):
+                    options = choices
+                else:
+                    skipped_count += 1
+                    continue
+                
+                # Format the prompt
+                # Support both old format (option_a, option_b, etc.) and new bayesian-peft format (choices)
+                if prompt:
+                    # Check if prompt uses {option_a} format or {choices} format
+                    if "{choices}" in prompt:
+                        # Format choices as "A) ... B) ... C) ... D) ..."
+                        choices_str = "\n".join([f"{k}) {options.get(k, '')}" for k in ["A", "B", "C", "D"]])
+                        formatted_input = prompt.format(
+                            question=question,
+                            choices=choices_str,
+                            option_a=options.get("A", ""),
+                            option_b=options.get("B", ""),
+                            option_c=options.get("C", ""),
+                            option_d=options.get("D", ""),
+                        )
+                    else:
+                        # Try to format with individual options
+                        formatted_input = prompt.format(
+                            question=question,
+                            option_a=options.get("A", ""),
+                            option_b=options.get("B", ""),
+                            option_c=options.get("C", ""),
+                            option_d=options.get("D", ""),
+                        )
+                else:
+                    # Default format if no prompt template provided
+                    choices_str = "\n".join([f"{k}) {options.get(k, '')}" for k in ["A", "B", "C", "D"]])
+                    formatted_input = f"Question: {question}\n{choices_str}"
+                
+                if description:
+                    formatted_input = description + "\n\n" + formatted_input
+                
+                x.append(formatted_input)
+                
+                # Use answer_letter as target
+                if y_column:
+                    y.append(inst.get(y_column, answer_letter))
+                else:
+                    y.append(answer_letter)
+            
+            if len(x) == 0:
+                raise ValueError(
+                    f"No valid cais/mmlu samples found after processing. "
+                    f"Skipped {skipped_count} samples. "
+                    f"Please check the dataset format and column names. "
+                    f"Expected columns: 'question', 'choices' (list), 'answer' (int 0-3). "
+                    f"Split: {split}"
+                )
+            
+            log.debug(f"Formatted {len(x)} cais/mmlu samples (skipped {skipped_count} invalid samples)")
         else:
             # Convert to lists to ensure we only have the selected samples
             # This is important because dataset[x_column] on a lazy dataset might access all rows
-            log.info(f"Converting dataset to lists (current length: {len(dataset)})")
+            log.debug(f"Converting dataset to lists (current length: {len(dataset)})")
             x = list(dataset[x_column])
             if y_column is not None:
                 y = list(dataset[y_column])
