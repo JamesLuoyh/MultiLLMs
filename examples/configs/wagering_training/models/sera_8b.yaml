@@ -1,0 +1,8 @@
+# SERA-8B model configuration
+path: allenai/SERA-8B
+path_to_load_script: model/default_causal.py
+type: CausalLM
+instruct: false
+load_model_args:
+  device_map: auto
+load_tokenizer_args: {}

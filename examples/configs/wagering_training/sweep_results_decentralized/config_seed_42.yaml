@@ -1,0 +1,56 @@
+_include_models:
+- models/gemma_2_9b_it.yaml
+- models/llama3_aloe_8b_alpha.yaml
+wagering_method:
+  name: decentralized_wagers
+  config:
+    common_hidden_dim: 4096
+    hidden_layers:
+    - 512
+    - 256
+    learning_rate: 1e-4
+    device: cuda:0
+aggregation:
+  name: weighted_linear_pooling
+  config: {}
+option_tokens:
+- A
+- B
+- C
+- D
+cache_path: /common/users/yl2310/MultiLLMs/cache
+_include_datasets:
+- datasets/mmlu.yaml
+- datasets/medmcqa.yaml
+datasets:
+- train_split: train
+  size: 1000
+- train_split: train
+  size: 1000
+num_epochs: 100
+checkpoint_base_dir: /common/users/yl2310/MultiLLMs/checkpoints
+save_every: 100
+training_batch_size: 100
+auto_resume: true
+shuffle_data: true
+shuffle_seed: 42
+early_stopping_patience: 10
+report_to_wandb: true
+wandb_project: multi-llm-wagering
+wandb_entity: null
+wandb_name: null
+_include_test_datasets:
+- datasets/mmlu.yaml
+- datasets/medmcqa.yaml
+test_datasets:
+- display_name: mmlu_test
+  eval_split: test
+  size: 1000
+- display_name: medmcqa_test
+  eval_split: validation
+  size: 1000
+_include_ood_dataset: datasets/arc_easy.yaml
+ood_dataset:
+  display_name: arc_easy_ood
+  eval_split: test
+  size: 1000

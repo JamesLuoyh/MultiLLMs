@@ -1,0 +1,15 @@
+# MMLU dataset configuration
+# Updated to match bayesian-peft format (plain text, no chat templates)
+name: ['LM-Polygraph/mmlu', 'simple_instruct']
+display_name: mmlu
+text_column: input
+label_column: output
+batch_size: 5
+max_prompt_tokens: 1200
+load_from_disk: false
+trust_remote_code: false
+instruct: false  # Plain text tokenization to match bayesian-peft
+prompt: "Return the label of the correct answer for the question below.\n\nQuestion: {question}\nChoices:\n{choices}\nAnswer:"
+description: ""  # No description prefix to match bayesian-peft format
+# Note: train_split and eval_split are specified in the main config
+

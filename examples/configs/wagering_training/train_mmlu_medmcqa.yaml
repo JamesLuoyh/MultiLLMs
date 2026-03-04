@@ -1,0 +1,47 @@
+# Training configuration for MMLU and MedMCQA with Gemma and Llama3-Aloe
+# Uses shared model and dataset configs to ensure consistency
+
+# Include model configs (loaded from models/ directory)
+_include_models:
+  - models/gemma_2_9b_it.yaml
+  - models/llama3_aloe_8b_alpha.yaml
+
+# Include dataset configs (loaded from datasets/ directory)
+# Each dataset config will be merged with split-specific settings below
+_include_datasets:
+  - datasets/mmlu.yaml
+  - datasets/medmcqa.yaml
+
+# Override dataset-specific settings for training
+# These are merged with the base dataset configs
+datasets:
+  - train_split: train
+    size: 8  # Only 8 samples (1 batch)
+  - train_split: train
+    size: 8  # Only 8 samples (1 batch)
+
+# Wagering method
+wagering_method:
+  name: equal_wagers
+  config: {}
+
+# Aggregation function
+aggregation:
+  name: weighted_linear_pooling
+  config: {}
+
+# Training parameters
+num_epochs: 1
+option_tokens: ["A", "B", "C", "D"]
+# Base directory for checkpoints (unique subdirectory will be generated based on config)
+checkpoint_base_dir: /common/users/yl2310/MultiLLMs/checkpoints
+save_every: 1  # Save after each batch
+
+# Paths
+cache_path: /common/users/yl2310/MultiLLMs/cache
+
+# Wandb logging
+report_to_wandb: false
+wandb_project: multi-llm-wagering
+wandb_entity: null
+wandb_name: null

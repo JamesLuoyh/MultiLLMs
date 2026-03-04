@@ -1,0 +1,63 @@
+# Evaluation configuration for MMLU, MedMCQA test splits and ARC-Easy OOD
+# Uses shared model and dataset configs to ensure consistency with training
+
+# Include model configs (must match training)
+_include_models:
+  - models/gemma_2_9b_it.yaml
+  - models/llama3_aloe_8b_alpha.yaml
+
+# Checkpoint path (load trained wagering method from here)
+# IMPORTANT: This will be automatically set by the pipeline script
+# For manual evaluation, set this to the checkpoint directory from training
+# Format: /common/users/yl2310/MultiLLMs/checkpoints/{unique_dir}/final
+# For equal_wagers (no trainable params), this can be a dummy path
+checkpoint_path: /common/users/yl2310/MultiLLMs/checkpoints/dummy_equal_wagers
+
+# Wagering method (must match training)
+wagering_method:
+  name: equal_wagers
+  config: {}
+
+# Aggregation function (must match training)
+aggregation:
+  name: weighted_linear_pooling
+  config: {}
+
+# Include test dataset configs
+_include_test_datasets:
+  - datasets/mmlu.yaml
+  - datasets/medmcqa.yaml
+
+# Override dataset-specific settings for evaluation
+# These are merged with the base dataset configs
+test_datasets:
+  - display_name: mmlu_test
+    eval_split: test
+  - display_name: medmcqa_test
+    eval_split: validation  # MedMCQA test split has no labels, use validation
+
+# Include OOD dataset config
+_include_ood_dataset: datasets/arc_easy.yaml
+
+# Override OOD dataset-specific settings
+ood_dataset:
+  display_name: arc_easy_ood
+  eval_split: test
+
+# Evaluation parameters
+option_tokens: ["A", "B", "C", "D"]
+
+# Evaluation checkpoint/resume (optional)
+# If eval_checkpoint_dir is not set, checkpoints will be saved to {checkpoint_path}/../eval_checkpoints
+# Set resume_eval: false to start fresh (ignore existing checkpoints)
+# resume_eval: true  # Default: true, resume from checkpoint if available
+# eval_checkpoint_dir: /path/to/eval/checkpoints  # Optional: custom checkpoint directory
+
+# Paths
+cache_path: /common/users/yl2310/MultiLLMs/cache
+
+# Wandb logging
+report_to_wandb: true
+wandb_project: multi-llm-wagering
+wandb_entity: null
+wandb_name: equal_wagers_linear_pooling_eval
