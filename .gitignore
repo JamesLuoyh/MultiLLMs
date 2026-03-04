@@ -181,3 +181,9 @@ cython_debug/
 # API Keys and Tokens configuration (contains sensitive information)
 .api_keys.yaml
 .wandb_config.yaml
+
+docs/
+wandb/
+
+.vscode/
+uv.lock
