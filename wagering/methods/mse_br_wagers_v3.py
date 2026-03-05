@@ -22,7 +22,7 @@ from .base import WageringMethod
 from lm_polygraph.utils.model import WhiteboxModel
 from wagering.aggregation.linear_pooling import LinearPooling
 
-class MSEBrWagersV2(WageringMethod):
+class MSEBrWagersV3(WageringMethod):
     """
     Wagering method where each model has its own router that outputs a single scalar wager.
     
@@ -240,8 +240,12 @@ class MSEBrWagersV2(WageringMethod):
         # Return negative (since lower Brier score is better, but we want higher scores to be better)
         # scores = 0.5 * (2-brier_scores - sigmoid_wagers)  # Custom modification
         scores = 0.5 * (2-brier_scores)
-        average_scores = ((scores * sigmoid_wagers).sum(dim=1, keepdim=True).expand_as(scores * sigmoid_wagers)
-                            - (scores * sigmoid_wagers)) / (sigmoid_wagers.sum(dim=1, keepdim=True).expand_as(sigmoid_wagers) - sigmoid_wagers)
+        # average_scores = ((scores * sigmoid_wagers).sum(dim=1, keepdim=True).expand_as(scores * sigmoid_wagers)
+        #                     - (scores * sigmoid_wagers)) / (sigmoid_wagers.sum(dim=1, keepdim=True).expand_as(sigmoid_wagers) - sigmoid_wagers)
+        sigmoid_wagers_expanded = torch.repeat_interleave(sigmoid_wagers.unsqueeze(-1), repeats=num_options, dim=-1)
+        # print(probs.shape, sigmoid_wagers_expanded.shape, gt_onehot_expanded.shape, scores.shape)
+        agg_probs_without_i = ((probs * sigmoid_wagers_expanded).sum(dim=1, keepdim=True) - (probs * sigmoid_wagers_expanded)) / (sigmoid_wagers_expanded.sum(dim=1, keepdim=True) - sigmoid_wagers_expanded)
+        average_scores = 0.5 * (2 - ((agg_probs_without_i - gt_onehot_expanded) ** 2).sum(dim=-1))
         # average_scores = brier_scores.sum(dim=1, keepdim=True)/(brier_scores.shape[1] - 1) - brier_scores
         # brs = 0.5 * (2 - brier_scores) - average_scores
         brs = scores - average_scores

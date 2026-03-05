@@ -214,6 +214,7 @@ class WageringTrainer:
         # Note: best_d_regret tracks validation d_regret if validation set exists, otherwise training d_regret
         # d_regret is a loss metric, so lower is better (initialized to infinity)
         self.best_d_regret = float('inf')
+        self.best_nash_gap = float('inf')  # For methods that provide Nash gap metric
         self.epochs_since_improvement = 0
         self.early_stopped = False
         self.best_wagering_method_state = None  # Store the best checkpoint state
@@ -247,6 +248,47 @@ class WageringTrainer:
                         f"({self.all_hidden_states.shape[1]})."
                     )
         self._apply_shuffling()
+
+    def _get_wandb_run_step(self) -> Optional[int]:
+        """Return current wandb run step if available and parseable."""
+        if not self.wandb_logger:
+            return None
+
+        if hasattr(self.wandb_logger, 'run') and self.wandb_logger.run is not None:
+            run = self.wandb_logger.run
+            if hasattr(run, 'step') and run.step is not None:
+                try:
+                    return int(run.step)
+                except (TypeError, ValueError):
+                    return None
+
+        return None
+
+    def _advance_wandb_plot_step(self) -> int:
+        """Advance plot logging step while staying monotonic with run.step."""
+        next_step = self.current_step + 1
+        run_step = self._get_wandb_run_step()
+        if run_step is not None:
+            next_step = max(next_step, run_step + 1)
+        self.current_step = next_step
+        return self.current_step
+
+    def _log_wandb_plot(self, payload: Dict[str, Any]) -> None:
+        """Log plot payload to wandb with a safe monotonically increasing step."""
+        if not self.wandb_logger:
+            return
+
+        plot_step = self._advance_wandb_plot_step()
+        if hasattr(self.wandb_logger, 'run') and hasattr(self.wandb_logger.run, 'log'):
+            self.wandb_logger.run.log(payload, step=plot_step, commit=True)
+        else:
+            self.wandb_logger.log(payload, step=plot_step, commit=True)
+
+        # Keep local step aligned with wandb's internal run.step, which can advance
+        # by one after commit=True logs.
+        run_step = self._get_wandb_run_step()
+        if run_step is not None:
+            self.current_step = max(self.current_step, run_step)
 
     def _resolve_training_dataset_names(self) -> Tuple[List[str], List[str]]:
         """Return display names and slugified keys for training datasets.
@@ -663,16 +705,20 @@ class WageringTrainer:
             
             if self.wandb_logger:
                 import wandb
-                self.wandb_logger.log({"wagers_plot/average_by_dataset/val": wandb.Image(str(avg_save_path))})
+                self._log_wandb_plot({"wagers_plot/average_by_dataset/val": wandb.Image(str(avg_save_path))})
         
         plt.close()
     
-    def _evaluate_validation(self) -> Dict[str, float]:
+    def _evaluate_validation(self) -> Tuple[Dict[str, Any], Optional[np.ndarray], Optional[np.ndarray], np.ndarray]:
         """
         Evaluate the wagering method on the validation set using batch processing.
         
         Returns:
-            Dictionary with validation metrics (accuracy, nll, ece, auc)
+            Tuple of:
+                - metrics dictionary (accuracy, nll, ece, auc, ...)
+                - val_nash_gaps averaged across validation examples per model (or None)
+                - val_score_diffs per validation sample and model (or None)
+                - val_wagers per validation sample and model
         """
         # Debug: Check validation state
         has_val_dataset = self.validation_dataset is not None
@@ -694,8 +740,9 @@ class WageringTrainer:
         val_predictions = []
         val_probs = []
         val_wagers = []  # Track wagers for each example
-        val_nash_gaps = []
         num_val_examples = len(self.validation_dataset.x)
+        val_nash_gaps = np.zeros((num_val_examples, len(self.models)))  # Track Nash gaps if provided by wagering method
+        val_score_diffs = np.zeros((num_val_examples, len(self.models)))  # Track score differences if provided by wagering method
         eval_batch_size = self.batch_size  # Process validation in batches
         
         for batch_start in range(0, num_val_examples, eval_batch_size):
@@ -733,17 +780,21 @@ class WageringTrainer:
             )  # [batch_size, num_models]
             batch_wagers = res_dict["wagers"]  # [batch_size, num_models]
             batch_nash_gap = res_dict.get("nash_gap", None)
-            print(batch_nash_gap.shape)
-            0/0
+            batch_score_diff = res_dict.get("score_diff", None)
             # Aggregate predictions for batch
             batch_aggregated_log_probs, batch_aggregated_probs = self.aggregation_function.aggregate(
                 batch_logits_transposed, batch_wagers
             )  # [batch_size, num_options] each
             
             batch_predictions = np.argmax(batch_aggregated_probs, axis=1)  # [batch_size]
-            if batch_nash_gap is not None:
-                val_nash_gaps.extend(batch_nash_gap.tolist())
-
+            if batch_nash_gap is not None and val_nash_gaps is not None:
+                val_nash_gaps[batch_start:batch_end] = batch_nash_gap
+            else:
+                val_nash_gaps = None
+            if batch_score_diff is not None and val_score_diffs is not None:
+                val_score_diffs[batch_start:batch_end] = batch_score_diff
+            else:
+                val_score_diffs = None
             val_predictions.extend(batch_predictions.tolist())
             val_probs.extend(batch_aggregated_probs.tolist())
             val_wagers.extend(batch_wagers.tolist())
@@ -752,7 +803,10 @@ class WageringTrainer:
         val_predictions = np.array(val_predictions, dtype=np.int32)
         val_probs = np.stack(val_probs, axis=0)
         val_wagers = np.stack(val_wagers, axis=0)  # [num_val_examples, num_models]
-        
+        if val_nash_gaps is not None:
+            val_nash_gaps = np.mean(val_nash_gaps, axis=0)  # Average Nash gap per model over validation set
+        if val_score_diffs is not None:
+            val_score_diffs = np.asarray(val_score_diffs, dtype=np.float32)
         # Compute metrics
         val_accuracy = np.mean(val_predictions == self.validation_labels)
         
@@ -844,7 +898,7 @@ class WageringTrainer:
             }
             self._plot_validation_wagers_by_dataset(val_wagers, val_results)
         
-        return metrics
+        return metrics, val_nash_gaps, val_score_diffs, val_wagers
     
     def _collect_logits(self):
         """
@@ -1016,6 +1070,19 @@ class WageringTrainer:
         
         # Track epoch-level metrics for early stopping
         epoch_accuracies = []
+
+        # Track validation Nash-gap trajectory and related metrics over epochs
+        val_nash_gap_history = []
+        val_d_regret_history = []
+        val_accuracy_history = []
+        val_nash_gap_history_epochs = []
+
+        # Cache validation wagers/score-diff for plotting only one epoch at the end.
+        best_val_wagers_for_plot: Optional[np.ndarray] = None
+        best_val_score_diff_for_plot: Optional[np.ndarray] = None
+        latest_val_wagers_for_plot: Optional[np.ndarray] = None
+        latest_val_score_diff_for_plot: Optional[np.ndarray] = None
+        latest_val_epoch: Optional[int] = None
         
         # Initialize these lists (will be reset each epoch to only keep final epoch's predictions)
         all_predictions = []
@@ -1189,16 +1256,85 @@ class WageringTrainer:
             
             # Evaluate on validation set if available
             val_metrics = {}
+            val_nash_gap = None
+            val_nash_gap_max = None
+            val_score_diff = None
+            val_wagers = None
             if self.validation_dataset is not None:
-                val_metrics = self._evaluate_validation()
+                val_metrics, val_nash_gap, val_score_diff, val_wagers = self._evaluate_validation()
                 val_d_regret = val_metrics.get("d_regret", None)
                 if val_metrics:
                     self.last_val_metrics = val_metrics
+
+                if val_wagers is not None and val_score_diff is not None:
+                    latest_val_wagers_for_plot = np.asarray(val_wagers, dtype=np.float32).copy()
+                    latest_val_score_diff_for_plot = np.asarray(val_score_diff, dtype=np.float32).copy()
+                    latest_val_epoch = epoch
             else:
                 # Fall back to training d_regret if no validation set
                 val_d_regret = epoch_d_regret
                 log.info("No validation set available, using training d_regret for early stopping")
+
+            # Check for epsilon Nash equilibrium if wagering method provides Nash gap metric
+            if val_nash_gap is not None:
+                log.info(f"Validation Nash gap for epoch {epoch+1}: {val_nash_gap}")
+                val_nash_gap_max = float(np.max(val_nash_gap))  # Use max Nash gap across models for early stopping
+                val_nash_gap_mean = float(np.mean(val_nash_gap))
+                val_d_regret_value = val_metrics.get("d_regret", None) if val_metrics else None
+                val_accuracy_value = val_metrics.get("accuracy", None) if val_metrics else None
+                val_nash_gap_history.append(val_nash_gap_mean)
+                val_d_regret_history.append(
+                    float(val_d_regret_value)
+                    if val_d_regret_value is not None and not np.isnan(val_d_regret_value)
+                    else np.nan
+                )
+                val_accuracy_history.append(
+                    float(val_accuracy_value)
+                    if val_accuracy_value is not None and not np.isnan(val_accuracy_value)
+                    else np.nan
+                )
+                val_nash_gap_history_epochs.append(epoch + 1)
+                
+                # if val_nash_gap_max < self.best_nash_gap:
+                #     self.best_nash_gap = val_nash_gap_max
+                #     self.epochs_since_improvement = 0
+                #     # Save the best checkpoint state (in memory and to disk)
+                #     # IMPORTANT: Use deep copy to avoid reference issues where subsequent
+                #     # training updates would modify the stored checkpoint state
+                #     self.best_wagering_method_state = copy.deepcopy(self.wagering_method.state_dict())
+                #     self.best_epoch = epoch
+                #     if val_wagers is not None and val_score_diff is not None:
+                #         best_val_wagers_for_plot = np.asarray(val_wagers, dtype=np.float32).copy()
+                #         best_val_score_diff_for_plot = np.asarray(val_score_diff, dtype=np.float32).copy()
+        
+                #     log.debug(f"Saving best checkpoint state dict keys: {list(self.best_wagering_method_state.keys())}")
+        
+                #     if self.checkpoint_dir:
+                #         best_checkpoint_path = self.checkpoint_dir / "best_checkpoint"
+                #         best_checkpoint_path.mkdir(parents=True, exist_ok=True)
+                #         self.wagering_method.save_pretrained(str(best_checkpoint_path))
+                #         log.debug(f"New best nash gap: {self.best_nash_gap:.4f} at epoch {epoch+1} - saved best checkpoint")
+                #     else:
+                #         log.debug(f"New best nash gap: {self.best_nash_gap:.4f} at epoch {epoch+1}")
+                # else:
+                #     self.epochs_since_improvement += 1
+                
+                # # Check if we should stop early
+                # if self.epochs_since_improvement >= self.early_stopping_patience:
+                #     log.info(
+                #         f"Early stopping: No improvement on validation set for {self.early_stopping_patience} epochs. "
+                #         f"Best validation nash gap: {self.best_nash_gap:.4f} (from epoch {self.best_epoch + 1})"
+                #     )
+                #     self.early_stopped = True
+                #     # Load the best checkpoint before breaking
+                #     if self.best_wagering_method_state is not None:
+                #         log.info(f"Loading best checkpoint from epoch {self.best_epoch + 1} (nash gap={self.best_nash_gap:.4f})")
+                #         log.debug(f"State dict keys before load: {list(self.wagering_method.state_dict().keys())}")
+                #         self.wagering_method.load_state_dict(self.best_wagering_method_state)
+                #         log.debug(f"State dict keys after load: {list(self.wagering_method.state_dict().keys())}")
+                #     break
             
+
             # Early stopping: check for improvement on validation set after each epoch
             # d_regret is a loss metric, so lower is better
             if self.early_stopping_patience > 0 and val_d_regret is not None:
@@ -1210,6 +1346,9 @@ class WageringTrainer:
                     # training updates would modify the stored checkpoint state
                     self.best_wagering_method_state = copy.deepcopy(self.wagering_method.state_dict())
                     self.best_epoch = epoch
+                    if val_wagers is not None and val_score_diff is not None:
+                        best_val_wagers_for_plot = np.asarray(val_wagers, dtype=np.float32).copy()
+                        best_val_score_diff_for_plot = np.asarray(val_score_diff, dtype=np.float32).copy()
         
                     log.debug(f"Saving best checkpoint state dict keys: {list(self.best_wagering_method_state.keys())}")
         
@@ -1319,6 +1458,8 @@ class WageringTrainer:
                         val_dict_update["val/epoch/meta_nll"] = val_metrics.get("meta_nll")
                     if val_metrics.get("meta_auc") is not None and not np.isnan(val_metrics.get("meta_auc", np.nan)):
                         val_dict_update["val/epoch/meta_auc"] = val_metrics.get("meta_auc")
+                    if val_nash_gap_max is not None and not np.isnan(val_nash_gap_max):
+                        val_dict_update["val/epoch/nash_gap_max"] = val_nash_gap_max
                     
                     wandb_epoch_dict.update(val_dict_update)
                     log.info(f"  Validation accuracy={val_metrics.get('accuracy', 0.0):.4f}, nll={val_metrics.get('nll', 0.0):.4f}")
@@ -1380,6 +1521,8 @@ class WageringTrainer:
                         wandb_val_dict["val/epoch/meta_nll"] = val_metrics.get("meta_nll")
                     if val_metrics.get("meta_auc") is not None and not np.isnan(val_metrics.get("meta_auc", np.nan)):
                         wandb_val_dict["val/epoch/meta_auc"] = val_metrics.get("meta_auc")
+                    if val_nash_gap_max is not None and not np.isnan(val_nash_gap_max):
+                        wandb_val_dict["val/epoch/nash_gap_max"] = val_nash_gap_max
                     
                     log.debug(f"Fallback path: Logging {len(wandb_val_dict)} validation metrics to wandb")
                     try:
@@ -1429,10 +1572,6 @@ class WageringTrainer:
                 if hyperparams:
                     self.wandb_logger.config.update(hyperparams)
                     log.debug(f"Logged hyperparameters to wandb: {list(hyperparams.keys())}")
-            
-            # Break out of epoch loop if early stopped
-            if self.early_stopped:
-                break
         
         # Ensure best checkpoint is loaded for downstream evaluation/checkpoint saving
         if self.best_wagering_method_state is not None and not self.early_stopped:
@@ -1441,6 +1580,27 @@ class WageringTrainer:
                 "for final checkpoint saving and evaluation."
             )
             self.wagering_method.load_state_dict(self.best_wagering_method_state)
+
+        # Plot only one validation wagers-vs-score_diff figure for the best epoch.
+        plot_val_wagers = best_val_wagers_for_plot
+        plot_val_score_diffs = best_val_score_diff_for_plot
+        plot_epoch = self.best_epoch
+        if plot_val_wagers is None or plot_val_score_diffs is None or plot_epoch is None:
+            plot_val_wagers = latest_val_wagers_for_plot
+            plot_val_score_diffs = latest_val_score_diff_for_plot
+            plot_epoch = latest_val_epoch
+            if plot_val_wagers is not None and plot_val_score_diffs is not None and plot_epoch is not None:
+                log.debug(
+                    "Best epoch plot data unavailable; using latest validation epoch "
+                    f"{plot_epoch + 1} for wagers_vs_score_diff plotting."
+                )
+
+        if plot_val_wagers is not None and plot_val_score_diffs is not None and plot_epoch is not None:
+            self._plot_val_wagers_vs_score_diff_for_epoch(
+                val_wagers=plot_val_wagers,
+                val_score_diffs=plot_val_score_diffs,
+                epoch=plot_epoch,
+            )
 
         # Convert to arrays
         all_predictions = np.array(all_predictions, dtype=np.int32)
@@ -1548,6 +1708,10 @@ class WageringTrainer:
             "labels": processed_labels,  # Use processed labels, not all labels
             "dataset_indices": processed_dataset_indices,
             "wagers_history": wagers_history,
+            "val_nash_gap_history": np.array(val_nash_gap_history, dtype=np.float32),
+            "val_d_regret_history": np.array(val_d_regret_history, dtype=np.float32),
+            "val_accuracy_history": np.array(val_accuracy_history, dtype=np.float32),
+            "val_nash_gap_history_epochs": np.array(val_nash_gap_history_epochs, dtype=np.int32),
             "batch_metrics": batch_metrics,
             "final_accuracy": accuracy,
             "final_nll": nll,
@@ -1594,7 +1758,25 @@ class WageringTrainer:
         
         # Log final training metrics to wandb
         if self.wandb_logger:
-            final_step = self.current_step + 1 if hasattr(self, 'current_step') else num_epochs * num_examples
+            proposed_final_step = self.current_step + 1 if hasattr(self, 'current_step') else num_epochs * num_examples
+            wandb_run_step = None
+            if (
+                hasattr(self.wandb_logger, 'run')
+                and self.wandb_logger.run is not None
+                and hasattr(self.wandb_logger.run, 'step')
+            ):
+                try:
+                    run_step_value = self.wandb_logger.run.step
+                    if run_step_value is not None:
+                        wandb_run_step = int(run_step_value)
+                except (TypeError, ValueError):
+                    wandb_run_step = None
+
+            final_step = (
+                max(proposed_final_step, wandb_run_step + 1)
+                if wandb_run_step is not None
+                else proposed_final_step
+            )
             wandb_final_dict = {
                 "train/final/accuracy": accuracy,
                 "train/final/nll": nll,
@@ -1624,18 +1806,23 @@ class WageringTrainer:
                         wandb_final_dict[f"train/final/{dataset_key}/{wager_key}"] = dataset_metrics[wager_key]
             
             try:
+                final_plot_step = final_step + 1
                 if hasattr(self.wandb_logger, 'run') and hasattr(self.wandb_logger.run, 'log'):
-                    self.wandb_logger.run.log(wandb_final_dict, step=final_step)
+                    self.wandb_logger.run.log(wandb_final_dict, step=final_step, commit=True)
+                    self.wandb_logger.run.log(wandb_final_dict, step=final_plot_step, commit=True)
                 else:
-                    self.wandb_logger.log(wandb_final_dict, step=final_step)
+                    self.wandb_logger.log(wandb_final_dict, step=final_step, commit=True)
+                    self.wandb_logger.log(wandb_final_dict, step=final_plot_step, commit=True)
+                self.current_step = max(self.current_step, final_plot_step)
             except Exception as e:
                 raise RuntimeError(f"Error logging train/final metrics to wandb: {e}") from e
         
         # Log final validation metrics to wandb
         if self.wandb_logger:
             final_val_metrics = {}
+            final_val_nash_gap = None
             if self.validation_dataset is not None:
-                final_val_metrics = self._evaluate_validation()
+                final_val_metrics, final_val_nash_gap, _, _ = self._evaluate_validation()
 
             # Fallback to last available validation metrics if current evaluation is unavailable
             if not final_val_metrics and self.last_val_metrics:
@@ -1644,7 +1831,25 @@ class WageringTrainer:
             if not final_val_metrics:
                 raise Exception("Final validation metrics missing; skipping val/final logging.")
             else:
-                final_step = self.current_step + 2
+                proposed_final_step = self.current_step + 1
+                wandb_run_step = None
+                if (
+                    hasattr(self.wandb_logger, 'run')
+                    and self.wandb_logger.run is not None
+                    and hasattr(self.wandb_logger.run, 'step')
+                ):
+                    try:
+                        run_step_value = self.wandb_logger.run.step
+                        if run_step_value is not None:
+                            wandb_run_step = int(run_step_value)
+                    except (TypeError, ValueError):
+                        wandb_run_step = None
+
+                final_step = (
+                    max(proposed_final_step, wandb_run_step + 1)
+                    if wandb_run_step is not None
+                    else proposed_final_step
+                )
                 
                 wandb_val_final_dict = {
                     "val/final/accuracy": final_val_metrics.get("accuracy", 0.0),
@@ -1662,6 +1867,10 @@ class WageringTrainer:
                     wandb_val_final_dict["val/final/meta_nll"] = final_val_metrics.get("meta_nll")
                 if final_val_metrics.get("meta_auc") is not None and not np.isnan(final_val_metrics.get("meta_auc", np.nan)):
                     wandb_val_final_dict["val/final/meta_auc"] = final_val_metrics.get("meta_auc")
+                if final_val_nash_gap is not None:
+                    final_val_nash_gap_max = float(np.max(final_val_nash_gap))
+                    if not np.isnan(final_val_nash_gap_max):
+                        wandb_val_final_dict["val/final/nash_gap_max"] = final_val_nash_gap_max
                 
                 if "grouped" in final_val_metrics:
                     _, slug_names = self._resolve_training_dataset_names()
@@ -1686,15 +1895,25 @@ class WageringTrainer:
                             wandb_val_final_dict[f"val/final/{dataset_key}/meta_auc"] = dataset_metrics.get("meta_auc")
                 
                 try:
+                    final_plot_step = final_step + 1
                     if hasattr(self.wandb_logger, 'run') and hasattr(self.wandb_logger.run, 'log'):
-                        self.wandb_logger.run.log(wandb_val_final_dict, step=final_step)
+                        self.wandb_logger.run.log(wandb_val_final_dict, step=final_step, commit=True)
+                        self.wandb_logger.run.log(wandb_val_final_dict, step=final_plot_step, commit=True)
                     else:
-                        self.wandb_logger.log(wandb_val_final_dict, step=final_step)
+                        self.wandb_logger.log(wandb_val_final_dict, step=final_step, commit=True)
+                        self.wandb_logger.log(wandb_val_final_dict, step=final_plot_step, commit=True)
+                    self.current_step = max(self.current_step, final_plot_step)
                 except Exception as e:
                     raise RuntimeError(f"Error logging val/final metrics to wandb: {e}") from e
         
         # Plot wagers over time
         self._plot_wagers_over_time(wagers_history, results)
+        self._plot_val_nash_gap_relationships(
+            val_nash_gap_history=np.array(val_nash_gap_history, dtype=np.float32),
+            val_d_regret_history=np.array(val_d_regret_history, dtype=np.float32),
+            val_accuracy_history=np.array(val_accuracy_history, dtype=np.float32),
+            val_history_epochs=np.array(val_nash_gap_history_epochs, dtype=np.int32),
+        )
         
         return results
     
@@ -1833,7 +2052,7 @@ class WageringTrainer:
             
             if self.wandb_logger:
                 import wandb
-                self.wandb_logger.log({"wagers_plot/val/average_by_dataset": wandb.Image(str(avg_save_path))})
+                self._log_wandb_plot({"wagers_plot/val/average_by_dataset": wandb.Image(str(avg_save_path))})
         
         plt.close()
     
@@ -1898,7 +2117,7 @@ class WageringTrainer:
             
             if self.wandb_logger:
                 import wandb
-                self.wandb_logger.log({"wagers_plot/overall": wandb.Image(str(save_path))})
+                self._log_wandb_plot({"wagers_plot/overall": wandb.Image(str(save_path))})
         
         plt.close()
         
@@ -1969,7 +2188,7 @@ class WageringTrainer:
                 
                 if self.wandb_logger:
                     import wandb
-                    self.wandb_logger.log({"wagers_plot/by_dataset": wandb.Image(str(grouped_save_path))})
+                    self._log_wandb_plot({"wagers_plot/by_dataset": wandb.Image(str(grouped_save_path))})
             
             plt.close()
             
@@ -2010,9 +2229,167 @@ class WageringTrainer:
                 
                 if self.wandb_logger:
                     import wandb
-                    self.wandb_logger.log({"wagers_plot/average_by_dataset": wandb.Image(str(avg_save_path))})
+                    self._log_wandb_plot({"wagers_plot/average_by_dataset": wandb.Image(str(avg_save_path))})
             
             plt.close()
+
+    def _plot_val_nash_gap_relationships(
+        self,
+        val_nash_gap_history: np.ndarray,
+        val_d_regret_history: np.ndarray,
+        val_accuracy_history: np.ndarray,
+        val_history_epochs: np.ndarray,
+    ):
+        """Plot validation Nash-gap relationships against d_regret and accuracy."""
+        if self.checkpoint_dir is None:
+            return
+
+        if val_nash_gap_history.size == 0:
+            log.debug("Skipping val_nash_gap plots: no validation Nash-gap history available")
+            return
+
+        # Plot 1: val_nash_gap (x) vs d_regret (y)
+        d_regret_mask = np.isfinite(val_nash_gap_history) & np.isfinite(val_d_regret_history)
+        if np.any(d_regret_mask):
+            x_vals = val_nash_gap_history[d_regret_mask]
+            y_vals = val_d_regret_history[d_regret_mask]
+
+            fig, ax = plt.subplots(1, 1, figsize=(8, 6))
+            ax.scatter(x_vals, y_vals, s=32, alpha=0.85)
+            ax.set_xlabel("Validation Nash Gap (Mean)", fontsize=11)
+            ax.set_ylabel("Validation D-Regret", fontsize=11)
+            ax.set_title("Validation D-Regret vs Mean Nash Gap", fontsize=12, fontweight='bold')
+            ax.grid(True, alpha=0.3)
+            plt.tight_layout()
+
+            save_path = self.checkpoint_dir / "validation_nash_gap_vs_d_regret.png"
+            plt.savefig(save_path, dpi=150, bbox_inches='tight')
+            log.debug(f"Saved validation nash_gap vs d_regret plot to {save_path}")
+
+            if self.wandb_logger:
+                import wandb
+                self._log_wandb_plot({"wagers_plot/val/nash_gap_vs_d_regret": wandb.Image(str(save_path))})
+
+            plt.close()
+        else:
+            log.debug("Skipping val_nash_gap vs d_regret plot: no finite paired points")
+
+        # Plot 2: val_nash_gap (x) vs accuracy (y)
+        accuracy_mask = np.isfinite(val_nash_gap_history) & np.isfinite(val_accuracy_history)
+        if np.any(accuracy_mask):
+            x_vals = val_nash_gap_history[accuracy_mask]
+            y_vals = val_accuracy_history[accuracy_mask]
+
+            fig, ax = plt.subplots(1, 1, figsize=(8, 6))
+            ax.scatter(x_vals, y_vals, s=32, alpha=0.85)
+            ax.set_xlabel("Validation Nash Gap (Mean)", fontsize=11)
+            ax.set_ylabel("Validation Accuracy", fontsize=11)
+            ax.set_title("Validation Accuracy vs Mean Nash Gap", fontsize=12, fontweight='bold')
+            ax.grid(True, alpha=0.3)
+            ax.set_ylim([0.0, 1.05])
+            plt.tight_layout()
+
+            save_path = self.checkpoint_dir / "validation_nash_gap_vs_accuracy.png"
+            plt.savefig(save_path, dpi=150, bbox_inches='tight')
+            log.debug(f"Saved validation nash_gap vs accuracy plot to {save_path}")
+
+            if self.wandb_logger:
+                import wandb
+                self._log_wandb_plot({"wagers_plot/val/nash_gap_vs_accuracy": wandb.Image(str(save_path))})
+
+            plt.close()
+        else:
+            log.debug("Skipping val_nash_gap vs accuracy plot: no finite paired points")
+
+        if val_history_epochs.size > 0:
+            log.debug(
+                f"Tracked validation mean Nash gap for {val_history_epochs.size} epochs "
+                f"(first epoch={int(val_history_epochs[0])}, last epoch={int(val_history_epochs[-1])})"
+            )
+
+    def _plot_val_wagers_vs_score_diff_for_epoch(
+        self,
+        val_wagers: np.ndarray,
+        val_score_diffs: np.ndarray,
+        epoch: int,
+    ):
+        """Scatter plot of validation wagers vs score differences for a specific epoch."""
+        if self.checkpoint_dir is None:
+            return
+
+        if val_wagers is None or val_score_diffs is None:
+            log.debug(f"Skipping epoch {epoch + 1} wagers vs score_diff plot: missing wagers or score_diff")
+            return
+
+        val_wagers = np.asarray(val_wagers)
+        val_score_diffs = np.asarray(val_score_diffs)
+        if val_wagers.ndim != 2 or val_score_diffs.ndim != 2 or val_wagers.shape != val_score_diffs.shape:
+            log.debug(
+                f"Skipping epoch {epoch + 1} wagers vs score_diff plot: shape mismatch "
+                f"wagers={val_wagers.shape}, score_diffs={val_score_diffs.shape}"
+            )
+            return
+
+        num_models = val_wagers.shape[1]
+
+        model_names: List[str] = []
+        if isinstance(self.metadata, dict) and "models" in self.metadata:
+            raw_names = self.metadata["models"]
+            if isinstance(raw_names, (list, tuple)):
+                model_names = [str(name) for name in raw_names][:num_models]
+
+        if len(model_names) != num_models and getattr(self, "models", None):
+            inferred_names: List[str] = []
+            for i, model in enumerate(self.models):
+                name = getattr(model, "model_path", None)
+                if not name:
+                    name = getattr(model, "model_name", None)
+                if not name:
+                    name = f"Model {i+1}"
+                inferred_names.append(str(name))
+            model_names = inferred_names[:num_models]
+
+        if len(model_names) != num_models:
+            model_names = [f"Model {i+1}" for i in range(num_models)]
+
+        fig, ax = plt.subplots(1, 1, figsize=(8, 6))
+        plotted_any = False
+        for model_idx in range(num_models):
+            model_x = val_wagers[:, model_idx]
+            model_y = val_score_diffs[:, model_idx]
+            finite_mask = np.isfinite(model_x) & np.isfinite(model_y)
+            if not np.any(finite_mask):
+                continue
+            ax.scatter(
+                model_x[finite_mask],
+                model_y[finite_mask],
+                s=14,
+                alpha=0.45,
+                label=model_names[model_idx],
+            )
+            plotted_any = True
+
+        if not plotted_any:
+            plt.close()
+            log.debug(f"Skipping epoch {epoch + 1} wagers vs score_diff plot: no finite points")
+            return
+
+        ax.set_xlabel("Validation Wagers (all models × val samples)", fontsize=11)
+        ax.set_ylabel("Validation Score Diff", fontsize=11)
+        ax.set_title(f"Validation Score Diff vs Wagers (Epoch {epoch + 1})", fontsize=12, fontweight='bold')
+        ax.legend(fontsize=8)
+        ax.grid(True, alpha=0.3)
+        plt.tight_layout()
+
+        save_path = self.checkpoint_dir / f"validation_epoch_{epoch + 1:04d}_wagers_vs_score_diff.png"
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        log.debug(f"Saved epoch {epoch + 1} wagers vs score_diff plot to {save_path}")
+
+        if self.wandb_logger:
+            import wandb
+            self._log_wandb_plot({f"wagers_plot/val/wagers_vs_score_diff/epoch_{epoch + 1}": wandb.Image(str(save_path))})
+
+        plt.close()
     
     def save_final_checkpoint(self, save_dir: str) -> str:
         """Save final checkpoint and return the path.

@@ -92,7 +92,10 @@ class WageringEvaluator:
         # Continue from training's last step if provided to avoid wandb step ordering warnings
         if wandb_starting_step is not None:
             # Use provided starting step (from training's last step)
-            self._global_wandb_step = wandb_starting_step
+            self._global_wandb_step = int(wandb_starting_step)
+            run_step = self._get_wandb_run_step()
+            if run_step is not None:
+                self._global_wandb_step = max(self._global_wandb_step, run_step)
             log.info(f"Initialized wandb step counter to {self._global_wandb_step} (continuing from training)")
         elif self.wandb_logger:
             try:
@@ -132,6 +135,41 @@ class WageringEvaluator:
                 log.warning(f"Could not get wandb step, starting from 0: {e}")
         else:
             self._global_wandb_step = 0
+
+    def _get_wandb_run_step(self) -> Optional[int]:
+        """Return current wandb run step if available and parseable."""
+        if not self.wandb_logger:
+            return None
+
+        if hasattr(self.wandb_logger, 'run') and self.wandb_logger.run is not None:
+            run = self.wandb_logger.run
+            if hasattr(run, 'step') and run.step is not None:
+                try:
+                    return int(run.step)
+                except (TypeError, ValueError):
+                    return None
+
+        return None
+
+    def _advance_wandb_step(self) -> int:
+        """Advance internal wandb step while staying monotonic with run.step."""
+        next_step = self._global_wandb_step + 1
+        run_step = self._get_wandb_run_step()
+        if run_step is not None:
+            next_step = max(next_step, run_step + 1)
+        self._global_wandb_step = next_step
+        return self._global_wandb_step
+
+    def _log_wandb_plot(self, payload: Dict[str, Any]) -> None:
+        """Log plot payloads to wandb using a safe monotonically increasing step."""
+        if not self.wandb_logger:
+            return
+
+        log_step = self._advance_wandb_step()
+        if hasattr(self.wandb_logger, 'run') and hasattr(self.wandb_logger.run, 'log'):
+            self.wandb_logger.run.log(payload, step=log_step, commit=True)
+        else:
+            self.wandb_logger.log(payload, step=log_step, commit=True)
     
     def evaluate(
         self,
@@ -329,13 +367,13 @@ class WageringEvaluator:
                     wandb_log_dict[f"{log_prefix}/{dataset_name}/batch/wager_model_{i}"] = float(np.mean(batch_wagers[:, i]))
                 
                 # Use global step counter to ensure unique steps across all datasets
-                self._global_wandb_step += 1
+                log_step = self._advance_wandb_step()
                 try:
                     # Use same API pattern as trainer for consistency
                     if hasattr(self.wandb_logger, 'run') and hasattr(self.wandb_logger.run, 'log'):
-                        self.wandb_logger.run.log(wandb_log_dict, step=self._global_wandb_step)
+                        self.wandb_logger.run.log(wandb_log_dict, step=log_step)
                     else:
-                        self.wandb_logger.log(wandb_log_dict, step=self._global_wandb_step)
+                        self.wandb_logger.log(wandb_log_dict, step=log_step)
                 except Exception as e:
                     raise Exception(f"✗ Error logging batch metrics to wandb: {e}", exc_info=True)
         
@@ -460,28 +498,38 @@ class WageringEvaluator:
             log_prefix = "test" if not dataset_name.startswith("ood_") else "ood"
             log.debug(f"Logging final metrics to wandb: prefix={log_prefix}, dataset_name={dataset_name}")
             # Use global step counter to ensure final metrics appear after all batch metrics
-            self._global_wandb_step += 1
-            wandb_metrics = {
-                f"{log_prefix}/{dataset_name}/final/accuracy": accuracy,
-                f"{log_prefix}/{dataset_name}/final/nll": nll,
-                f"{log_prefix}/{dataset_name}/final/auc": auc if auc is not None and not np.isnan(auc) else None,
-                f"{log_prefix}/{dataset_name}/final/ece": ece if ece is not None and not np.isnan(ece) else None,
-                f"{log_prefix}/{dataset_name}/final/d_regret": d_regret if d_regret is not None and not np.isnan(d_regret) else None,
-                f"{log_prefix}/{dataset_name}/final/meta_acc": meta_acc if meta_acc is not None and not np.isnan(meta_acc) else None,
-                f"{log_prefix}/{dataset_name}/final/meta_nll": meta_nll if meta_nll is not None and not np.isnan(meta_nll) else None,
-                f"{log_prefix}/{dataset_name}/final/meta_auc": meta_auc if meta_auc is not None and not np.isnan(meta_auc) else None,
+            final_step = self._advance_wandb_step()
+            metric_values = {
+                "accuracy": accuracy,
+                "nll": nll,
+                "auc": auc if auc is not None and not np.isnan(auc) else None,
+                "ece": ece if ece is not None and not np.isnan(ece) else None,
+                "d_regret": d_regret if d_regret is not None and not np.isnan(d_regret) else None,
+                "meta_acc": meta_acc if meta_acc is not None and not np.isnan(meta_acc) else None,
+                "meta_nll": meta_nll if meta_nll is not None and not np.isnan(meta_nll) else None,
+                "meta_auc": meta_auc if meta_auc is not None and not np.isnan(meta_auc) else None,
             }
+
+            primary_final_prefix = f"{log_prefix}/{dataset_name}/final"
+            alias_final_prefix = f"{log_prefix}/final/{dataset_name}"
+            wandb_metrics = {f"{primary_final_prefix}/{k}": v for k, v in metric_values.items()}
+            wandb_metrics.update({f"{alias_final_prefix}/{k}": v for k, v in metric_values.items()})
             
             # Add average wagers per model
             avg_wagers = np.mean(wagers_history, axis=0)
             for model_idx, avg_wager in enumerate(avg_wagers):
-                wandb_metrics[f"{log_prefix}/{dataset_name}/final/avg_wager_model_{model_idx}"] = float(avg_wager)
+                wager_value = float(avg_wager)
+                wandb_metrics[f"{primary_final_prefix}/avg_wager_model_{model_idx}"] = wager_value
+                wandb_metrics[f"{alias_final_prefix}/avg_wager_model_{model_idx}"] = wager_value
             
             try:
+                final_plot_step = final_step + 1
                 if hasattr(self.wandb_logger, 'run') and hasattr(self.wandb_logger.run, 'log'):
-                    self.wandb_logger.run.log(wandb_metrics, step=self._global_wandb_step)
+                    self.wandb_logger.run.log(wandb_metrics, step=final_step, commit=True)
+                    self.wandb_logger.run.log(wandb_metrics, step=final_plot_step, commit=True)
                 else:
-                    self.wandb_logger.log(wandb_metrics, step=self._global_wandb_step)
+                    self.wandb_logger.log(wandb_metrics, step=final_step, commit=True)
+                    self.wandb_logger.log(wandb_metrics, step=final_plot_step, commit=True)
             except Exception as e:
                 raise Exception(f"Error logging final metrics to wandb: {e}", exc_info=True)
         
@@ -555,10 +603,7 @@ class WageringEvaluator:
             import wandb
             log_prefix = "test" if not dataset_name.startswith("ood_") else "ood"
             try:
-                if hasattr(self.wandb_logger, 'run') and hasattr(self.wandb_logger.run, 'log'):
-                    self.wandb_logger.run.log({f"{log_prefix}/{dataset_name}/wagers_plot": wandb.Image(str(save_path))})
-                else:
-                    self.wandb_logger.log({f"{log_prefix}/{dataset_name}/wagers_plot": wandb.Image(str(save_path))})
+                self._log_wandb_plot({f"{log_prefix}/{dataset_name}/wagers_plot": wandb.Image(str(save_path))})
             except Exception as e:
                 raise Exception(f"Error logging wagers plot: {e}")
         
@@ -596,10 +641,7 @@ class WageringEvaluator:
             import wandb
             log_prefix = "test" if not dataset_name.startswith("ood_") else "ood"
             try:
-                if hasattr(self.wandb_logger, 'run') and hasattr(self.wandb_logger.run, 'log'):
-                    self.wandb_logger.run.log({f"{log_prefix}/{dataset_name}/average_wagers_plot": wandb.Image(str(avg_save_path))})
-                else:
-                    self.wandb_logger.log({f"{log_prefix}/{dataset_name}/average_wagers_plot": wandb.Image(str(avg_save_path))})
+                self._log_wandb_plot({f"{log_prefix}/{dataset_name}/average_wagers_plot": wandb.Image(str(avg_save_path))})
             except Exception as e:
                 raise Exception(f"Error logging average wagers plot: {e}")
         
@@ -725,9 +767,15 @@ class WageringEvaluator:
             import wandb
             try:
                 if hasattr(self.wandb_logger, 'run') and hasattr(self.wandb_logger.run, 'log'):
-                    self.wandb_logger.run.log({f"wagers_plot/{eval_type}/average_by_dataset": wandb.Image(str(save_path))})
+                    self.wandb_logger.run.log(
+                        {f"wagers_plot/{eval_type}/average_by_dataset": wandb.Image(str(save_path))},
+                        step=self._global_wandb_step,
+                    )
                 else:
-                    self.wandb_logger.log({f"wagers_plot/{eval_type}/average_by_dataset": wandb.Image(str(save_path))})
+                    self.wandb_logger.log(
+                        {f"wagers_plot/{eval_type}/average_by_dataset": wandb.Image(str(save_path))},
+                        step=self._global_wandb_step,
+                    )
             except Exception as e:
                 raise Exception(f"Error logging plot to wandb: {e}")
         
@@ -848,7 +896,14 @@ class WageringEvaluator:
         
         if self.wandb_logger:
             import wandb
-            self.wandb_logger.log({f"wagers_plot/average_by_dataset/{eval_type}": wandb.Image(str(save_path))})
+            plot_image_primary = wandb.Image(str(save_path))
+            plot_image_alias = wandb.Image(str(save_path))
+            self._log_wandb_plot(
+                {
+                    f"wagers_plot/{eval_type}/average_by_dataset": plot_image_primary,
+                    f"wagers_plot/average_by_dataset/{eval_type}": plot_image_alias,
+                }
+            )
         
         plt.close(fig)
         

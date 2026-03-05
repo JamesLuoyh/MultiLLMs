@@ -42,6 +42,7 @@ def load_wagering_method(
     from .moe_wagers import MoEWagers
     from .mse_br_wagers import MSEBrWagers
     from .mse_br_wagers_v2 import MSEBrWagersV2
+    from .mse_br_wagers_v3 import MSEBrWagersV3
 
     
     # Built-in methods mapping
@@ -58,6 +59,7 @@ def load_wagering_method(
         "moe_wagers": MoEWagers,
         "mse_br_wagers": MSEBrWagers,
         "mse_br_wagers_v2": MSEBrWagersV2,
+        "mse_br_wagers_v3": MSEBrWagersV3,
     }
     
     if method_name in methods:
