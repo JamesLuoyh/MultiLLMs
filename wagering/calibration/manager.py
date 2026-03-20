@@ -1,0 +1,670 @@
+"""Adaptive temperature scaling over cached multiple-choice logits."""
+
+from __future__ import annotations
+
+import copy
+import logging
+import math
+from pathlib import Path
+import sys
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+from torch import nn
+from torch.nn.utils import clip_grad_norm_
+from torch.utils.data import DataLoader, TensorDataset
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+SRC_PATH = PROJECT_ROOT / "src"
+if str(SRC_PATH) not in sys.path:
+    sys.path.insert(0, str(SRC_PATH))
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from wagering.core.dataset import Dataset
+from wagering.core.model import WhiteboxModel
+
+from wagering.utils import generate_calibration_dir, load_datasets_from_config, load_models_from_config
+from wagering.utils.multi_llm_ensemble import (
+    assign_pubmedqa_context_models,
+    collect_option_logits_and_hidden_states_for_model,
+    get_model_prompt_variant,
+    get_cached_logits_and_hidden_states_for_model,
+    set_cached_logits_and_hidden_states_for_model,
+)
+
+log = logging.getLogger("wagering")
+
+
+def calibration_enabled(args: Dict[str, Any]) -> bool:
+    """Return whether cached-logit calibration is enabled for this run."""
+    return bool(args.get("calibrated", False))
+
+
+def get_calibration_config(args: Dict[str, Any]) -> Dict[str, Any]:
+    """Validate and return the calibration config block."""
+    if not calibration_enabled(args):
+        return {}
+
+    calibration_config = args.get("calibration")
+    if not isinstance(calibration_config, dict):
+        raise ValueError("calibrated=true requires a calibration config via _include_calibration or calibration")
+    if "datasets" not in calibration_config or not calibration_config["datasets"]:
+        raise ValueError("Calibration config must define at least one dataset")
+    return calibration_config
+
+
+def resolve_calibration_artifact_dir(args: Dict[str, Any]) -> Optional[Path]:
+    """Resolve the artifact directory for the temperature calibrator."""
+    if not calibration_enabled(args):
+        return None
+
+    calibration_config = get_calibration_config(args)
+    base_dir = Path(
+        calibration_config.get(
+            "checkpoint_base_dir",
+            "/common/users/yl2310/MultiLLMs/calibration_checkpoints",
+        )
+    )
+    return generate_calibration_dir(
+        base_dir=base_dir,
+        models=args["models"],
+        datasets=calibration_config["datasets"],
+        calibration_config=calibration_config,
+        create_hash=True,
+    )
+
+
+class TemperatureScalingHead(nn.Module):
+    """Small MLP that predicts one temperature per example from cached hidden states."""
+
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_layers: Sequence[int],
+        min_temperature: float,
+        max_temperature: Optional[float],
+        init_temperature: float,
+        dropout: float,
+    ):
+        super().__init__()
+        if input_dim <= 0:
+            raise ValueError(f"input_dim must be positive, got {input_dim}")
+        if init_temperature <= min_temperature:
+            raise ValueError("init_temperature must be larger than min_temperature")
+
+        layers: List[nn.Module] = []
+        prev_dim = input_dim
+        for hidden_dim in hidden_layers:
+            layers.append(nn.Linear(prev_dim, int(hidden_dim)))
+            layers.append(nn.ReLU())
+            if dropout > 0:
+                layers.append(nn.Dropout(dropout))
+            prev_dim = int(hidden_dim)
+
+        self.backbone = nn.Sequential(*layers) if layers else nn.Identity()
+        self.output = nn.Linear(prev_dim, 1)
+        self.min_temperature = float(min_temperature)
+        self.max_temperature = float(max_temperature) if max_temperature is not None else None
+
+        target_delta = max(init_temperature - self.min_temperature, 1e-3)
+        with torch.no_grad():
+            self.output.weight.zero_()
+            self.output.bias.fill_(math.log(math.expm1(target_delta)))
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        features = self.backbone(hidden_states)
+        raw_temperature = self.output(features).squeeze(-1)
+        temperatures = F.softplus(raw_temperature) + self.min_temperature
+        if self.max_temperature is not None:
+            temperatures = torch.clamp(temperatures, max=self.max_temperature)
+        return temperatures
+
+
+class AdaptiveTemperatureCalibrator(nn.Module):
+    """Per-model adaptive temperature scaling over cached option logits."""
+
+    artifact_name = "temperature_calibration.pt"
+
+    def __init__(
+        self,
+        model_paths: Sequence[str],
+        input_dims: Sequence[int],
+        config: Dict[str, Any],
+    ):
+        super().__init__()
+        if len(model_paths) != len(input_dims):
+            raise ValueError("model_paths and input_dims must have the same length")
+
+        self.model_paths = list(model_paths)
+        self.input_dims = [int(dim) for dim in input_dims]
+        self.config = dict(config)
+        self.device_name = str(self.config.get("device", "cpu"))
+        self.device = torch.device(self.device_name)
+        self.batch_size = int(self.config.get("batch_size", 64))
+        self.inference_batch_size = int(self.config.get("inference_batch_size", max(self.batch_size, 256)))
+        self.learning_rate = float(self.config.get("learning_rate", 1e-4))
+        self.weight_decay = float(self.config.get("weight_decay", 1e-5))
+        self.num_epochs = int(self.config.get("num_epochs", 20))
+        self.validation_split_ratio = float(self.config.get("validation_split_ratio", 0.1))
+        self.early_stopping_patience = int(self.config.get("early_stopping_patience", 5))
+        self.max_grad_norm = float(self.config.get("max_grad_norm", 1.0))
+        self.shuffle_seed = int(self.config.get("shuffle_seed", 42))
+
+        hidden_layers = self.config.get("head_hidden_layers", self.config.get("hidden_layers", []))
+        dropout = float(self.config.get("dropout", 0.0))
+        min_temperature = float(self.config.get("min_temperature", 0.05))
+        max_temperature = self.config.get("max_temperature", 10.0)
+        init_temperature = float(self.config.get("init_temperature", 1.0))
+
+        self.heads = nn.ModuleList(
+            [
+                TemperatureScalingHead(
+                    input_dim=input_dim,
+                    hidden_layers=hidden_layers,
+                    min_temperature=min_temperature,
+                    max_temperature=max_temperature,
+                    init_temperature=init_temperature,
+                    dropout=dropout,
+                )
+                for input_dim in self.input_dims
+            ]
+        )
+        self.to(self.device)
+        self.eval()
+
+    @staticmethod
+    def _coerce_hidden_states_by_model(hidden_states: Any) -> List[np.ndarray]:
+        if isinstance(hidden_states, list):
+            return [np.asarray(model_hidden, dtype=np.float32) for model_hidden in hidden_states]
+
+        array = np.asarray(hidden_states, dtype=np.float32)
+        if array.ndim == 3:
+            return [array[model_idx] for model_idx in range(array.shape[0])]
+        if array.ndim == 2:
+            return [array]
+
+        raise ValueError(f"Unsupported hidden state shape for calibration: {array.shape}")
+
+    @staticmethod
+    def _coerce_logits_by_model(model_logits: Any) -> List[np.ndarray]:
+        if isinstance(model_logits, list):
+            return [np.asarray(model_logit, dtype=np.float32) for model_logit in model_logits]
+
+        array = np.asarray(model_logits, dtype=np.float32)
+        if array.ndim == 3:
+            return [array[model_idx] for model_idx in range(array.shape[0])]
+        if array.ndim == 2:
+            return [array]
+
+        raise ValueError(f"Unsupported logit shape for calibration: {array.shape}")
+
+    def freeze(self) -> None:
+        """Freeze all heads for inference after calibration."""
+        self.eval()
+        for parameter in self.parameters():
+            parameter.requires_grad_(False)
+
+    def _evaluate_loss(
+        self,
+        head: TemperatureScalingHead,
+        hidden_states: torch.Tensor,
+        logits: torch.Tensor,
+        labels: torch.Tensor,
+    ) -> float:
+        head.eval()
+        if labels.numel() == 0:
+            return float("nan")
+
+        losses: List[float] = []
+        with torch.no_grad():
+            for start in range(0, labels.shape[0], self.inference_batch_size):
+                end = min(start + self.inference_batch_size, labels.shape[0])
+                batch_hidden = hidden_states[start:end].to(self.device)
+                batch_logits = logits[start:end].to(self.device)
+                batch_labels = labels[start:end].to(self.device)
+                temperatures = head(batch_hidden)
+                scaled_logits = batch_logits / temperatures.unsqueeze(-1)
+                losses.append(float(F.cross_entropy(scaled_logits, batch_labels).detach().cpu().item()))
+        return float(np.mean(losses)) if losses else float("nan")
+
+    def _fit_single_model(
+        self,
+        model_index: int,
+        logits: np.ndarray,
+        hidden_states: np.ndarray,
+        labels: np.ndarray,
+    ) -> Dict[str, float]:
+        head = self.heads[model_index]
+        trainable_params = [parameter for parameter in head.parameters() if parameter.requires_grad]
+        optimizer = torch.optim.AdamW(
+            trainable_params,
+            lr=self.learning_rate,
+            weight_decay=self.weight_decay,
+        )
+        
+        rng = np.random.RandomState(self.shuffle_seed + model_index)
+        indices = np.arange(labels.shape[0], dtype=np.int64)
+        rng.shuffle(indices)
+
+        val_size = int(round(labels.shape[0] * self.validation_split_ratio))
+        if val_size >= labels.shape[0]:
+            val_size = max(labels.shape[0] - 1, 0)
+        train_indices = indices[val_size:]
+        val_indices = indices[:val_size]
+        if train_indices.size == 0:
+            train_indices = indices
+            val_indices = np.array([], dtype=np.int64)
+
+        train_hidden = torch.from_numpy(hidden_states[train_indices]).float()
+        train_logits = torch.from_numpy(logits[train_indices]).float()
+        train_labels = torch.from_numpy(labels[train_indices]).long()
+        val_hidden = torch.from_numpy(hidden_states[val_indices]).float()
+        val_logits = torch.from_numpy(logits[val_indices]).float()
+        val_labels = torch.from_numpy(labels[val_indices]).long()
+
+        train_dataset = TensorDataset(train_hidden, train_logits, train_labels)
+        train_loader = DataLoader(train_dataset, batch_size=self.batch_size, shuffle=True, drop_last=False)
+
+        best_state = copy.deepcopy(head.state_dict())
+        best_val_loss = float("inf")
+        epochs_without_improvement = 0
+
+        baseline_nll = self._evaluate_loss(
+            head=head,
+            hidden_states=torch.from_numpy(hidden_states).float(),
+            logits=torch.from_numpy(logits).float(),
+            labels=torch.from_numpy(labels).long(),
+        )
+
+        for epoch in range(self.num_epochs):
+            head.train()
+            epoch_losses: List[float] = []
+            for batch_hidden, batch_logits, batch_labels in train_loader:
+                batch_hidden = batch_hidden.to(self.device)
+                batch_logits = batch_logits.to(self.device)
+                batch_labels = batch_labels.to(self.device)
+
+                temperatures = head(batch_hidden)
+                scaled_logits = batch_logits / temperatures.unsqueeze(-1)
+                loss = F.cross_entropy(scaled_logits, batch_labels)
+
+                optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                clip_grad_norm_(head.parameters(), self.max_grad_norm)
+                optimizer.step()
+                epoch_losses.append(float(loss.detach().cpu().item()))
+
+            train_loss = float(np.mean(epoch_losses)) if epoch_losses else float("nan")
+            if val_indices.size > 0:
+                monitored_loss = self._evaluate_loss(head, val_hidden, val_logits, val_labels)
+            else:
+                monitored_loss = train_loss
+
+            if monitored_loss + 1e-8 < best_val_loss:
+                best_val_loss = monitored_loss
+                best_state = copy.deepcopy(head.state_dict())
+                epochs_without_improvement = 0
+            else:
+                epochs_without_improvement += 1
+                if epochs_without_improvement >= self.early_stopping_patience:
+                    break
+
+            log.info(
+                "Calibration model %d epoch %d/%d - train_nll=%.4f monitored_nll=%.4f",
+                model_index,
+                epoch + 1,
+                self.num_epochs,
+                train_loss,
+                monitored_loss,
+            )
+
+        head.load_state_dict(best_state)
+        final_nll = self._evaluate_loss(
+            head=head,
+            hidden_states=torch.from_numpy(hidden_states).float(),
+            logits=torch.from_numpy(logits).float(),
+            labels=torch.from_numpy(labels).long(),
+        )
+
+        return {
+            "baseline_nll": baseline_nll,
+            "final_nll": final_nll,
+            "best_val_nll": best_val_loss,
+        }
+
+    def fit(
+        self,
+        all_model_logits: Any,
+        all_hidden_states: Any,
+        labels: np.ndarray,
+    ) -> Dict[str, Any]:
+        """Fit one adaptive temperature head independently per model."""
+        logits_by_model = self._coerce_logits_by_model(all_model_logits)
+        hidden_states_by_model = self._coerce_hidden_states_by_model(all_hidden_states)
+        if len(logits_by_model) != len(self.heads):
+            raise ValueError("Mismatch between logits and number of calibration heads")
+        if len(hidden_states_by_model) != len(self.heads):
+            raise ValueError("Mismatch between hidden states and number of calibration heads")
+
+        labels = np.asarray(labels, dtype=np.int64)
+        metrics = {"model_metrics": []}
+        for model_index, (logits, hidden_states) in enumerate(zip(logits_by_model, hidden_states_by_model)):
+            if logits.shape[0] != hidden_states.shape[0] or logits.shape[0] != labels.shape[0]:
+                raise ValueError("Calibration arrays must align across logits, hidden states, and labels")
+            metrics["model_metrics"].append(
+                self._fit_single_model(model_index, logits=logits, hidden_states=hidden_states, labels=labels)
+            )
+
+        self.freeze()
+        return metrics
+
+    def predict_temperatures(self, hidden_states: np.ndarray, model_index: int) -> np.ndarray:
+        """Predict temperatures for one model over a batch of cached hidden states."""
+        hidden_states = np.asarray(hidden_states, dtype=np.float32)
+        head = self.heads[model_index]
+        temperatures: List[np.ndarray] = []
+        head.eval()
+        with torch.no_grad():
+            for start in range(0, hidden_states.shape[0], self.inference_batch_size):
+                end = min(start + self.inference_batch_size, hidden_states.shape[0])
+                batch_hidden = torch.from_numpy(hidden_states[start:end]).float().to(self.device)
+                batch_temperatures = head(batch_hidden).detach().to(dtype=torch.float32).cpu().numpy()
+                temperatures.append(batch_temperatures)
+        if not temperatures:
+            return np.empty((0,), dtype=np.float32)
+        return np.concatenate(temperatures, axis=0)
+
+    def apply_to_stacked_logits(self, all_model_logits: np.ndarray, all_hidden_states: Any) -> np.ndarray:
+        """Apply frozen temperature scaling to stacked logits [num_models, num_examples, num_options]."""
+        model_logits = np.asarray(all_model_logits, dtype=np.float32)
+        hidden_states_by_model = self._coerce_hidden_states_by_model(all_hidden_states)
+
+        if model_logits.ndim != 3:
+            raise ValueError(f"Expected stacked logits with 3 dims, got {model_logits.shape}")
+        if len(hidden_states_by_model) != model_logits.shape[0]:
+            raise ValueError("Hidden states must provide one array per model")
+
+        calibrated_logits = np.empty_like(model_logits, dtype=np.float32)
+        for model_index in range(model_logits.shape[0]):
+            temperatures = self.predict_temperatures(hidden_states_by_model[model_index], model_index)
+            if temperatures.shape[0] != model_logits.shape[1]:
+                raise ValueError("Predicted temperatures do not align with logit count")
+            calibrated_logits[model_index] = model_logits[model_index] / temperatures[:, None]
+        return calibrated_logits
+
+    def save_pretrained(self, save_dir: str | Path) -> str:
+        """Save the calibrator artifact to disk."""
+        save_path = Path(save_dir)
+        save_path.mkdir(parents=True, exist_ok=True)
+        artifact = {
+            "config": self.config,
+            "model_paths": self.model_paths,
+            "input_dims": self.input_dims,
+            "state_dict": self.state_dict(),
+        }
+        torch.save(artifact, save_path / self.artifact_name)
+        return str(save_path)
+
+    @classmethod
+    def load_pretrained(
+        cls,
+        save_dir: str | Path,
+        device: Optional[str] = None,
+    ) -> "AdaptiveTemperatureCalibrator":
+        """Load a saved calibrator artifact."""
+        save_path = Path(save_dir)
+        artifact = torch.load(save_path / cls.artifact_name, map_location="cpu")
+        config = dict(artifact["config"])
+        if device is not None:
+            config["device"] = device
+        calibrator = cls(
+            model_paths=artifact["model_paths"],
+            input_dims=artifact["input_dims"],
+            config=config,
+        )
+        calibrator.load_state_dict(artifact["state_dict"])
+        calibrator.freeze()
+        return calibrator
+
+
+def _prepare_models_for_datasets(
+    model_cfgs: Sequence[Dict[str, Any]],
+    datasets: Sequence[Dataset],
+    option_tokens: Sequence[str],
+    cache_path: Optional[str],
+    require_hidden_states: bool,
+) -> Tuple[List[WhiteboxModel | str], List[str]]:
+    """Load only the models that are missing required cached artifacts."""
+    cache_miss_indices: List[int] = []
+    model_names: List[str] = []
+
+    for idx, model_cfg in enumerate(model_cfgs):
+        model_path = model_cfg["path"]
+        model_names.append(model_path.replace("/", "_"))
+        dataset_cache_ok = True
+        for dataset in datasets:
+            prompt_variant = get_model_prompt_variant(dataset, model_index=idx)
+            cached_logits, cached_hidden_states, _ = get_cached_logits_and_hidden_states_for_model(
+                model_path,
+                dataset,
+                list(option_tokens),
+                prompt_variant=prompt_variant,
+            )
+            if cached_logits is None or (require_hidden_states and cached_hidden_states is None):
+                dataset_cache_ok = False
+                break
+        if not dataset_cache_ok:
+            cache_miss_indices.append(idx)
+
+    if not cache_miss_indices:
+        return [model_cfg["path"] for model_cfg in model_cfgs], model_names
+
+    missing_cfgs = [model_cfgs[idx] for idx in cache_miss_indices]
+    missing_models, missing_model_names = load_models_from_config(
+        missing_cfgs,
+        cache_kwargs={"cache_dir": cache_path} if cache_path else {},
+    )
+    missing_name_map = {idx: name for idx, name in zip(cache_miss_indices, missing_model_names)}
+    missing_iter = iter(missing_models)
+
+    prepared_models: List[WhiteboxModel | str] = []
+    for idx, model_cfg in enumerate(model_cfgs):
+        if idx in cache_miss_indices:
+            prepared_models.append(next(missing_iter))
+            model_names[idx] = missing_name_map.get(idx, model_names[idx])
+        else:
+            prepared_models.append(model_cfg["path"])
+
+    return prepared_models, model_names
+
+
+def _collect_calibration_arrays(
+    models: Sequence[WhiteboxModel | str],
+    datasets: Sequence[Dataset],
+    option_tokens: Sequence[str],
+    balance_datasets: bool,
+    shuffle_seed: int,
+) -> Tuple[np.ndarray, List[np.ndarray], np.ndarray]:
+    """Load or collect cached logits and hidden states for calibration datasets."""
+    per_dataset_logits: List[np.ndarray] = []
+    per_dataset_hidden_states: List[List[np.ndarray]] = []
+    per_dataset_labels: List[np.ndarray] = []
+
+    for dataset in datasets:
+        dataset_model_logits: List[np.ndarray] = []
+        dataset_model_hidden_states: List[np.ndarray] = []
+        dataset_labels: Optional[np.ndarray] = None
+
+        for model_idx, model in enumerate(models):
+            model_path = model if isinstance(model, str) else model.model_path
+            prompt_variant = get_model_prompt_variant(dataset, model_index=model_idx)
+            cached_logits, cached_hidden_states, cached_labels = get_cached_logits_and_hidden_states_for_model(
+                model_path,
+                dataset,
+                list(option_tokens),
+                prompt_variant=prompt_variant,
+            )
+
+            if cached_logits is None or cached_hidden_states is None:
+                if isinstance(model, str):
+                    raise RuntimeError(
+                        f"Cache miss for model path {model}. A loaded model instance is required to collect calibration caches."
+                    )
+                model_logits, model_hidden_states, model_labels = collect_option_logits_and_hidden_states_for_model(
+                    model,
+                    dataset,
+                    list(option_tokens),
+                    model_identifier=str(model_path),
+                    model_index=model_idx,
+                )
+                set_cached_logits_and_hidden_states_for_model(
+                    model,
+                    dataset,
+                    list(option_tokens),
+                    model_logits,
+                    model_hidden_states,
+                    model_labels,
+                    prompt_variant=prompt_variant,
+                )
+            else:
+                model_logits = cached_logits
+                model_hidden_states = cached_hidden_states
+                model_labels = cached_labels
+
+            model_logits = np.asarray(model_logits, dtype=np.float32)
+            model_hidden_states = np.asarray(model_hidden_states, dtype=np.float32)
+            model_labels = np.asarray(model_labels, dtype=np.int64)
+            if dataset_labels is None:
+                dataset_labels = model_labels
+            elif not np.array_equal(dataset_labels, model_labels):
+                raise RuntimeError("Calibration labels must match across models for the same dataset")
+
+            dataset_model_logits.append(model_logits)
+            dataset_model_hidden_states.append(model_hidden_states)
+
+        if dataset_labels is None:
+            raise RuntimeError("Calibration dataset produced no labels")
+
+        per_dataset_logits.append(np.stack(dataset_model_logits, axis=0))
+        per_dataset_hidden_states.append(dataset_model_hidden_states)
+        per_dataset_labels.append(dataset_labels)
+
+    if balance_datasets and per_dataset_labels:
+        rng = np.random.RandomState(shuffle_seed)
+        min_size = min(label_array.shape[0] for label_array in per_dataset_labels)
+        for dataset_idx, label_array in enumerate(per_dataset_labels):
+            if label_array.shape[0] == min_size:
+                indices = np.arange(min_size, dtype=np.int64)
+            else:
+                indices = np.sort(rng.choice(label_array.shape[0], size=min_size, replace=False))
+            per_dataset_logits[dataset_idx] = per_dataset_logits[dataset_idx][:, indices, :]
+            per_dataset_hidden_states[dataset_idx] = [hidden_state[indices] for hidden_state in per_dataset_hidden_states[dataset_idx]]
+            per_dataset_labels[dataset_idx] = label_array[indices]
+
+    stacked_logits = np.concatenate(per_dataset_logits, axis=1)
+    hidden_states_by_model = [
+        np.concatenate([per_dataset_hidden_states[dataset_idx][model_idx] for dataset_idx in range(len(per_dataset_hidden_states))], axis=0)
+        for model_idx in range(len(models))
+    ]
+    labels = np.concatenate(per_dataset_labels, axis=0)
+    return stacked_logits, hidden_states_by_model, labels
+
+
+def fit_or_load_logit_calibrator(
+    args: Dict[str, Any],
+    calibration_path: Optional[str] = None,
+    force_refit: bool = False,
+) -> Tuple[Optional[AdaptiveTemperatureCalibrator], Optional[str], bool]:
+    """Fit or load the cached-logit temperature calibrator for a run."""
+    if not calibration_enabled(args):
+        return None, None, False
+
+    calibration_config = get_calibration_config(args)
+    artifact_dir = Path(calibration_path) if calibration_path is not None else resolve_calibration_artifact_dir(args)
+    if artifact_dir is None:
+        raise RuntimeError("Could not resolve calibration artifact directory")
+
+    artifact_file = artifact_dir / AdaptiveTemperatureCalibrator.artifact_name
+    reuse_existing = bool(calibration_config.get("reuse_existing", True))
+    if artifact_file.exists() and reuse_existing and not force_refit:
+        calibrator = AdaptiveTemperatureCalibrator.load_pretrained(
+            artifact_dir,
+            device=str(calibration_config.get("device", "cpu")),
+        )
+        log.info("Loaded existing temperature calibrator from %s", artifact_dir)
+        return calibrator, str(artifact_dir), False
+
+    dataset_split_seed = args.get(
+        "seed",
+        args.get("shuffle_seed", calibration_config.get("shuffle_seed", 42)),
+    )
+    datasets, dataset_names = load_datasets_from_config(
+        calibration_config["datasets"],
+        split="train",
+        random_seed=dataset_split_seed,
+    )
+    log.info("Loaded %d calibration datasets: %s", len(datasets), dataset_names)
+
+    pubmedqa_context_seed = dataset_split_seed
+    pubmedqa_assignments = assign_pubmedqa_context_models(
+        datasets,
+        [model_cfg["path"] for model_cfg in args["models"]],
+        random_seed=pubmedqa_context_seed,
+    )
+    for dataset_idx, assignment_info in pubmedqa_assignments.items():
+        dataset_name = dataset_names[dataset_idx] if dataset_idx < len(dataset_names) else f"dataset_{dataset_idx}"
+        assignment_hash = assignment_info.get("assignment_hash", "unknown")
+        num_examples = assignment_info.get("num_examples", len(datasets[dataset_idx].x))
+        routing_seed = assignment_info.get("routing_seed", pubmedqa_context_seed)
+        model_context_counts = assignment_info.get("model_context_counts", [])
+        log.info(
+            "PubMedQA balanced mixed-context assignment for calibration dataset %s: assignment_hash=%s, num_examples=%s, routing_seed=%s",
+            dataset_name,
+            assignment_hash,
+            num_examples,
+            routing_seed,
+        )
+        if isinstance(model_context_counts, list):
+            for model_idx, context_count in enumerate(model_context_counts):
+                model_path = args["models"][model_idx]["path"] if model_idx < len(args["models"]) else f"model_{model_idx}"
+                log.info(
+                    "PubMedQA context count for calibration dataset %s: model_index=%d, model=%s, context_examples=%d",
+                    dataset_name,
+                    model_idx,
+                    model_path,
+                    int(context_count),
+                )
+
+    models, _ = _prepare_models_for_datasets(
+        model_cfgs=args["models"],
+        datasets=datasets,
+        option_tokens=args.get("option_tokens", ["A", "B", "C", "D"]),
+        cache_path=args.get("cache_path"),
+        require_hidden_states=True,
+    )
+
+    all_model_logits, all_hidden_states, labels = _collect_calibration_arrays(
+        models=models,
+        datasets=datasets,
+        option_tokens=args.get("option_tokens", ["A", "B", "C", "D"]),
+        balance_datasets=bool(calibration_config.get("balance_datasets", True)),
+        shuffle_seed=int(calibration_config.get("shuffle_seed", 42)),
+    )
+
+    calibrator = AdaptiveTemperatureCalibrator(
+        model_paths=[model_cfg["path"] for model_cfg in args["models"]],
+        input_dims=[hidden_state.shape[1] for hidden_state in all_hidden_states],
+        config=calibration_config,
+    )
+    metrics = calibrator.fit(
+        all_model_logits=all_model_logits,
+        all_hidden_states=all_hidden_states,
+        labels=labels,
+    )
+    calibrator.save_pretrained(artifact_dir)
+    log.info("Saved temperature calibrator to %s", artifact_dir)
+    log.info("Calibration metrics: %s", metrics)
+    return calibrator, str(artifact_dir), True

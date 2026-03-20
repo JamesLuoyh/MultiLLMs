@@ -14,7 +14,7 @@ import torch.nn as nn
 from typing import Optional, Dict, Any, List, Tuple
 
 from .base import WageringMethod
-from lm_polygraph.utils.model import WhiteboxModel
+from wagering.core.model import WhiteboxModel
 
 
 from .utils import compute_scoring_rule
@@ -428,7 +428,7 @@ class BrRegretWagers(WageringMethod):
                 self.optimizer.load_state_dict(state_dict["optimizer_state_dict"])
             except (ValueError, KeyError) as e:
                 import logging
-                log = logging.getLogger("lm_polygraph")
+                log = logging.getLogger("wagering")
                 log.warning(
                     f"Could not load optimizer state dict (parameter mismatch): {e}. "
                     "Continuing with fresh optimizer state."

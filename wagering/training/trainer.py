@@ -13,14 +13,14 @@ import numpy as np
 import torch
 import pandas as pd
 
-# Add src/ to path for lm_polygraph imports
+# Ensure local project modules are importable
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SRC_PATH = PROJECT_ROOT / "src"
 if str(SRC_PATH) not in sys.path:
     sys.path.insert(0, str(SRC_PATH))
 
-from lm_polygraph.utils.model import WhiteboxModel
-from lm_polygraph.utils.dataset import Dataset
+from wagering.core.model import WhiteboxModel
+from wagering.core.dataset import Dataset
 
 # Local wagering imports
 from wagering.methods.base import WageringMethod
@@ -28,6 +28,7 @@ from wagering.training.analytics import WageringAnalytics
 from wagering.aggregation.base import AggregationFunction
 from wagering.utils.multi_llm_ensemble import (
     collect_option_logits_and_hidden_states_for_model,
+    get_model_prompt_variant,
     get_cached_logits_and_hidden_states_for_model,
     set_cached_logits_and_hidden_states_for_model,
 )
@@ -40,7 +41,7 @@ import matplotlib.pyplot as plt
 import re
 
 from sklearn.metrics import roc_auc_score
-from lm_polygraph.ue_metrics.ece import ECE
+from wagering.core.metrics import ECE
 
 
 def compute_dynamic_regret(
@@ -160,9 +161,12 @@ class WageringTrainer:
         resume_from_checkpoint: Optional[str] = None,
         shuffle_data: bool = True,
         shuffle_seed: int = 42,
-        early_stopping_patience: int = 10,  # Now in epochs, default 10 epochs
+        early_stopping_patience: int = 10,
         batch_size: int = 100,  # Batch size for training loop
         validation_split_ratio: float = 0.1,  # Fraction of data to use for validation (default: 10%)
+        balance_training_datasets: bool = True,
+        early_stopping_criterion: str = "validation",
+        logit_calibrator: Optional[Any] = None,
     ):
         """
         Initialize the trainer.
@@ -176,6 +180,13 @@ class WageringTrainer:
             checkpoint_dir: Directory for saving checkpoints
             wandb_logger: Optional wandb logger
             save_every: Save checkpoint every N batches
+            early_stopping_patience: Number of non-improving intervals before stopping.
+                Uses epochs for ``validation`` criterion and batches for ``online_learning`` criterion.
+            early_stopping_criterion: Early stopping strategy.
+                - ``validation``: epoch-level stopping based on validation metrics (existing behavior)
+                - ``online_learning``: batch-level stopping on training batches using max nash gap
+            balance_training_datasets: If True, randomly subsample each training
+                dataset to the minimum dataset size before concatenation.
         """
         self.models = models
         self.datasets = datasets
@@ -189,9 +200,17 @@ class WageringTrainer:
         self.resume_from_checkpoint = resume_from_checkpoint
         self.shuffle_data = shuffle_data
         self.shuffle_seed = shuffle_seed
-        self.early_stopping_patience = early_stopping_patience  # In epochs
+        self.early_stopping_patience = early_stopping_patience
+        self.early_stopping_criterion = str(early_stopping_criterion).strip().lower()
+        if self.early_stopping_criterion not in {"validation", "online_learning"}:
+            raise ValueError(
+                "early_stopping_criterion must be one of {'validation', 'online_learning'}, "
+                f"got: {early_stopping_criterion}"
+            )
         self.batch_size = batch_size
         self.validation_split_ratio = validation_split_ratio
+        self.balance_training_datasets = balance_training_datasets
+        self.logit_calibrator = logit_calibrator
         
         if self.checkpoint_dir:
             self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -215,14 +234,18 @@ class WageringTrainer:
         # d_regret is a loss metric, so lower is better (initialized to infinity)
         self.best_d_regret = float('inf')
         self.best_nash_gap = float('inf')  # For methods that provide Nash gap metric
+        self.best_batch_nash_gap = float('inf')  # For online-learning batch-level nash gap criterion
         self.epochs_since_improvement = 0
+        self.batches_since_improvement = 0
         self.early_stopped = False
         self.best_wagering_method_state = None  # Store the best checkpoint state
         self.best_epoch = None  # Track which epoch had the best checkpoint
+        self.best_batch_step = None  # Track global step for online-learning best checkpoint
         
         # Collect per-dataset cached logits/hidden states first, then combine datasets and shuffle
         self._collect_logits()
         self._collect_hidden_states()
+        self._apply_logit_calibration()
         self._prepare_datasets()
         # Sanity check: combined dataset length must match cached logits/hidden states
         if hasattr(self, "all_model_logits") and self.all_model_logits is not None:
@@ -324,19 +347,123 @@ class WageringTrainer:
         return display_names, slug_names
         
     def _prepare_datasets(self):
-        """Concatenate all datasets WITHOUT shuffling (after per-dataset cache collection).
-        
-        Shuffling and train/validation split happen AFTER cache loading in _apply_shuffling().
+        """Concatenate training datasets WITHOUT shuffling (after cache collection).
+
+        If ``self.balance_training_datasets`` is True, each dataset is randomly
+        subsampled (without replacement) to the minimum dataset size across
+        ``self.datasets`` before concatenation. Otherwise, the full datasets are
+        concatenated.
+
+        Shuffling and train/validation split happen AFTER cache loading in
+        ``_apply_shuffling()``.
         """
+        if not self.datasets:
+            self.combined_dataset = Dataset([], [], batch_size=8)
+            self.labels = np.array([], dtype=np.int32)
+            self.dataset_indices = np.array([], dtype=np.int32)
+            return
+
+        dataset_sizes = [len(dataset.x) for dataset in self.datasets]
+        total_unbalanced_size = int(np.sum(dataset_sizes))
+        if total_unbalanced_size <= 0:
+            raise ValueError(
+                "Cannot build training set: all datasets are empty."
+            )
+
+        min_dataset_size = min(dataset_sizes)
+        if self.balance_training_datasets and min_dataset_size <= 0:
+            raise ValueError(
+                "Cannot build balanced training set: at least one dataset is empty."
+            )
+
+        if self.balance_training_datasets and len(set(dataset_sizes)) > 1:
+            log.info(
+                "Balancing training datasets to %d samples each via random subsampling (dataset sizes: %s)",
+                min_dataset_size,
+                dataset_sizes,
+            )
+        elif not self.balance_training_datasets:
+            log.info(
+                "Using full training datasets without balancing (dataset sizes: %s)",
+                dataset_sizes,
+            )
+
         all_x = []
         all_y = []
         dataset_indices = []  # Track which dataset each example came from
+        selected_global_indices = []
+        global_offset = 0
+        sampling_rng = np.random.RandomState(self.shuffle_seed) if self.balance_training_datasets else None
         
         for dataset_idx, dataset in enumerate(self.datasets):
-            all_x.extend(dataset.x)
-            all_y.extend(dataset.y)
+            dataset_len = len(dataset.x)
+            if self.balance_training_datasets:
+                if dataset_len == min_dataset_size:
+                    selected_local_indices = np.arange(min_dataset_size, dtype=np.int64)
+                else:
+                    selected_local_indices = np.sort(
+                        sampling_rng.choice(
+                            dataset_len,
+                            size=min_dataset_size,
+                            replace=False,
+                        )
+                    )
+            else:
+                selected_local_indices = np.arange(dataset_len, dtype=np.int64)
+
+            all_x.extend(dataset.x[i] for i in selected_local_indices)
+            all_y.extend(dataset.y[i] for i in selected_local_indices)
             # Track dataset index for each example
-            dataset_indices.extend([dataset_idx] * len(dataset.x))
+            dataset_indices.extend([dataset_idx] * len(selected_local_indices))
+            selected_global_indices.extend((global_offset + selected_local_indices).tolist())
+            global_offset += dataset_len
+
+        selected_global_indices = np.array(selected_global_indices, dtype=np.int64)
+
+        full_selection_indices = np.arange(total_unbalanced_size, dtype=np.int64)
+        did_select_subset = not np.array_equal(selected_global_indices, full_selection_indices)
+
+        if did_select_subset:
+            # Keep cached logits aligned with dataset selection.
+            if hasattr(self, "all_model_logits") and self.all_model_logits is not None:
+                if self.all_model_logits.shape[1] != total_unbalanced_size:
+                    raise RuntimeError(
+                        f"Unexpected logits size before selection: got {self.all_model_logits.shape[1]}, "
+                        f"expected {total_unbalanced_size}."
+                    )
+                self.all_model_logits = self.all_model_logits[:, selected_global_indices, :]
+
+            # Keep cached hidden states aligned with dataset selection.
+            if hasattr(self, "all_hidden_states") and self.all_hidden_states is not None:
+                if isinstance(self.all_hidden_states, list):
+                    selected_hidden_states = []
+                    for model_idx, model_hidden_states in enumerate(self.all_hidden_states):
+                        if model_hidden_states.shape[0] != total_unbalanced_size:
+                            raise RuntimeError(
+                                "Unexpected hidden states size before selection for model "
+                                f"{model_idx}: got {model_hidden_states.shape[0]}, "
+                                f"expected {total_unbalanced_size}."
+                            )
+                        selected_hidden_states.append(
+                            model_hidden_states[selected_global_indices, ...]
+                        )
+                    self.all_hidden_states = selected_hidden_states
+                elif self.all_hidden_states.ndim == 3:
+                    if self.all_hidden_states.shape[1] != total_unbalanced_size:
+                        raise RuntimeError(
+                            "Unexpected hidden states size before selection: "
+                            f"got {self.all_hidden_states.shape[1]}, "
+                            f"expected {total_unbalanced_size}."
+                        )
+                    self.all_hidden_states = self.all_hidden_states[:, selected_global_indices, :]
+                else:
+                    if self.all_hidden_states.shape[0] != total_unbalanced_size:
+                        raise RuntimeError(
+                            "Unexpected hidden states size before selection: "
+                            f"got {self.all_hidden_states.shape[0]}, "
+                            f"expected {total_unbalanced_size}."
+                        )
+                    self.all_hidden_states = self.all_hidden_states[selected_global_indices, ...]
         
         # Convert labels to indices if needed
         labels = []
@@ -352,6 +479,7 @@ class WageringTrainer:
         self.combined_dataset = Dataset(all_x, all_y, batch_size=batch_size)
         self.labels = np.array(labels, dtype=np.int32)
         self.dataset_indices = np.array(dataset_indices, dtype=np.int32)
+
     def _apply_shuffling(self):
         """Apply shuffling to cached arrays and create train/validation splits.
         
@@ -600,6 +728,26 @@ class WageringTrainer:
                 running_avgs[key] = float(np.mean(values))
         
         return running_avgs
+
+    def _compute_batch_max_nash_gap(self, nash_gap: Any) -> Optional[float]:
+        """Compute a scalar max-nash-gap statistic for batch-level early stopping."""
+        if nash_gap is None:
+            return None
+
+        nash_gap_arr = np.asarray(nash_gap)
+        if nash_gap_arr.size == 0:
+            return None
+
+        # Treat axis 0 as batch axis; if input is 1D this promotes it to a
+        # single-batch 2D array so axis=0 still works consistently.
+        nash_gap_arr = np.atleast_2d(nash_gap_arr)
+        per_model_nash_gap = np.mean(nash_gap_arr, axis=0)
+        max_nash_gap = float(np.max(per_model_nash_gap))
+
+        if not np.isfinite(max_nash_gap):
+            raise ValueError(f"Non-finite max nash gap computed: {max_nash_gap} (nash_gap input: {nash_gap})")
+
+        return max_nash_gap
     
     def _plot_validation_wagers_by_dataset(
         self,
@@ -932,8 +1080,12 @@ class WageringTrainer:
             
             for model_idx, model in enumerate(self.models):
                 model_path = model if isinstance(model, str) else model.model_path
+                prompt_variant = get_model_prompt_variant(dataset, model_index=model_idx)
                 cached_logits, cached_hidden_states, cached_labels = get_cached_logits_and_hidden_states_for_model(
-                    model_path, dataset, self.option_tokens
+                    model_path,
+                    dataset,
+                    self.option_tokens,
+                    prompt_variant=prompt_variant,
                 )
                 
                 if cached_logits is not None and cached_hidden_states is not None:
@@ -953,11 +1105,20 @@ class WageringTrainer:
                             f"Cache miss for model path {model}. Model must be loaded to collect logits."
                         )
                     model_logits, model_hidden_states, model_labels = collect_option_logits_and_hidden_states_for_model(
-                        model, dataset, self.option_tokens
+                        model,
+                        dataset,
+                        self.option_tokens,
+                        model_identifier=str(model_path),
+                        model_index=model_idx,
                     )
                     set_cached_logits_and_hidden_states_for_model(
-                        model, dataset, self.option_tokens,
-                        model_logits, model_hidden_states, model_labels
+                        model,
+                        dataset,
+                        self.option_tokens,
+                        model_logits,
+                        model_hidden_states,
+                        model_labels,
+                        prompt_variant=prompt_variant,
                     )
                 else:
                     if isinstance(model, str):
@@ -970,11 +1131,20 @@ class WageringTrainer:
                     )
                     try:
                         model_logits, model_hidden_states, model_labels = collect_option_logits_and_hidden_states_for_model(
-                            model, dataset, self.option_tokens
+                            model,
+                            dataset,
+                            self.option_tokens,
+                            model_identifier=str(model_path),
+                            model_index=model_idx,
                         )
                         set_cached_logits_and_hidden_states_for_model(
-                            model, dataset, self.option_tokens,
-                            model_logits, model_hidden_states, model_labels
+                            model,
+                            dataset,
+                            self.option_tokens,
+                            model_logits,
+                            model_hidden_states,
+                            model_labels,
+                            prompt_variant=prompt_variant,
                         )
                     except Exception as e:
                         raise RuntimeError(
@@ -1049,6 +1219,22 @@ class WageringTrainer:
         # Hidden states should always be collected with logits in _collect_logits with per-model caching
         raise RuntimeError("Hidden states not found. They should have been collected with logits in _collect_logits. "
                    "Some wagering methods may not work correctly.")
+
+    def _apply_logit_calibration(self):
+        """Apply frozen temperature scaling to cached logits before training logic runs."""
+        if self.logit_calibrator is None:
+            return
+
+        if not hasattr(self, "all_model_logits") or self.all_model_logits is None:
+            raise RuntimeError("Logit calibration requested but no cached logits are available")
+        if not hasattr(self, "all_hidden_states") or self.all_hidden_states is None:
+            raise RuntimeError("Logit calibration requested but cached hidden states are unavailable")
+
+        self.all_model_logits = self.logit_calibrator.apply_to_stacked_logits(
+            self.all_model_logits,
+            self.all_hidden_states,
+        )
+        log.info("Applied frozen temperature scaling to cached training logits")
     
     def train(self, num_epochs: int = 100) -> Dict[str, Any]:
         """
@@ -1088,6 +1274,19 @@ class WageringTrainer:
         all_predictions = []
         all_aggregated_probs = []
         wagers_history = []
+        stop_training_now = False
+
+        if self.early_stopping_patience > 0:
+            if self.early_stopping_criterion == "online_learning":
+                log.info(
+                    "Early stopping enabled: criterion=online_learning, "
+                    f"patience={self.early_stopping_patience} batches"
+                )
+            else:
+                log.info(
+                    "Early stopping enabled: criterion=validation, "
+                    f"patience={self.early_stopping_patience} epochs"
+                )
         
         for epoch in range(self.start_epoch, num_epochs):
             log.debug(f"Epoch {epoch+1}/{num_epochs}")
@@ -1157,6 +1356,53 @@ class WageringTrainer:
                 )  # [batch_size, num_models]
                 
                 batch_wagers = res_dict["wagers"]
+                nash_gap = res_dict.get("nash_gap", None)
+                batch_nash_gap_max = self._compute_batch_max_nash_gap(nash_gap)
+
+                if self.early_stopping_criterion == "online_learning" and self.early_stopping_patience > 0:
+                    if batch_nash_gap_max is None:
+                        raise RuntimeError(
+                            "early_stopping_criterion='online_learning' requires compute_wagers() "
+                            "to return a finite 'nash_gap' for each training batch."
+                        )
+
+                    if batch_nash_gap_max < self.best_batch_nash_gap:
+                        self.best_batch_nash_gap = batch_nash_gap_max
+                        self.batches_since_improvement = 0
+                        self.best_wagering_method_state = copy.deepcopy(self.wagering_method.state_dict())
+                        self.best_epoch = epoch
+                        self.best_batch_step = epoch * num_examples + batch_end
+
+                        if self.checkpoint_dir:
+                            best_checkpoint_path = self.checkpoint_dir / "best_checkpoint"
+                            best_checkpoint_path.mkdir(parents=True, exist_ok=True)
+                            self.wagering_method.save_pretrained(str(best_checkpoint_path))
+                            log.debug(
+                                "New best online-learning nash gap: %.6f at epoch %d batch %d (global step %d)",
+                                self.best_batch_nash_gap,
+                                epoch + 1,
+                                batch_idx + 1,
+                                self.best_batch_step,
+                            )
+                    else:
+                        self.batches_since_improvement += 1
+
+                    if self.batches_since_improvement >= self.early_stopping_patience:
+                        log.info(
+                            "Early stopping (online_learning): max batch nash gap did not improve "
+                            "for %d batches. Best max nash gap: %.6f%s",
+                            self.early_stopping_patience,
+                            self.best_batch_nash_gap,
+                            (
+                                f" (epoch {self.best_epoch + 1}, step {self.best_batch_step})"
+                                if self.best_epoch is not None and self.best_batch_step is not None
+                                else ""
+                            ),
+                        )
+                        self.early_stopped = True
+                        stop_training_now = True
+                        break
+
                 # Aggregate predictions for entire batch
                 batch_aggregated_log_probs, batch_aggregated_probs = self.aggregation_function.aggregate(
                     batch_logits_transposed, batch_wagers
@@ -1203,6 +1449,8 @@ class WageringTrainer:
                         "train/batch/nll": float(np.mean(batch_nll)),
                         "train/batch/batch_size": batch_size_actual,
                     }
+                    if batch_nash_gap_max is not None:
+                        wandb_log_dict["train/batch/nash_gap_max"] = float(batch_nash_gap_max)
                     
                     # Add average wager statistics
                     for i in range(batch_wagers.shape[1]):
@@ -1235,6 +1483,9 @@ class WageringTrainer:
                 else:
                     # Update current_step even without wandb logger
                     self.current_step = epoch * num_examples + batch_end
+
+                if stop_training_now:
+                    break
             
 
             # Checkpoint after epoch
@@ -1253,6 +1504,9 @@ class WageringTrainer:
             
             epoch_accuracies.append(epoch_accuracy)
             log.info(f"Epoch {epoch+1} training accuracy: {epoch_accuracy:.4f}, NLL: {epoch_nll:.4f}")
+
+            if stop_training_now:
+                break
             
             # Evaluate on validation set if available
             val_metrics = {}
@@ -1271,12 +1525,12 @@ class WageringTrainer:
                     latest_val_score_diff_for_plot = np.asarray(val_score_diff, dtype=np.float32).copy()
                     latest_val_epoch = epoch
             else:
-                # Fall back to training d_regret if no validation set
-                val_d_regret = epoch_d_regret
-                log.info("No validation set available, using training d_regret for early stopping")
+                val_d_regret = None
+                if self.early_stopping_criterion == "validation":
+                    log.info("No validation set available; validation-based early stopping is disabled")
 
             # Check for epsilon Nash equilibrium if wagering method provides Nash gap metric
-            if val_nash_gap is not None:
+            if self.early_stopping_criterion == "validation" and val_nash_gap is not None:
                 log.info(f"Validation Nash gap for epoch {epoch+1}: {val_nash_gap}")
                 val_nash_gap_max = float(np.max(val_nash_gap))  # Use max Nash gap across models for early stopping
                 val_nash_gap_mean = float(np.mean(val_nash_gap))
@@ -1295,49 +1549,53 @@ class WageringTrainer:
                 )
                 val_nash_gap_history_epochs.append(epoch + 1)
                 
-                # if val_nash_gap_max < self.best_nash_gap:
-                #     self.best_nash_gap = val_nash_gap_max
-                #     self.epochs_since_improvement = 0
-                #     # Save the best checkpoint state (in memory and to disk)
-                #     # IMPORTANT: Use deep copy to avoid reference issues where subsequent
-                #     # training updates would modify the stored checkpoint state
-                #     self.best_wagering_method_state = copy.deepcopy(self.wagering_method.state_dict())
-                #     self.best_epoch = epoch
-                #     if val_wagers is not None and val_score_diff is not None:
-                #         best_val_wagers_for_plot = np.asarray(val_wagers, dtype=np.float32).copy()
-                #         best_val_score_diff_for_plot = np.asarray(val_score_diff, dtype=np.float32).copy()
+                if val_nash_gap_max < self.best_nash_gap:
+                    self.best_nash_gap = val_nash_gap_max
+                    self.epochs_since_improvement = 0
+                    # Save the best checkpoint state (in memory and to disk)
+                    # IMPORTANT: Use deep copy to avoid reference issues where subsequent
+                    # training updates would modify the stored checkpoint state
+                    self.best_wagering_method_state = copy.deepcopy(self.wagering_method.state_dict())
+                    self.best_epoch = epoch
+                    if val_wagers is not None and val_score_diff is not None:
+                        best_val_wagers_for_plot = np.asarray(val_wagers, dtype=np.float32).copy()
+                        best_val_score_diff_for_plot = np.asarray(val_score_diff, dtype=np.float32).copy()
         
-                #     log.debug(f"Saving best checkpoint state dict keys: {list(self.best_wagering_method_state.keys())}")
+                    log.debug(f"Saving best checkpoint state dict keys: {list(self.best_wagering_method_state.keys())}")
         
-                #     if self.checkpoint_dir:
-                #         best_checkpoint_path = self.checkpoint_dir / "best_checkpoint"
-                #         best_checkpoint_path.mkdir(parents=True, exist_ok=True)
-                #         self.wagering_method.save_pretrained(str(best_checkpoint_path))
-                #         log.debug(f"New best nash gap: {self.best_nash_gap:.4f} at epoch {epoch+1} - saved best checkpoint")
-                #     else:
-                #         log.debug(f"New best nash gap: {self.best_nash_gap:.4f} at epoch {epoch+1}")
-                # else:
-                #     self.epochs_since_improvement += 1
+                    if self.checkpoint_dir:
+                        best_checkpoint_path = self.checkpoint_dir / "best_checkpoint"
+                        best_checkpoint_path.mkdir(parents=True, exist_ok=True)
+                        self.wagering_method.save_pretrained(str(best_checkpoint_path))
+                        log.debug(f"New best nash gap: {self.best_nash_gap:.4f} at epoch {epoch+1} - saved best checkpoint")
+                    else:
+                        log.debug(f"New best nash gap: {self.best_nash_gap:.4f} at epoch {epoch+1}")
+                else:
+                    self.epochs_since_improvement += 1
                 
-                # # Check if we should stop early
-                # if self.epochs_since_improvement >= self.early_stopping_patience:
-                #     log.info(
-                #         f"Early stopping: No improvement on validation set for {self.early_stopping_patience} epochs. "
-                #         f"Best validation nash gap: {self.best_nash_gap:.4f} (from epoch {self.best_epoch + 1})"
-                #     )
-                #     self.early_stopped = True
-                #     # Load the best checkpoint before breaking
-                #     if self.best_wagering_method_state is not None:
-                #         log.info(f"Loading best checkpoint from epoch {self.best_epoch + 1} (nash gap={self.best_nash_gap:.4f})")
-                #         log.debug(f"State dict keys before load: {list(self.wagering_method.state_dict().keys())}")
-                #         self.wagering_method.load_state_dict(self.best_wagering_method_state)
-                #         log.debug(f"State dict keys after load: {list(self.wagering_method.state_dict().keys())}")
-                #     break
+                # Check if we should stop early
+                if self.epochs_since_improvement >= self.early_stopping_patience:
+                    log.info(
+                        f"Early stopping: No improvement on validation set for {self.early_stopping_patience} epochs. "
+                        f"Best validation nash gap: {self.best_nash_gap:.4f} (from epoch {self.best_epoch + 1})"
+                    )
+                    self.early_stopped = True
+                    # Load the best checkpoint before breaking
+                    if self.best_wagering_method_state is not None:
+                        log.info(f"Loading best checkpoint from epoch {self.best_epoch + 1} (nash gap={self.best_nash_gap:.4f})")
+                        log.debug(f"State dict keys before load: {list(self.wagering_method.state_dict().keys())}")
+                        self.wagering_method.load_state_dict(self.best_wagering_method_state)
+                        log.debug(f"State dict keys after load: {list(self.wagering_method.state_dict().keys())}")
+                    break
             
 
             # Early stopping: check for improvement on validation set after each epoch
             # d_regret is a loss metric, so lower is better
-            if self.early_stopping_patience > 0 and val_d_regret is not None:
+            elif (
+                self.early_stopping_criterion == "validation"
+                and self.early_stopping_patience > 0
+                and val_d_regret is not None
+            ):
                 if val_d_regret < self.best_d_regret:
                     self.best_d_regret = val_d_regret
                     self.epochs_since_improvement = 0
@@ -1554,7 +1812,9 @@ class WageringTrainer:
                 hyperparams["training/num_datasets"] = len(self.datasets)
                 hyperparams["training/shuffle_data"] = self.shuffle_data
                 hyperparams["training/shuffle_seed"] = self.shuffle_seed
+                hyperparams["training/balance_training_datasets"] = self.balance_training_datasets
                 hyperparams["training/early_stopping_patience"] = self.early_stopping_patience
+                hyperparams["training/early_stopping_criterion"] = self.early_stopping_criterion
                 hyperparams["training/save_every"] = self.save_every
                 hyperparams["training/batch_size"] = self.batch_size
                 hyperparams["training/validation_split_ratio"] = self.validation_split_ratio
@@ -1573,12 +1833,16 @@ class WageringTrainer:
                     self.wandb_logger.config.update(hyperparams)
                     log.debug(f"Logged hyperparameters to wandb: {list(hyperparams.keys())}")
         
-        # Ensure best checkpoint is loaded for downstream evaluation/checkpoint saving
-        if self.best_wagering_method_state is not None and not self.early_stopped:
-            log.debug(
-                "Training completed without early stopping. Loading best checkpoint state "
-                "for final checkpoint saving and evaluation."
-            )
+        # Ensure best checkpoint is loaded for downstream evaluation/checkpoint saving.
+        # This also restores the best state after online-learning batch-level early stopping.
+        if self.best_wagering_method_state is not None:
+            if not self.early_stopped:
+                log.debug(
+                    "Training completed without early stopping. Loading best checkpoint state "
+                    "for final checkpoint saving and evaluation."
+                )
+            elif self.early_stopping_criterion == "online_learning":
+                log.debug("Loading best checkpoint state after online-learning early stopping.")
             self.wagering_method.load_state_dict(self.best_wagering_method_state)
 
         # Plot only one validation wagers-vs-score_diff figure for the best epoch.
@@ -1742,6 +2006,7 @@ class WageringTrainer:
             shuffle_data=self.shuffle_data,
             shuffle_seed=self.shuffle_seed,
             early_stopping_patience=self.early_stopping_patience,
+            early_stopping_criterion=self.early_stopping_criterion,
             save_every=self.save_every,
             results=results,
             metadata=self.metadata,

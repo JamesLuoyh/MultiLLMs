@@ -39,6 +39,7 @@ class WageringAnalytics:
         metadata: Optional[Dict[str, Any]] = None,
         checkpoint_dir: Optional[Path] = None,
         dataset_size: Optional[int] = None,
+        early_stopping_criterion: str = "validation",
     ) -> pd.DataFrame:
         """
         Create analytics dataframe for training results.
@@ -51,6 +52,7 @@ class WageringAnalytics:
             shuffle_data: Whether data was shuffled
             shuffle_seed: Seed for data shuffling
             early_stopping_patience: Early stopping patience
+            early_stopping_criterion: Early stopping strategy name
             save_every: Save frequency
             results: Training results dictionary
             metadata: Optional metadata dict with model_names, dataset_names
@@ -99,6 +101,7 @@ class WageringAnalytics:
         row["shuffle_data"] = shuffle_data
         row["shuffle_seed"] = shuffle_seed
         row["early_stopping_patience"] = early_stopping_patience
+        row["early_stopping_criterion"] = early_stopping_criterion
         row["save_every"] = save_every
         
         # Dataset size (included in settings_hash to distinguish different settings)
@@ -160,7 +163,7 @@ class WageringAnalytics:
             models: List of models
             evaluation_dataset_name: Name of the evaluation dataset
             training_datasets: Optional list of training dataset names
-            results: Evaluation results dictionary (should contain accuracy, nll, auc, ece)
+            results: Evaluation results dictionary (should contain accuracy, nll, brier, auc, ece)
             metadata: Optional metadata dict with model_names
             checkpoint_path: Optional path to the training checkpoint used
             seed: Optional random seed used for this run
@@ -235,6 +238,7 @@ class WageringAnalytics:
         if results:
             row["accuracy"] = results.get("accuracy")
             row["nll"] = results.get("nll")
+            row["brier"] = results.get("brier") if results.get("brier") is not None and not np.isnan(results.get("brier", np.nan)) else None
             row["auc"] = results.get("auc") if results.get("auc") is not None and not np.isnan(results.get("auc", np.nan)) else None
             row["ece"] = results.get("ece") if results.get("ece") is not None and not np.isnan(results.get("ece", np.nan)) else None
             row["d_regret"] = results.get("d_regret") if results.get("d_regret") is not None and not np.isnan(results.get("d_regret", np.nan)) else None
@@ -293,7 +297,7 @@ class WageringAnalytics:
             ]
             result_columns = [
                 col for col in combined_df.columns
-                if (col.startswith('final_') or col in ['accuracy', 'nll', 'auc', 'ece', 'num_examples', 'd_regret', 'meta_acc', 'meta_nll', 'meta_auc'])
+                if (col.startswith('final_') or col in ['accuracy', 'nll', 'brier', 'auc', 'ece', 'num_examples', 'd_regret', 'meta_acc', 'meta_nll', 'meta_auc'])
                 or (col not in settings_columns and pd.api.types.is_numeric_dtype(combined_df[col]))
             ]
         
@@ -368,7 +372,7 @@ class WageringAnalytics:
         """
         result_columns = [
             col for col in analytics_df.columns
-            if col.startswith('final_') or col in ['accuracy', 'nll', 'auc', 'ece', 'num_examples', 'd_regret', 'meta_acc', 'meta_nll', 'meta_auc']
+            if col.startswith('final_') or col in ['accuracy', 'nll', 'brier', 'auc', 'ece', 'num_examples', 'd_regret', 'meta_acc', 'meta_nll', 'meta_auc']
         ]
         settings_columns = [
             col for col in analytics_df.columns
@@ -389,7 +393,7 @@ class WageringAnalytics:
         """
         result_columns = [
             col for col in analytics_df.columns
-            if col.startswith('final_') or col in ['accuracy', 'nll', 'auc', 'ece', 'num_examples', 'd_regret', 'meta_acc', 'meta_nll', 'meta_auc']
+            if col.startswith('final_') or col in ['accuracy', 'nll', 'brier', 'auc', 'ece', 'num_examples', 'd_regret', 'meta_acc', 'meta_nll', 'meta_auc']
             or (pd.api.types.is_numeric_dtype(analytics_df[col]) 
                 and col not in ['num_models', 'num_datasets', 'shuffle_seed', 'early_stopping_patience', 
                                'save_every', 'seed', 'num_examples'])

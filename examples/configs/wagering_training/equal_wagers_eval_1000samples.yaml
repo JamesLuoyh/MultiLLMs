@@ -10,6 +10,11 @@ _include_models:
 # Checkpoint path (for equal_wagers, this can be a dummy path since no training is needed)
 checkpoint_path: /common/users/yl2310/MultiLLMs/checkpoints/dummy_equal_wagers
 
+# Apply adaptive temperature scaling to cached option logits before wagering.
+calibrated: true
+_include_calibration: calibration/adaptive_temperature_1000samples.yaml
+
+
 # Wagering method - equal wagers (no trainable parameters)
 wagering_method:
   name: equal_wagers
@@ -56,7 +61,7 @@ wandb_name: null
 
 # Include test dataset configs
 _include_test_datasets:
-  - datasets/mmlu.yaml
+  - datasets/mmlu_full.yaml
   - datasets/medmcqa.yaml
 
 # Override dataset-specific settings for evaluation with 1000 samples each

@@ -1,6 +1,6 @@
 import numpy as np
 
-from lm_polygraph.utils.multi_llm_ensemble import (
+from wagering.utils.multi_llm_ensemble import (
     aggregate_logits_log_pooling,
     run_online_ensemble,
 )

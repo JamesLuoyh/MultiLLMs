@@ -45,7 +45,7 @@ pipeline_module = load_module_from_path("wagering_pipeline", PROJECT_ROOT / "scr
 run_pipeline = pipeline_module.run_pipeline
 main_pipeline = pipeline_module.main
 
-log = logging.getLogger("lm_polygraph")
+log = logging.getLogger("wagering")
 
 
 def update_config_with_seed(config_path: Path, seed: int, output_path: Path) -> Path:

@@ -1,0 +1,8 @@
+# Llama-2-7B model configuration
+path: meta-llama/Llama-2-7b
+path_to_load_script: model/default_causal.py
+type: CausalLM
+instruct: false
+load_model_args:
+  device_map: auto
+load_tokenizer_args: {}

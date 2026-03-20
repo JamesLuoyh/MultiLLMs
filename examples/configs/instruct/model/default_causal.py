@@ -1,4 +1,10 @@
+import os
+
 from transformers import AutoModelForCausalLM, AutoTokenizer
+
+
+# Disable background safetensors conversion PR attempts to avoid network-thread failures.
+os.environ.setdefault("DISABLE_SAFETENSORS_CONVERSION", "1")
 
 
 def load_model(model_path: str, device_map: str):

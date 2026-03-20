@@ -10,15 +10,15 @@ import sys
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
 
-# Add src/ to path for lm_polygraph imports
+# Ensure local project modules are importable
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SRC_PATH = PROJECT_ROOT / "src"
 if str(SRC_PATH) not in sys.path:
     sys.path.insert(0, str(SRC_PATH))
 
-from lm_polygraph.utils.model import WhiteboxModel
-from lm_polygraph.utils.common import load_external_module
-from lm_polygraph.utils.generation_parameters import GenerationParametersFactory
+from wagering.core.model import WhiteboxModel
+from wagering.core.common import load_external_module
+from wagering.core.generation_parameters import GenerationParametersFactory
 
 log = logging.getLogger(__name__)
 

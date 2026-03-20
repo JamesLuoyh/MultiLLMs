@@ -9,14 +9,14 @@ import sys
 from pathlib import Path
 from typing import Optional, Dict, Any, List
 
-# Add src/ to path for lm_polygraph imports
+# Ensure local project modules are importable
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SRC_PATH = PROJECT_ROOT / "src"
 if str(SRC_PATH) not in sys.path:
     sys.path.insert(0, str(SRC_PATH))
 
 from .base import WageringMethod
-from lm_polygraph.utils.model import WhiteboxModel
+from wagering.core.model import WhiteboxModel
 from wagering.aggregation.linear_pooling import LinearPooling
 
 
@@ -219,10 +219,11 @@ class CentralizedWagers(WageringMethod):
             torch.nn.utils.clip_grad_norm_(proj_params, self.grad_clip_norm)
         self.optimizer.step()
         
-        # Compute batch metrics
-        batch_correct = (np.argmax(aggregated_probs, axis=1) == gold_label)
+        # Compute batch metrics using computed aggregated probs (not the passed-in parameter)
+        batch_aggregated_probs_np = batch_aggregated_probs.detach().cpu().numpy()
+        batch_correct = (np.argmax(batch_aggregated_probs_np, axis=1) == gold_label)
         batch_accuracy = float(np.mean(batch_correct))
-        avg_prob_correct = float(np.mean(aggregated_probs[np.arange(batch_size), gold_label]))
+        avg_prob_correct = float(np.mean(batch_aggregated_probs_np[np.arange(batch_size), gold_label]))
         
         return {
             "loss": float(loss.item()),
@@ -232,8 +233,11 @@ class CentralizedWagers(WageringMethod):
         }
     
     def get_trainable_parameters(self) -> List[torch.nn.Parameter]:
-        """Get list of trainable parameters."""
-        return list(self.router.parameters())
+        """Get list of trainable parameters (router + projections)."""
+        params = list(self.router.parameters())
+        for proj in self.model_projections.values():
+            params.extend(proj.parameters())
+        return params
     
     def train_mode(self):
         """Set the method to training mode."""
@@ -290,7 +294,7 @@ class CentralizedWagers(WageringMethod):
                 # Optimizer state dict may not match if projection layers were added/removed
                 # This is acceptable - we'll continue with a fresh optimizer
                 import logging
-                log = logging.getLogger("lm_polygraph")
+                log = logging.getLogger("wagering")
                 log.warning(
                     f"Could not load optimizer state dict (parameter mismatch): {e}. "
                     "Continuing with fresh optimizer state."

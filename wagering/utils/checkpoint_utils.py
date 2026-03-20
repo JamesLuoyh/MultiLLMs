@@ -7,7 +7,7 @@ Simplified version with direct, predictable naming.
 import hashlib
 import re
 from pathlib import Path
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
 
 def sanitize_name(name: str, max_length: int = 20) -> str:
@@ -93,6 +93,7 @@ def generate_checkpoint_dir(
     wagering_method: Dict[str, Any],
     aggregation: Dict[str, Any],
     create_hash: bool = True,
+    calibration: Optional[Dict[str, Any]] = None,
 ) -> Path:
     """
     Generate a unique checkpoint directory name based on configuration.
@@ -152,6 +153,10 @@ def generate_checkpoint_dir(
     
     # Aggregation
     components.append(f"agg_{aggregation_name}")
+
+    if calibration:
+        calibration_name = sanitize_name(calibration.get("name", "calibrated"), max_length=20)
+        components.append(f"cal_{calibration_name}")
     
     # Join components
     dir_name = "_".join(components)
@@ -159,7 +164,7 @@ def generate_checkpoint_dir(
     # Add hash for uniqueness if requested
     if create_hash:
         # Create hash from full config for uniqueness
-        config_str = f"{models}_{datasets}_{wagering_method}_{aggregation}"
+        config_str = f"{models}_{datasets}_{wagering_method}_{aggregation}_{calibration}"
         config_hash = hashlib.md5(config_str.encode()).hexdigest()[:8]
         dir_name = f"{dir_name}_{config_hash}"
     
@@ -171,6 +176,7 @@ def get_checkpoint_metadata(
     datasets: List[Dict[str, Any]],
     wagering_method: Dict[str, Any],
     aggregation: Dict[str, Any],
+    calibration: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     Get metadata dictionary for logging/analytics.
@@ -195,7 +201,7 @@ def get_checkpoint_metadata(
     model_names = [m.get("path", "unknown") for m in models]
     dataset_names = [get_dataset_name(d) for d in datasets]
     
-    return {
+    metadata = {
         "models": model_names,
         "model_count": len(models),
         "datasets": dataset_names,
@@ -205,3 +211,49 @@ def get_checkpoint_metadata(
         "aggregation_method": aggregation.get("name", "unknown"),
         "aggregation_config": aggregation.get("config", {}),
     }
+
+    if calibration:
+        metadata["calibrated"] = True
+        metadata["calibration_method"] = calibration.get("name", "adaptive_temperature_scaling")
+        metadata["calibration_config"] = calibration
+    else:
+        metadata["calibrated"] = False
+
+    return metadata
+
+
+def generate_calibration_dir(
+    base_dir: Path,
+    models: List[Dict[str, Any]],
+    datasets: List[Dict[str, Any]],
+    calibration_config: Dict[str, Any],
+    create_hash: bool = True,
+) -> Path:
+    """Generate a unique artifact directory for cached-logit calibration."""
+    base_dir = Path(base_dir)
+    base_dir.mkdir(parents=True, exist_ok=True)
+
+    if not models:
+        raise ValueError("Must provide at least one model")
+    if not datasets:
+        raise ValueError("Must provide at least one dataset")
+
+    model_names = [get_model_name(m["path"]) for m in models if "path" in m]
+    if not model_names:
+        raise ValueError("No valid model paths found in model configs")
+
+    dataset_names = [get_dataset_name(d) for d in datasets]
+    calibration_name = sanitize_name(calibration_config.get("name", "adaptive_temperature_scaling"), max_length=25)
+
+    components = [
+        f"models_{'_'.join(sorted(set(model_names)))}",
+        f"datasets_{'_'.join(sorted(set(dataset_names)))}",
+        f"calibration_{calibration_name}",
+    ]
+    dir_name = "_".join(components)
+
+    if create_hash:
+        config_hash = hashlib.md5(f"{models}_{datasets}_{calibration_config}".encode()).hexdigest()[:8]
+        dir_name = f"{dir_name}_{config_hash}"
+
+    return base_dir / dir_name

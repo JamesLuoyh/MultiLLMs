@@ -29,8 +29,13 @@ from wagering.utils import (
     generate_checkpoint_dir,
     get_checkpoint_metadata,
 )
-from wagering.utils.multi_llm_ensemble import get_cached_logits_and_hidden_states_for_model
-from lm_polygraph.utils.dataset import Dataset
+from wagering.calibration import calibration_enabled, fit_or_load_logit_calibrator
+from wagering.utils.multi_llm_ensemble import (
+    assign_pubmedqa_context_models,
+    get_cached_logits_and_hidden_states_for_model,
+    get_model_prompt_variant,
+)
+from wagering.core.dataset import Dataset
 from wagering.methods.factory import load_wagering_method
 from wagering.training import WageringTrainer
 from wagering.aggregation.factory import load_aggregation_function
@@ -59,7 +64,7 @@ def load_api_keys_from_config():
         return filtered
 
 
-def main(config_path: Optional[str] = None):
+def main(config_path: Optional[str] = None, calibration_path: Optional[str] = None):
     """Main training function."""
     if config_path is None:
         if len(sys.argv) > 1:
@@ -81,13 +86,14 @@ def main(config_path: Optional[str] = None):
     logging.basicConfig(level=logging.INFO, format='%(name)s - %(levelname)s - %(message)s')
     
     # Suppress verbose library logging
-    logging.getLogger("lm_polygraph").setLevel(logging.INFO)
+    logging.getLogger("wagering").setLevel(logging.INFO)
     logging.getLogger("transformers").setLevel(logging.WARNING)
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("urllib3").setLevel(logging.WARNING)
     
     # Generate unique checkpoint directory
     base_checkpoint_dir = Path(args.get("checkpoint_base_dir", "/common/users/yl2310/MultiLLMs/checkpoints"))
+    calibration_config = args.get("calibration") if calibration_enabled(args) else None
     checkpoint_dir = generate_checkpoint_dir(
         base_dir=base_checkpoint_dir,
         models=args["models"],
@@ -95,6 +101,7 @@ def main(config_path: Optional[str] = None):
         wagering_method=args["wagering_method"],
         aggregation=args["aggregation"],
         create_hash=True,
+        calibration=calibration_config,
     )
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     log.info(f"Checkpoint directory: {checkpoint_dir}")
@@ -105,6 +112,7 @@ def main(config_path: Optional[str] = None):
         datasets=args["datasets"],
         wagering_method=args["wagering_method"],
         aggregation=args["aggregation"],
+        calibration=calibration_config,
     )
     
     # Initialize wandb
@@ -137,14 +145,72 @@ def main(config_path: Optional[str] = None):
             log.info(f"Initialized wandb run: {wandb.run.id}")
         except ImportError as e:
             raise RuntimeError("wandb not available but report_to_wandb is enabled in config") from e
+
+    logit_calibrator = None
+    calibration_artifact_path = calibration_path
+    if calibration_enabled(args):
+        log.info("Preparing cached-logit temperature calibrator...")
+        logit_calibrator, calibration_artifact_path, _ = fit_or_load_logit_calibrator(
+            args,
+            calibration_path=calibration_path,
+        )
     
     # Load training datasets
     log.info("Loading training datasets...")
+    dataset_split_seed = args.get("seed", args.get("shuffle_seed", 42))
     train_datasets, dataset_names = load_datasets_from_config(
         args["datasets"],
         split="train",
+        random_seed=dataset_split_seed,
     )
     log.info(f"Loaded {len(train_datasets)} training datasets: {dataset_names}")
+
+    validation_split_ratio = args.get("validation_split_ratio", 0.1)
+    pubmedqa_val_split_ratio = None
+    for dataset in train_datasets:
+        ratio = getattr(dataset, "pubmedqa_train_val_split_ratio", None)
+        if ratio is not None:
+            pubmedqa_val_split_ratio = float(ratio)
+            break
+    if pubmedqa_val_split_ratio is not None and abs(validation_split_ratio - pubmedqa_val_split_ratio) > 1e-12:
+        log.info(
+            "Overriding validation_split_ratio from %.4f to %.4f to enforce PubMedQA 6:2:2 train:val:test split.",
+            float(validation_split_ratio),
+            float(pubmedqa_val_split_ratio),
+        )
+        validation_split_ratio = pubmedqa_val_split_ratio
+
+    # For PubMedQA mixed-context prompts, assign context on a balanced randomized
+    # per-example basis across model indices.
+    pubmedqa_context_seed = dataset_split_seed
+    pubmedqa_assignments = assign_pubmedqa_context_models(
+        train_datasets,
+        [model_cfg["path"] for model_cfg in args["models"]],
+        random_seed=pubmedqa_context_seed,
+    )
+    for dataset_idx, assignment_info in pubmedqa_assignments.items():
+        dataset_name = dataset_names[dataset_idx] if dataset_idx < len(dataset_names) else f"dataset_{dataset_idx}"
+        assignment_hash = assignment_info.get("assignment_hash", "unknown")
+        num_examples = assignment_info.get("num_examples", len(train_datasets[dataset_idx].x))
+        routing_seed = assignment_info.get("routing_seed", pubmedqa_context_seed)
+        model_context_counts = assignment_info.get("model_context_counts", [])
+        log.info(
+            "PubMedQA balanced mixed-context assignment for %s: assignment_hash=%s, num_examples=%s, routing_seed=%s",
+            dataset_name,
+            assignment_hash,
+            num_examples,
+            routing_seed,
+        )
+        if isinstance(model_context_counts, list):
+            for model_idx, context_count in enumerate(model_context_counts):
+                model_path = args["models"][model_idx]["path"] if model_idx < len(args["models"]) else f"model_{model_idx}"
+                log.info(
+                    "PubMedQA context count for %s: model_index=%d, model=%s, context_examples=%d",
+                    dataset_name,
+                    model_idx,
+                    model_path,
+                    int(context_count),
+                )
 
     # Cache checks are performed per-dataset (matches trainer logic)
 
@@ -159,7 +225,10 @@ def main(config_path: Optional[str] = None):
     log.info(f"Loaded wagering method: {wagering_config['name']}")
 
     wagering_method_name = type(wagering_method).__name__
-    needs_hidden_states = wagering_method_name not in ["EqualWagers", "ZeroOneWagers", "OneZeroWagers"]
+    needs_hidden_states = (
+        wagering_method_name not in ["EqualWagers", "ZeroOneWagers", "OneZeroWagers"]
+        or logit_calibrator is not None
+    )
 
     # Determine which models need to be loaded based on cache
     option_tokens = args.get("option_tokens", ["A", "B", "C", "D"])
@@ -173,8 +242,12 @@ def main(config_path: Optional[str] = None):
 
         model_cache_ok = True
         for dataset in train_datasets:
+            prompt_variant = get_model_prompt_variant(dataset, model_index=idx)
             cached_logits, cached_hidden_states, _ = get_cached_logits_and_hidden_states_for_model(
-                model_path, dataset, option_tokens
+                model_path,
+                dataset,
+                option_tokens,
+                prompt_variant=prompt_variant,
             )
             if cached_logits is None or (needs_hidden_states and cached_hidden_states is None):
                 model_cache_ok = False
@@ -249,8 +322,11 @@ def main(config_path: Optional[str] = None):
         shuffle_data=args.get("shuffle_data", True),
         shuffle_seed=args.get("shuffle_seed", 42),
         early_stopping_patience=args.get("early_stopping_patience", 10),
+        early_stopping_criterion=args.get("early_stopping_criterion", "validation"),
         batch_size=args.get("training_batch_size", 100),
-        validation_split_ratio=args.get("validation_split_ratio", 0.1),
+        validation_split_ratio=validation_split_ratio,
+        balance_training_datasets=args.get("balance_training_datasets", True),
+        logit_calibrator=logit_calibrator,
     )
     
     # Train
@@ -265,6 +341,8 @@ def main(config_path: Optional[str] = None):
     
     # Return results (wandb run stays active)
     results["checkpoint_path"] = str(checkpoint_dir)
+    if calibration_artifact_path is not None:
+        results["calibration_path"] = calibration_artifact_path
     if wandb_logger and hasattr(wandb_logger, 'run') and wandb_logger.run is not None:
         results["wandb_run_id"] = wandb_logger.run.id
         results["wandb_run_name"] = wandb_logger.run.name

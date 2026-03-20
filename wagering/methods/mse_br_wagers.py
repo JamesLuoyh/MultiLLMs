@@ -12,14 +12,14 @@ import sys
 from pathlib import Path
 from typing import Optional, Dict, Any, List
 
-# Add src/ to path for lm_polygraph imports
+# Ensure local project modules are importable
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SRC_PATH = PROJECT_ROOT / "src"
 if str(SRC_PATH) not in sys.path:
     sys.path.insert(0, str(SRC_PATH))
 
 from .base import WageringMethod
-from lm_polygraph.utils.model import WhiteboxModel
+from wagering.core.model import WhiteboxModel
 from wagering.aggregation.linear_pooling import LinearPooling
 
 class MSEBrWagers(WageringMethod):
@@ -175,12 +175,12 @@ class MSEBrWagers(WageringMethod):
         # Normalize
         raw_wagers_tensor = torch.cat(raw_wagers_list, dim=1)
         sigmoid_wagers = torch.sigmoid(raw_wagers_tensor/self.temperature)
-                
+        sigmoid_wagers = torch.clamp(sigmoid_wagers, min=1e-10, max=1.0-1e-10)  # Prevent zero wagers which can cause issues with the loss
         # Compute sum for normalization
         sigmoid_sum = torch.sum(sigmoid_wagers, dim=1, keepdim=True)
         
         # Check for near-zero sums and fallback to uniform if needed
-        if torch.any(sigmoid_sum < 1e-8):
+        if torch.any(sigmoid_sum < 1e-16):
             raise RuntimeError("Near-zero sigmoid sum detected during compute_wagers(). This should not happen due to clipping.")
         else:
             wagers = sigmoid_wagers / sigmoid_sum
@@ -203,10 +203,11 @@ class MSEBrWagers(WageringMethod):
         
         model_logits_tensor = torch.as_tensor(model_logits, dtype=torch.float32).to(self.device)
         gold_label_tensor = torch.as_tensor(gold_label, dtype=torch.long).to(self.device)
-        brs, nash_gap = self.extract_wagers_brs_and_nash_gap(sigmoid_wagers, model_logits_tensor, gold_label_tensor)  # This will populate the cache with BRs and Nash gaps for the current wagers
+        brs, nash_gap, score_diff = self.extract_wagers_brs_and_nash_gap(sigmoid_wagers, model_logits_tensor, gold_label_tensor)  # This will populate the cache with BRs and Nash gaps for the current wagers
         # Convert to numpy and validate
         wagers_np = wagers.detach().cpu().numpy()
         nash_gap = nash_gap.detach().cpu().numpy()
+        score_diff = score_diff.detach().cpu().numpy()
         # Check for NaN or inf
         if np.any(np.isnan(wagers_np)) or np.any(np.isinf(wagers_np)):
             import sys
@@ -214,7 +215,7 @@ class MSEBrWagers(WageringMethod):
             # Fallback to uniform wagers
             raise ValueError("Invalid wagers detected (NaN or inf).")
         
-        return {"wagers": wagers_np, "nash_gap": nash_gap}
+        return {"wagers": wagers_np, "nash_gap": nash_gap, "score_diff": score_diff}
     
     def extract_wagers_brs_and_nash_gap(self, sigmoid_wagers, model_logits_tensor, gold_label_tensor):
         
@@ -244,12 +245,12 @@ class MSEBrWagers(WageringMethod):
         # average_scores = brier_scores.sum(dim=1, keepdim=True)/(brier_scores.shape[1] - 1) - brier_scores
         brs = 0.5 * (2 - brier_scores) - average_scores
         # brs = average_scores
-        brs = torch.clamp(brs, min=0.0)
+        brs = torch.clamp(brs, max=1.0-1e-10, min=1e-10)  # Prevent zero or negative BRs which can cause issues with the loss
 
         br_scores = 0.5 * (2-brier_scores - brs)
         nash_gap = brs * (br_scores - average_scores) - sigmoid_wagers * (scores - average_scores)
-
-        return brs, nash_gap
+        score_diff = scores - average_scores
+        return brs, nash_gap, score_diff
 
     def update(
         self,
@@ -347,7 +348,7 @@ class MSEBrWagers(WageringMethod):
             # Normalize wagers (single computation for all)
             raw_wagers_tensor = torch.cat(raw_wagers_list, dim=1)
             sigmoid_wagers = torch.sigmoid(raw_wagers_tensor / self.temperature) # [batch_size, num_models]
-            
+            sigmoid_wagers = torch.clamp(sigmoid_wagers, min=1e-10, max=1.0-1e-10)  # Prevent zero wagers which can cause issues with the loss
 
             # scores = ((scores - #.detach()
 
@@ -361,7 +362,7 @@ class MSEBrWagers(WageringMethod):
             # aggregated_probs_torch = LinearPooling.aggregate_torch(
             #     model_logits_tensor, wagers_all
             # )  # [batch_size, num_options]
-            brs, nash_gap = self.extract_wagers_brs_and_nash_gap(sigmoid_wagers, model_logits_tensor, gold_label_tensor)
+            brs, nash_gap, score_diff = self.extract_wagers_brs_and_nash_gap(sigmoid_wagers, model_logits_tensor, gold_label_tensor)
             # losses = -torch.log(aggregated_probs_torch[torch.arange(batch_size), gold_label_tensor] + 1e-10) # [batch_size]
             mseloss = F.mse_loss(sigmoid_wagers, brs, reduction='none')#.mean(dim=1)
             # Compute all N losses from the same forward pass tensors
@@ -511,7 +512,7 @@ class MSEBrWagers(WageringMethod):
                         optimizer.load_state_dict(optimizers_state_dict[key])
                     except (ValueError, KeyError) as e:
                         import logging
-                        log = logging.getLogger("lm_polygraph")
+                        log = logging.getLogger("wagering")
                         log.warning(
                             f"Could not load optimizer {model_idx} state dict (parameter mismatch): {e}. "
                             "Continuing with fresh optimizer state."

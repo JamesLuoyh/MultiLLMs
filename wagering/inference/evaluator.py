@@ -10,15 +10,15 @@ from typing import List, Dict, Any, Optional, Tuple
 import numpy as np
 import pandas as pd
 
-# Add src/ to path for lm_polygraph imports
+# Ensure local project modules are importable
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SRC_PATH = PROJECT_ROOT / "src"
 if str(SRC_PATH) not in sys.path:
     sys.path.insert(0, str(SRC_PATH))
 
-from lm_polygraph.utils.model import WhiteboxModel
-from lm_polygraph.utils.dataset import Dataset
-from lm_polygraph.ue_metrics.ece import ECE
+from wagering.core.model import WhiteboxModel
+from wagering.core.dataset import Dataset
+from wagering.core.metrics import ECE
 
 # Local wagering imports
 from wagering.methods.base import WageringMethod
@@ -27,6 +27,7 @@ from wagering.training.trainer import compute_dynamic_regret, compute_meta_metri
 from wagering.aggregation.base import AggregationFunction
 from wagering.utils.multi_llm_ensemble import (
     collect_option_logits_and_hidden_states_for_model,
+    get_model_prompt_variant,
     get_cached_logits_and_hidden_states_for_model,
     set_cached_logits_and_hidden_states_for_model,
 )
@@ -40,7 +41,7 @@ class WageringEvaluator:
     """
     Evaluator for multi-LLM wagering methods.
     
-    Evaluates on test splits and OOD datasets, computes accuracy, AUC, and ECE.
+    Evaluates on test splits and OOD datasets, computes accuracy, AUC, ECE, and Brier score.
     """
     
     def __init__(
@@ -55,6 +56,7 @@ class WageringEvaluator:
         training_checkpoint_path: Optional[str] = None,
         seed: Optional[int] = None,
         wandb_starting_step: Optional[int] = None,
+        logit_calibrator: Optional[Any] = None,
     ):
         """
         Initialize the evaluator.
@@ -80,6 +82,7 @@ class WageringEvaluator:
         self.metadata = metadata or {}
         self.training_checkpoint_path = training_checkpoint_path
         self.seed = seed
+        self.logit_calibrator = logit_calibrator
         
         if self.checkpoint_dir is not None:
             self.checkpoint_dir = Path(checkpoint_dir)
@@ -195,7 +198,10 @@ class WageringEvaluator:
         
         # Check if wagering method requires hidden states (CentralizedWagers, DecentralizedWagers, or WeightedScoreWagers, etc.)
         wagering_method_name = type(self.wagering_method).__name__
-        needs_hidden_states = wagering_method_name not in ["EqualWagers", "ZeroOneWagers", "OneZeroWagers"]
+        needs_hidden_states = (
+            wagering_method_name not in ["EqualWagers", "ZeroOneWagers", "OneZeroWagers"]
+            or self.logit_calibrator is not None
+        )
         
         # Check cache per model and collect if needed
         all_model_logits_list = []
@@ -205,8 +211,12 @@ class WageringEvaluator:
         for i, model in enumerate(self.models):
             # Try to load from cache for this model
             model_path = model if isinstance(model, str) else model.model_path
+            prompt_variant = get_model_prompt_variant(dataset, model_index=i)
             cached_logits, cached_hidden_states, cached_labels = get_cached_logits_and_hidden_states_for_model(
-                model_path, dataset, self.option_tokens
+                model_path,
+                dataset,
+                self.option_tokens,
+                prompt_variant=prompt_variant,
             )
             
             if cached_logits is not None:
@@ -225,12 +235,21 @@ class WageringEvaluator:
                                 f"Cache miss for model path {model}. Model must be loaded to collect logits."
                             )
                         model_logits, model_hidden_states, model_labels = collect_option_logits_and_hidden_states_for_model(
-                            model, dataset, self.option_tokens
+                            model,
+                            dataset,
+                            self.option_tokens,
+                            model_identifier=str(model_path),
+                            model_index=i,
                         )
                         # Update cache with hidden states
                         set_cached_logits_and_hidden_states_for_model(
-                            model, dataset, self.option_tokens,
-                            model_logits, model_hidden_states, model_labels
+                            model,
+                            dataset,
+                            self.option_tokens,
+                            model_logits,
+                            model_hidden_states,
+                            model_labels,
+                            prompt_variant=prompt_variant,
                         )
                         all_model_logits_list[-1] = model_logits  # Use freshly collected logits
                         all_model_hidden_states_list.append(model_hidden_states)
@@ -247,13 +266,22 @@ class WageringEvaluator:
                         f"Cache miss for model path {model}. Model must be loaded to collect logits."
                     )
                 model_logits, model_hidden_states, model_labels = collect_option_logits_and_hidden_states_for_model(
-                    model, dataset, self.option_tokens
+                    model,
+                    dataset,
+                    self.option_tokens,
+                    model_identifier=str(model_path),
+                    model_index=i,
                 )
                 
                 # Cache the results for this model
                 set_cached_logits_and_hidden_states_for_model(
-                    model, dataset, self.option_tokens,
-                    model_logits, model_hidden_states, model_labels
+                    model,
+                    dataset,
+                    self.option_tokens,
+                    model_logits,
+                    model_hidden_states,
+                    model_labels,
+                    prompt_variant=prompt_variant,
                 )
                 
                 all_model_logits_list.append(model_logits)
@@ -281,6 +309,15 @@ class WageringEvaluator:
         # Ensure labels are numpy array
         if not isinstance(labels, np.ndarray):
             labels = np.array(labels, dtype=np.int32)
+
+        if self.logit_calibrator is not None:
+            if all_model_hidden_states is None:
+                raise RuntimeError("Temperature calibration requires cached hidden states during evaluation")
+            all_model_logits = self.logit_calibrator.apply_to_stacked_logits(
+                all_model_logits,
+                all_model_hidden_states,
+            )
+            log.info("Applied frozen temperature scaling to cached evaluation logits")
         
         # Evaluate on all examples in batches for efficiency
         all_predictions = []
@@ -388,6 +425,11 @@ class WageringEvaluator:
         # Compute NLL (negative log likelihood) for correct classes
         correct_class_probs = all_aggregated_probs[np.arange(len(labels)), labels]
         nll = -np.mean(np.log(correct_class_probs + 1e-10))
+
+        # Compute multiclass Brier score: mean over examples of sum((p_k - y_k)^2)
+        num_options = all_aggregated_probs.shape[1]
+        one_hot_labels = np.eye(num_options, dtype=np.float64)[labels]
+        brier = np.mean(np.sum((all_aggregated_probs - one_hot_labels) ** 2, axis=1))
         
         # Compute AUC
         auc = None
@@ -444,6 +486,7 @@ class WageringEvaluator:
             "wagers_history": wagers_history,
             "accuracy": accuracy,
             "nll": nll,
+            "brier": brier,
             "auc": auc,
             "ece": ece,
             "d_regret": d_regret,
@@ -452,11 +495,12 @@ class WageringEvaluator:
             "meta_auc": meta_auc,
         }
         
+        brier_str = f"{brier:.4f}" if brier is not None and not np.isnan(brier) else "N/A"
         auc_str = f"{auc:.4f}" if auc is not None and not np.isnan(auc) else "N/A"
         ece_str = f"{ece:.4f}" if ece is not None and not np.isnan(ece) else "N/A"
         d_regret_str = f"{d_regret:.4f}" if d_regret is not None and not np.isnan(d_regret) else "N/A"
         meta_acc_str = f"{meta_acc:.4f}" if meta_acc is not None and not np.isnan(meta_acc) else "N/A"
-        log.info(f"{dataset_name} - Accuracy: {accuracy:.4f}, NLL: {nll:.4f}, AUC: {auc_str}, ECE: {ece_str}, "
+        log.info(f"{dataset_name} - Accuracy: {accuracy:.4f}, NLL: {nll:.4f}, Brier: {brier_str}, AUC: {auc_str}, ECE: {ece_str}, "
                  f"DRegret: {d_regret_str}, MetaAcc: {meta_acc_str}")
         
         # Log average wagers per model
@@ -502,6 +546,7 @@ class WageringEvaluator:
             metric_values = {
                 "accuracy": accuracy,
                 "nll": nll,
+                "brier": brier if brier is not None and not np.isnan(brier) else None,
                 "auc": auc if auc is not None and not np.isnan(auc) else None,
                 "ece": ece if ece is not None and not np.isnan(ece) else None,
                 "d_regret": d_regret if d_regret is not None and not np.isnan(d_regret) else None,

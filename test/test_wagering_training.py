@@ -12,7 +12,7 @@ from unittest.mock import Mock, MagicMock, patch
 from wagering.methods import EqualWagers
 from wagering.aggregation import LinearPooling
 from wagering.training import WageringTrainer
-from lm_polygraph.utils.dataset import Dataset
+from wagering.core.dataset import Dataset
 
 
 class MockWhiteboxModel:
@@ -88,8 +88,17 @@ def aggregation_function():
 class TestWageringTrainer:
     """Test WageringTrainer class."""
     
-    def test_init(self, mock_models, simple_dataset, wagering_method, aggregation_function):
+    def _make_cache_hit(self, num_examples: int, num_options: int = 4, hidden_dim: int = 32):
+        """Return a side_effect function that simulates a full cache hit."""
+        logits = np.random.randn(num_examples, num_options).astype(np.float32)
+        hidden = np.random.randn(num_examples, hidden_dim).astype(np.float32)
+        labels = np.arange(num_examples) % num_options
+        return lambda *args, **kwargs: (logits, hidden, labels)
+
+    @patch('wagering.training.trainer.get_cached_logits_and_hidden_states_for_model')
+    def test_init(self, mock_cache, mock_models, simple_dataset, wagering_method, aggregation_function):
         """Test trainer initialization."""
+        mock_cache.side_effect = self._make_cache_hit(len(simple_dataset.x))
         trainer = WageringTrainer(
             models=mock_models,
             datasets=[simple_dataset],
@@ -101,8 +110,10 @@ class TestWageringTrainer:
         assert len(trainer.combined_dataset.x) == 2
         assert trainer.wagering_method.num_models == 2
     
-    def test_prepare_datasets(self, mock_models, simple_dataset, wagering_method, aggregation_function):
+    @patch('wagering.training.trainer.get_cached_logits_and_hidden_states_for_model')
+    def test_prepare_datasets(self, mock_cache, mock_models, simple_dataset, wagering_method, aggregation_function):
         """Test dataset preparation."""
+        mock_cache.side_effect = self._make_cache_hit(len(simple_dataset.x))
         trainer = WageringTrainer(
             models=mock_models,
             datasets=[simple_dataset],
@@ -113,15 +124,10 @@ class TestWageringTrainer:
         assert len(trainer.combined_dataset.x) == 2
         assert len(trainer.labels) == 2
     
-    @patch('wagering.training.trainer.collect_option_logits_for_model')
-    def test_collect_logits(self, mock_collect, mock_models, simple_dataset, wagering_method, aggregation_function):
+    @patch('wagering.training.trainer.get_cached_logits_and_hidden_states_for_model')
+    def test_collect_logits(self, mock_cache, mock_models, simple_dataset, wagering_method, aggregation_function):
         """Test logit collection."""
-        # Mock logit collection
-        mock_collect.return_value = (
-            np.random.randn(2, 4),  # logits: [num_examples, num_options]
-            np.array([0, 1]),  # labels
-        )
-        
+        mock_cache.side_effect = self._make_cache_hit(len(simple_dataset.x))
         trainer = WageringTrainer(
             models=mock_models,
             datasets=[simple_dataset],
@@ -133,15 +139,11 @@ class TestWageringTrainer:
         assert trainer.all_model_logits.shape[0] == len(mock_models)
         assert trainer.all_model_logits.shape[1] == len(simple_dataset.x)
     
-    @patch('wagering.training.trainer.collect_option_logits_for_model')
-    def test_train_single_epoch(self, mock_collect, mock_models, simple_dataset, wagering_method, aggregation_function):
+    @patch('wagering.training.trainer.get_cached_logits_and_hidden_states_for_model')
+    def test_train_single_epoch(self, mock_cache, mock_models, simple_dataset, wagering_method, aggregation_function):
         """Test training for one epoch."""
-        # Mock logit collection
         num_examples = len(simple_dataset.x)
-        mock_collect.return_value = (
-            np.random.randn(num_examples, 4),  # logits
-            np.array([0, 1]),  # labels
-        )
+        mock_cache.side_effect = self._make_cache_hit(num_examples)
         
         trainer = WageringTrainer(
             models=mock_models,
@@ -149,6 +151,7 @@ class TestWageringTrainer:
             wagering_method=wagering_method,
             aggregation_function=aggregation_function,
             checkpoint_dir=None,  # No checkpointing for test
+            validation_split_ratio=0.0,  # No validation split for tiny test dataset
         )
         
         # Train for 1 epoch
@@ -160,8 +163,10 @@ class TestWageringTrainer:
         assert "wagers_history" in results
         assert len(results["predictions"]) == num_examples
     
-    def test_save_checkpoint(self, mock_models, simple_dataset, wagering_method, aggregation_function):
+    @patch('wagering.training.trainer.get_cached_logits_and_hidden_states_for_model')
+    def test_save_checkpoint(self, mock_cache, mock_models, simple_dataset, wagering_method, aggregation_function):
         """Test checkpoint saving."""
+        mock_cache.side_effect = self._make_cache_hit(len(simple_dataset.x))
         with tempfile.TemporaryDirectory() as tmpdir:
             trainer = WageringTrainer(
                 models=mock_models,
@@ -171,23 +176,13 @@ class TestWageringTrainer:
                 checkpoint_dir=tmpdir,
             )
             
-            # Mock logit collection
-            with patch('wagering.training.trainer.collect_option_logits_for_model') as mock_collect:
-                mock_collect.return_value = (
-                    np.random.randn(2, 4),
-                    np.array([0, 1]),
-                )
-                
-                # Trigger checkpoint save
-                trainer._save_checkpoint(epoch=0, step=0)
-                
-                # Check that checkpoint file exists
-                checkpoint_file = Path(tmpdir) / "checkpoint_epoch_0_step_0.pt"
-                # Note: This won't actually create a file since we haven't collected logits
-                # But we can test the method exists and doesn't crash
+            # Trigger checkpoint save (method must exist and not crash)
+            trainer._save_checkpoint(epoch=0)
     
-    def test_save_final_checkpoint(self, mock_models, simple_dataset, wagering_method, aggregation_function):
+    @patch('wagering.training.trainer.get_cached_logits_and_hidden_states_for_model')
+    def test_save_final_checkpoint(self, mock_cache, mock_models, simple_dataset, wagering_method, aggregation_function):
         """Test final checkpoint saving."""
+        mock_cache.side_effect = self._make_cache_hit(len(simple_dataset.x))
         with tempfile.TemporaryDirectory() as tmpdir:
             trainer = WageringTrainer(
                 models=mock_models,

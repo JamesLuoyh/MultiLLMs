@@ -26,7 +26,12 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from wagering.utils import load_models_from_config, load_datasets_from_config, load_and_merge_configs
-from wagering.utils.multi_llm_ensemble import get_cached_logits_and_hidden_states_for_model
+from wagering.calibration import calibration_enabled, fit_or_load_logit_calibrator
+from wagering.utils.multi_llm_ensemble import (
+    assign_pubmedqa_context_models,
+    get_cached_logits_and_hidden_states_for_model,
+    get_model_prompt_variant,
+)
 from wagering.methods.factory import load_wagering_method
 from wagering.inference import WageringEvaluator
 from wagering.aggregation.factory import load_aggregation_function
@@ -55,7 +60,11 @@ def load_api_keys_from_config():
         return filtered
 
 
-def main(config_path: Optional[str] = None, checkpoint_path: Optional[str] = None):
+def main(
+    config_path: Optional[str] = None,
+    checkpoint_path: Optional[str] = None,
+    calibration_path: Optional[str] = None,
+):
     """Main evaluation function."""
     if config_path is None:
         if len(sys.argv) > 1:
@@ -77,7 +86,7 @@ def main(config_path: Optional[str] = None, checkpoint_path: Optional[str] = Non
     logging.basicConfig(level=logging.INFO, format='%(name)s - %(levelname)s - %(message)s')
     
     # Suppress verbose library logging
-    logging.getLogger("lm_polygraph").setLevel(logging.INFO)
+    logging.getLogger("wagering").setLevel(logging.INFO)
     logging.getLogger("transformers").setLevel(logging.WARNING)
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("urllib3").setLevel(logging.WARNING)
@@ -116,21 +125,23 @@ def main(config_path: Optional[str] = None, checkpoint_path: Optional[str] = Non
         except ImportError as e:
             raise RuntimeError("wandb not available but report_to_wandb is enabled in config") from e
     
-    # Load checkpoint path
-    if checkpoint_path is None:
-        checkpoint_path = args.get("checkpoint_path")
-    if checkpoint_path is None:
-        log.error("Please provide a checkpoint path in config file")
-        sys.exit(1)
-    
-    checkpoint_path = Path(checkpoint_path)
+    logit_calibrator = None
+    calibration_artifact_path = calibration_path
+    if calibration_enabled(args):
+        log.info("Preparing cached-logit temperature calibrator...")
+        logit_calibrator, calibration_artifact_path, _ = fit_or_load_logit_calibrator(
+            args,
+            calibration_path=calibration_path,
+        )
     
     # Load test datasets
+    dataset_split_seed = args.get("seed", args.get("shuffle_seed", 42))
     test_datasets = []
     if "test_datasets" in args:
         test_ds, test_names = load_datasets_from_config(
             args["test_datasets"],
             split="test",
+            random_seed=dataset_split_seed,
         )
         test_datasets = [(ds, name) for ds, name in zip(test_ds, test_names)]
 
@@ -138,9 +149,49 @@ def main(config_path: Optional[str] = None, checkpoint_path: Optional[str] = Non
     ood_dataset = None
     if "ood_dataset" in args and args["ood_dataset"]:
         ood_configs = [args["ood_dataset"]] if isinstance(args["ood_dataset"], dict) else args["ood_dataset"]
-        ood_ds, ood_names = load_datasets_from_config(ood_configs, split="test")
+        ood_ds, ood_names = load_datasets_from_config(
+            ood_configs,
+            split="test",
+            random_seed=dataset_split_seed,
+        )
         if ood_ds:
             ood_dataset = (ood_ds[0], ood_names[0])
+
+    # Configure PubMedQA mixed-context prompts with balanced randomized per-example assignment.
+    eval_dataset_objects = [ds for ds, _ in test_datasets]
+    eval_dataset_names = [name for _, name in test_datasets]
+    if ood_dataset is not None:
+        eval_dataset_objects.append(ood_dataset[0])
+        eval_dataset_names.append(ood_dataset[1])
+    pubmedqa_context_seed = dataset_split_seed
+    pubmedqa_assignments = assign_pubmedqa_context_models(
+        eval_dataset_objects,
+        [model_cfg["path"] for model_cfg in args["models"]],
+        random_seed=pubmedqa_context_seed,
+    )
+    for dataset_idx, assignment_info in pubmedqa_assignments.items():
+        dataset_name = eval_dataset_names[dataset_idx] if dataset_idx < len(eval_dataset_names) else f"dataset_{dataset_idx}"
+        assignment_hash = assignment_info.get("assignment_hash", "unknown")
+        num_examples = assignment_info.get("num_examples", len(eval_dataset_objects[dataset_idx].x))
+        routing_seed = assignment_info.get("routing_seed", pubmedqa_context_seed)
+        model_context_counts = assignment_info.get("model_context_counts", [])
+        log.info(
+            "PubMedQA balanced mixed-context assignment for eval dataset %s: assignment_hash=%s, num_examples=%s, routing_seed=%s",
+            dataset_name,
+            assignment_hash,
+            num_examples,
+            routing_seed,
+        )
+        if isinstance(model_context_counts, list):
+            for model_idx, context_count in enumerate(model_context_counts):
+                model_path = args["models"][model_idx]["path"] if model_idx < len(args["models"]) else f"model_{model_idx}"
+                log.info(
+                    "PubMedQA context count for eval dataset %s: model_index=%d, model=%s, context_examples=%d",
+                    dataset_name,
+                    model_idx,
+                    model_path,
+                    int(context_count),
+                )
 
     # Load wagering method (before models so we can decide cache requirements)
     wagering_config = args["wagering_method"]
@@ -151,9 +202,22 @@ def main(config_path: Optional[str] = None, checkpoint_path: Optional[str] = Non
         config=wagering_config.get("config", {}),
     )
 
+    requires_checkpoint = len(wagering_method.get_trainable_parameters()) > 0
+
+    if checkpoint_path is None:
+        checkpoint_path = args.get("checkpoint_path")
+    if requires_checkpoint and checkpoint_path is None:
+        log.error("Please provide a checkpoint path in config file")
+        sys.exit(1)
+
+    checkpoint_path = Path(checkpoint_path) if checkpoint_path is not None else None
+
     # Determine if hidden states are required
     wagering_method_name = type(wagering_method).__name__
-    needs_hidden_states = wagering_method_name not in ["EqualWagers", "ZeroOneWagers", "OneZeroWagers"]
+    needs_hidden_states = (
+        wagering_method_name not in ["EqualWagers", "ZeroOneWagers", "OneZeroWagers"]
+        or logit_calibrator is not None
+    )
 
     # Check cache per model across all eval datasets
     option_tokens = args.get("option_tokens", ["A", "B", "C", "D"])
@@ -170,8 +234,12 @@ def main(config_path: Optional[str] = None, checkpoint_path: Optional[str] = Non
         model_path = model_cfg["path"]
         model_cached = True
         for ds in eval_datasets:
+            prompt_variant = get_model_prompt_variant(ds, model_index=idx)
             cached_logits, cached_hidden_states, _ = get_cached_logits_and_hidden_states_for_model(
-                model_path, ds, option_tokens
+                model_path,
+                ds,
+                option_tokens,
+                prompt_variant=prompt_variant,
             )
             if cached_logits is None or (needs_hidden_states and cached_hidden_states is None):
                 model_cached = False
@@ -220,7 +288,6 @@ def main(config_path: Optional[str] = None, checkpoint_path: Optional[str] = Non
     
     # Load checkpoint
     # Check if the method has trainable parameters
-    requires_checkpoint = len(wagering_method.get_trainable_parameters()) > 0
     baseline_wagering_method = None
     
     if requires_checkpoint:
@@ -382,11 +449,15 @@ def main(config_path: Optional[str] = None, checkpoint_path: Optional[str] = Non
     seed = args.get("seed", args.get("shuffle_seed", None))
     
     # Get starting step from wandb if active
-    wandb_starting_step = 0
+    wandb_starting_step = None
     if wandb_logger and wandb.run is not None:
         try:
-            wandb_starting_step = wandb.run.step
-            log.info(f"Continuing from wandb step {wandb_starting_step}")
+            run_step = wandb.run.step
+            if run_step is not None:
+                wandb_starting_step = int(run_step)
+                log.info(f"Continuing from wandb step {wandb_starting_step}")
+            else:
+                log.warning("wandb.run.step is None; evaluator will infer a safe starting step")
         except Exception as e:
             log.warning(f"Could not get wandb step: {e}")
     
@@ -399,9 +470,10 @@ def main(config_path: Optional[str] = None, checkpoint_path: Optional[str] = Non
         wandb_logger=wandb_logger,
         checkpoint_dir=eval_checkpoint_dir,
         metadata=metadata,
-        training_checkpoint_path=str(checkpoint_path),
+        training_checkpoint_path=str(checkpoint_path) if checkpoint_path is not None else None,
         seed=seed,
         wandb_starting_step=wandb_starting_step,
+        logit_calibrator=logit_calibrator,
     )
     
     # Evaluate
@@ -422,6 +494,7 @@ def main(config_path: Optional[str] = None, checkpoint_path: Optional[str] = Non
     aggregate_metrics = {
         "accuracy": [],
         "nll": [],
+        "brier": [],
         "auc": [],
         "ece": [],
         "d_regret": [],
@@ -453,6 +526,7 @@ def main(config_path: Optional[str] = None, checkpoint_path: Optional[str] = Non
 
         accuracy_val = get_metric_float(result, "accuracy")
         nll_val = get_metric_float(result, "nll")
+        brier_val = get_metric_float(result, "brier")
         auc_val = get_metric_float(result, "auc")
         ece_val = get_metric_float(result, "ece")
         d_regret_val = get_metric_float(result, "d_regret")
@@ -464,6 +538,8 @@ def main(config_path: Optional[str] = None, checkpoint_path: Optional[str] = Non
             aggregate_metrics["accuracy"].append(accuracy_val)
         if nll_val is not None:
             aggregate_metrics["nll"].append(nll_val)
+        if brier_val is not None:
+            aggregate_metrics["brier"].append(brier_val)
         if auc_val is not None:
             aggregate_metrics["auc"].append(auc_val)
         if ece_val is not None:
@@ -479,6 +555,7 @@ def main(config_path: Optional[str] = None, checkpoint_path: Optional[str] = Non
 
         accuracy_str = get_metric_str(result, "accuracy")
         nll_str = get_metric_str(result, "nll")
+        brier_str = get_metric_str(result, "brier")
         auc_str = get_metric_str(result, "auc")
         ece_str = get_metric_str(result, "ece")
         d_regret_str = get_metric_str(result, "d_regret")
@@ -488,11 +565,11 @@ def main(config_path: Optional[str] = None, checkpoint_path: Optional[str] = Non
         
         log.info(
             f"{dataset_name}: Accuracy={accuracy_str}, "
-            f"NLL={nll_str}, AUC={auc_str}, ECE={ece_str}, "
+            f"NLL={nll_str}, Brier={brier_str}, AUC={auc_str}, ECE={ece_str}, "
             f"DRegret={d_regret_str}, MetaAcc={meta_acc_str}, MetaNLL={meta_nll_str}, MetaAUC={meta_auc_str}"
         )
         
-        results_summary[dataset_name] = f"Accuracy={accuracy_str}, AUC={auc_str}, ECE={ece_str}, NLL={nll_str}, DRegret={d_regret_str}, MetaAcc={meta_acc_str}, MetaAuc={meta_auc_str}, MetaNLL={meta_nll_str}"
+        results_summary[dataset_name] = f"Accuracy={accuracy_str}, AUC={auc_str}, ECE={ece_str}, NLL={nll_str}, Brier={brier_str}, DRegret={d_regret_str}, MetaAcc={meta_acc_str}, MetaAuc={meta_auc_str}, MetaNLL={meta_nll_str}"
 
     def aggregate_metric_str(values):
         if not values:
@@ -502,6 +579,7 @@ def main(config_path: Optional[str] = None, checkpoint_path: Optional[str] = Non
 
     overall_accuracy = aggregate_metric_str(aggregate_metrics["accuracy"])
     overall_nll = aggregate_metric_str(aggregate_metrics["nll"])
+    overall_brier = aggregate_metric_str(aggregate_metrics["brier"])
     overall_auc = aggregate_metric_str(aggregate_metrics["auc"])
     overall_ece = aggregate_metric_str(aggregate_metrics["ece"])
     overall_d_regret = aggregate_metric_str(aggregate_metrics["d_regret"])
@@ -511,7 +589,7 @@ def main(config_path: Optional[str] = None, checkpoint_path: Optional[str] = Non
 
     results_summary["overall"] = (
         f"Accuracy={overall_accuracy}, AUC={overall_auc}, ECE={overall_ece}, "
-        f"NLL={overall_nll}, DRegret={overall_d_regret}, MetaAcc={overall_meta_acc}, "
+        f"NLL={overall_nll}, Brier={overall_brier}, DRegret={overall_d_regret}, MetaAcc={overall_meta_acc}, "
         f"MetaAuc={overall_meta_auc}, MetaNLL={overall_meta_nll}"
     )
     

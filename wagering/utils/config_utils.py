@@ -55,6 +55,98 @@ def resolve_config_path(path: str | Path, base_dir: Path) -> Path:
     return resolved
 
 
+def _merge_model_includes(config: Dict[str, Any], base_dir: Path) -> None:
+    """Resolve model include directives in-place."""
+    if "_include_models" not in config:
+        return
+
+    if not isinstance(config["_include_models"], list):
+        raise ValueError(f"_include_models must be a list, got {type(config['_include_models'])}")
+
+    model_configs = []
+    for model_path in config["_include_models"]:
+        model_file = resolve_config_path(model_path, base_dir)
+        model_config = load_yaml_file(model_file)
+        model_configs.append(model_config)
+
+    config["models"] = model_configs
+    del config["_include_models"]
+
+
+def _merge_dataset_includes(
+    config: Dict[str, Any],
+    base_dir: Path,
+    include_key: str,
+    target_key: str,
+) -> None:
+    """Resolve dataset include directives in-place."""
+    if include_key not in config:
+        return
+
+    if not isinstance(config[include_key], list):
+        raise ValueError(f"{include_key} must be a list, got {type(config[include_key])}")
+
+    override_configs = config.get(target_key, [])
+    dataset_configs = []
+    for idx, dataset_path in enumerate(config[include_key]):
+        dataset_file = resolve_config_path(dataset_path, base_dir)
+        dataset_config = load_yaml_file(dataset_file)
+
+        if idx < len(override_configs) and isinstance(override_configs[idx], dict):
+            dataset_config.update(override_configs[idx])
+
+        dataset_configs.append(dataset_config)
+
+    config[target_key] = dataset_configs
+    del config[include_key]
+
+
+def _merge_ood_include(config: Dict[str, Any], base_dir: Path) -> None:
+    """Resolve OOD dataset include directive in-place."""
+    if "_include_ood_dataset" not in config:
+        return
+
+    dataset_file = resolve_config_path(config["_include_ood_dataset"], base_dir)
+    ood_config = load_yaml_file(dataset_file)
+
+    if "ood_dataset" in config and isinstance(config["ood_dataset"], dict):
+        ood_config.update(config["ood_dataset"])
+
+    config["ood_dataset"] = ood_config
+    del config["_include_ood_dataset"]
+
+
+def _load_config_with_includes(
+    config_path: Path,
+    base_dir: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """Load a config file and resolve any supported include directives."""
+    config_path = Path(config_path)
+    if base_dir is None:
+        base_dir = config_path.parent
+
+    config = load_yaml_file(config_path)
+
+    _merge_model_includes(config, base_dir)
+    _merge_dataset_includes(config, base_dir, "_include_datasets", "datasets")
+    _merge_dataset_includes(config, base_dir, "_include_test_datasets", "test_datasets")
+    _merge_ood_include(config, base_dir)
+
+    if "_include_calibration" in config:
+        calibration_file = resolve_config_path(config["_include_calibration"], base_dir)
+        calibration_config = _load_config_with_includes(
+            calibration_file,
+            base_dir=calibration_file.parent,
+        )
+        override_config = config.get("calibration")
+        if isinstance(override_config, dict):
+            calibration_config.update(override_config)
+        config["calibration"] = calibration_config
+        del config["_include_calibration"]
+
+    return config
+
+
 def load_and_merge_configs(
     main_config_path: Path,
     base_dir: Optional[Path] = None,
@@ -81,80 +173,8 @@ def load_and_merge_configs(
     main_config_path = Path(main_config_path)
     if base_dir is None:
         base_dir = main_config_path.parent
-    
-    # Load main config
-    config = load_yaml_file(main_config_path)
-    
-    # Load and merge model configs
-    if "_include_models" in config:
-        if not isinstance(config["_include_models"], list):
-            raise ValueError(f"_include_models must be a list, got {type(config['_include_models'])}")
-        
-        model_configs = []
-        for model_path in config["_include_models"]:
-            model_file = resolve_config_path(model_path, base_dir)
-            model_config = load_yaml_file(model_file)
-            model_configs.append(model_config)
-        
-        config["models"] = model_configs
-        del config["_include_models"]
-    
-    # Load and merge dataset configs
-    if "_include_datasets" in config:
-        if not isinstance(config["_include_datasets"], list):
-            raise ValueError(f"_include_datasets must be a list, got {type(config['_include_datasets'])}")
-        
-        # Get any override configs specified in the main config
-        override_configs = config.get("datasets", [])
-        
-        dataset_configs = []
-        for idx, dataset_path in enumerate(config["_include_datasets"]):
-            dataset_file = resolve_config_path(dataset_path, base_dir)
-            dataset_config = load_yaml_file(dataset_file)
-            
-            # Merge with override if provided
-            if idx < len(override_configs) and isinstance(override_configs[idx], dict):
-                dataset_config.update(override_configs[idx])
-            
-            dataset_configs.append(dataset_config)
-        
-        config["datasets"] = dataset_configs
-        del config["_include_datasets"]
-    
-    # Load and merge test dataset configs
-    if "_include_test_datasets" in config:
-        if not isinstance(config["_include_test_datasets"], list):
-            raise ValueError(f"_include_test_datasets must be a list, got {type(config['_include_test_datasets'])}")
-        
-        # Get any override configs specified in the main config
-        override_configs = config.get("test_datasets", [])
-        
-        test_dataset_configs = []
-        for idx, dataset_path in enumerate(config["_include_test_datasets"]):
-            dataset_file = resolve_config_path(dataset_path, base_dir)
-            dataset_config = load_yaml_file(dataset_file)
-            
-            # Merge with override if provided
-            if idx < len(override_configs) and isinstance(override_configs[idx], dict):
-                dataset_config.update(override_configs[idx])
-            
-            test_dataset_configs.append(dataset_config)
-        
-        config["test_datasets"] = test_dataset_configs
-        del config["_include_test_datasets"]
 
-    # Load and merge OOD dataset config
-    if "_include_ood_dataset" in config:
-        ood_path = config["_include_ood_dataset"]
-        dataset_file = resolve_config_path(ood_path, base_dir)
-        ood_config = load_yaml_file(dataset_file)
-
-        # Merge with override if provided
-        if "ood_dataset" in config and isinstance(config["ood_dataset"], dict):
-            ood_config.update(config["ood_dataset"])
-
-        config["ood_dataset"] = ood_config
-        del config["_include_ood_dataset"]
+    config = _load_config_with_includes(main_config_path, base_dir=base_dir)
     
     # Validate required keys
     if "models" not in config or not config["models"]:

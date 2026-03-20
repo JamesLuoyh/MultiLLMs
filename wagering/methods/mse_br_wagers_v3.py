@@ -12,14 +12,14 @@ import sys
 from pathlib import Path
 from typing import Optional, Dict, Any, List
 
-# Add src/ to path for lm_polygraph imports
+# Ensure local project modules are importable
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SRC_PATH = PROJECT_ROOT / "src"
 if str(SRC_PATH) not in sys.path:
     sys.path.insert(0, str(SRC_PATH))
 
 from .base import WageringMethod
-from lm_polygraph.utils.model import WhiteboxModel
+from wagering.core.model import WhiteboxModel
 from wagering.aggregation.linear_pooling import LinearPooling
 
 class MSEBrWagersV3(WageringMethod):
@@ -62,6 +62,8 @@ class MSEBrWagersV3(WageringMethod):
         self.score_function_name = str(config.get("score_function", "normalized_linear"))  # Scoring function: 'linear', 'log', or 'brier'
         self.device_str = str(config.get("device", "cuda" if torch.cuda.is_available() else "cpu"))
         self.device = torch.device(self.device_str)
+        self.lr_decay_factor = float(config.get("lr_decay_factor", 1.0))  # Factor to multiply LR by (1.0 = no decay)
+        self.lr_decay_steps = int(config.get("lr_decay_steps", 1))  # Decay every N optimizer steps
         
         # Initialize scoring function
         
@@ -69,7 +71,8 @@ class MSEBrWagersV3(WageringMethod):
         # Each router takes a single model's projected hidden state and outputs a scalar
         self.routers = nn.ModuleList()
         self.model_projections = nn.ModuleDict()
-        self.optimizers = []
+        self.optimizers = []  # List of tuples: (model_idx, optimizer, scheduler)
+        self.schedulers = []  # List of schedulers paired with optimizers
         
         for i in range(num_models):
             router = self._build_router().to(self.device)
@@ -149,7 +152,13 @@ class MSEBrWagersV3(WageringMethod):
                     # Create optimizer for this model (router i + projection i)
                     params = list(self.routers[i].parameters()) + list(projection.parameters())
                     optimizer = torch.optim.Adam(params, lr=self.learning_rate)
+                    scheduler = torch.optim.lr_scheduler.StepLR(
+                        optimizer,
+                        step_size=self.lr_decay_steps,
+                        gamma=self.lr_decay_factor
+                    )
                     self.optimizers.append((i, optimizer))
+                    self.schedulers.append((i, scheduler))
             
             projection = self.model_projections[proj_key]
             # Convert to tensor (no requires_grad - hidden states are inputs, not learnable)
@@ -244,12 +253,13 @@ class MSEBrWagersV3(WageringMethod):
         #                     - (scores * sigmoid_wagers)) / (sigmoid_wagers.sum(dim=1, keepdim=True).expand_as(sigmoid_wagers) - sigmoid_wagers)
         sigmoid_wagers_expanded = torch.repeat_interleave(sigmoid_wagers.unsqueeze(-1), repeats=num_options, dim=-1)
         # print(probs.shape, sigmoid_wagers_expanded.shape, gt_onehot_expanded.shape, scores.shape)
-        agg_probs_without_i = ((probs * sigmoid_wagers_expanded).sum(dim=1, keepdim=True) - (probs * sigmoid_wagers_expanded)) / (sigmoid_wagers_expanded.sum(dim=1, keepdim=True) - sigmoid_wagers_expanded)
+        wager_with_i = torch.clamp(sigmoid_wagers_expanded.sum(dim=1, keepdim=True) - sigmoid_wagers_expanded, min=1e-16)
+        agg_probs_without_i = ((probs * sigmoid_wagers_expanded).sum(dim=1, keepdim=True) - (probs * sigmoid_wagers_expanded)) / wager_with_i
         average_scores = 0.5 * (2 - ((agg_probs_without_i - gt_onehot_expanded) ** 2).sum(dim=-1))
         # average_scores = brier_scores.sum(dim=1, keepdim=True)/(brier_scores.shape[1] - 1) - brier_scores
         # brs = 0.5 * (2 - brier_scores) - average_scores
         brs = scores - average_scores
-        brs = torch.clamp(brs, min=1e-6, max=1.0-1e-6)  # Prevent negative or zero BRs for stability
+        brs = torch.clamp(brs, min=1e-16, max=1.0-1e-16)  # Prevent negative or zero BRs for stability
 
         nash_gap = brs * (scores - average_scores - 0.5 * brs) - sigmoid_wagers * (scores - average_scores - 0.5 * sigmoid_wagers)
         score_diff = scores - average_scores
@@ -365,7 +375,7 @@ class MSEBrWagersV3(WageringMethod):
             # aggregated_probs_torch = LinearPooling.aggregate_torch(
             #     model_logits_tensor, wagers_all
             # )  # [batch_size, num_options]
-            brs, _, _ = self.extract_wagers_brs_and_nash_gap(sigmoid_wagers, model_logits_tensor, gold_label_tensor)
+            brs, nash_gap, _ = self.extract_wagers_brs_and_nash_gap(sigmoid_wagers, model_logits_tensor, gold_label_tensor)
             # losses = -torch.log(aggregated_probs_torch[torch.arange(batch_size), gold_label_tensor] + 1e-10) # [batch_size]
             mseloss = F.mse_loss(sigmoid_wagers, brs, reduction='none')#.mean(dim=1)
             # Compute all N losses from the same forward pass tensors
@@ -379,11 +389,17 @@ class MSEBrWagersV3(WageringMethod):
             # This avoids in-place operation conflicts with retain_graph=True
             total_loss = 0.0
             for i in range(self.num_models):
-                # Find optimizer for model i
+                # Find optimizer and scheduler for model i
                 optimizer_i = None
+                scheduler_i = None
                 for model_idx, opt in self.optimizers:
                     if model_idx == i:
                         optimizer_i = opt
+                        break
+                
+                for model_idx, sch in self.schedulers:
+                    if model_idx == i:
+                        scheduler_i = sch
                         break
                 
                 if optimizer_i is None:
@@ -427,6 +443,8 @@ class MSEBrWagersV3(WageringMethod):
                 
                 # Step: update only model i (router i + projection i)
                 optimizer_i.step()
+                if scheduler_i is not None:
+                    scheduler_i.step()  # Update learning rate
                 
                 total_loss += float(all_losses[i].detach().cpu().numpy())
 
@@ -515,7 +533,7 @@ class MSEBrWagersV3(WageringMethod):
                         optimizer.load_state_dict(optimizers_state_dict[key])
                     except (ValueError, KeyError) as e:
                         import logging
-                        log = logging.getLogger("lm_polygraph")
+                        log = logging.getLogger("wagering")
                         log.warning(
                             f"Could not load optimizer {model_idx} state dict (parameter mismatch): {e}. "
                             "Continuing with fresh optimizer state."

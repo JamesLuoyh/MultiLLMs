@@ -16,7 +16,7 @@ import torch.nn.functional as F
 from typing import Optional, Dict, Any, List, Tuple
 
 from .base import WageringMethod
-from lm_polygraph.utils.model import WhiteboxModel
+from wagering.core.model import WhiteboxModel
 from .utils import compute_scoring_rule
 
 
@@ -585,7 +585,7 @@ class KellyWagers(WageringMethod):
                 self.actor_optimizer.load_state_dict(state_dict["actor_optimizer_state_dict"])
             except (ValueError, KeyError) as e:
                 import logging
-                log = logging.getLogger("lm_polygraph")
+                log = logging.getLogger("wagering")
                 log.warning(
                     f"Could not load actor optimizer state dict (parameter mismatch): {e}. "
                     "Continuing with fresh optimizer state."
@@ -596,7 +596,7 @@ class KellyWagers(WageringMethod):
                 self.critic_optimizer.load_state_dict(state_dict["critic_optimizer_state_dict"])
             except (ValueError, KeyError) as e:
                 import logging
-                log = logging.getLogger("lm_polygraph")
+                log = logging.getLogger("wagering")
                 log.warning(
                     f"Could not load critic optimizer state dict (parameter mismatch): {e}. "
                     "Continuing with fresh optimizer state."

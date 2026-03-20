@@ -7,8 +7,7 @@
 
 # Models (shared between training and evaluation)
 _include_models:
-  - models/gemma_2_9b_it.yaml
-  - models/llama3_aloe_8b_alpha.yaml
+  - models/llama3_1_8b_instruct.yaml
 
 # Wagering method (must match between training and evaluation)
 wagering_method:

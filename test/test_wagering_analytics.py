@@ -201,6 +201,7 @@ class TestWageringAnalytics:
         results = {
             "accuracy": 0.85,
             "nll": 0.5,
+            "brier": 0.22,
             "auc": 0.9,
             "ece": 0.1,
             "num_examples": 100,
@@ -234,12 +235,14 @@ class TestWageringAnalytics:
         # Check result columns
         assert "accuracy" in df.columns
         assert "nll" in df.columns
+        assert "brier" in df.columns
         assert "auc" in df.columns
         assert "ece" in df.columns
         
         # Check values
         assert df["evaluation_dataset"].iloc[0] == "test_dataset"
         assert df["accuracy"].iloc[0] == 0.85
+        assert df["brier"].iloc[0] == 0.22
         assert df["result_type"].iloc[0] == "evaluation"
     
     def test_create_evaluation_analytics_with_checkpoint(self):
@@ -580,6 +583,7 @@ class TestWageringAnalytics:
         results = {
             "accuracy": 0.8,
             "nll": 0.5,
+            "brier": np.nan,
             "auc": np.nan,
             "ece": np.nan,
         }
@@ -593,6 +597,7 @@ class TestWageringAnalytics:
         )
         
         # NaN values should be converted to None
+        assert pd.isna(df["brier"].iloc[0]) or df["brier"].iloc[0] is None
         assert pd.isna(df["auc"].iloc[0]) or df["auc"].iloc[0] is None
         assert pd.isna(df["ece"].iloc[0]) or df["ece"].iloc[0] is None
 

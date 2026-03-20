@@ -13,8 +13,8 @@ SRC_PATH = PROJECT_ROOT / "src"
 if str(SRC_PATH) not in sys.path:
     sys.path.insert(0, str(SRC_PATH))
 
-from lm_polygraph.utils.config_loader import load_and_merge_configs
-from lm_polygraph.utils.checkpoint_utils import generate_checkpoint_dir
+from wagering.utils.config_utils import load_and_merge_configs
+from wagering.utils.checkpoint_utils import generate_checkpoint_dir
 
 
 def delete_checkpoints(config_path: Path, method_name: str):

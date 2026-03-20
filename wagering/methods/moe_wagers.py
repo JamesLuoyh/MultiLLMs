@@ -10,14 +10,14 @@ from pathlib import Path
 from typing import Optional, Dict, Any, List
 from transformers import AutoModel, AutoTokenizer
 
-# Add src/ to path for lm_polygraph imports
+# Ensure local project modules are importable
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SRC_PATH = PROJECT_ROOT / "src"
 if str(SRC_PATH) not in sys.path:
     sys.path.insert(0, str(SRC_PATH))
 
 from .base import WageringMethod
-from lm_polygraph.utils.model import WhiteboxModel
+from wagering.core.model import WhiteboxModel
 from wagering.aggregation.linear_pooling import LinearPooling
 
 
@@ -335,7 +335,7 @@ class MoEWagers(WageringMethod):
                 self.optimizer.load_state_dict(state_dict["optimizer_state_dict"])
             except (ValueError, KeyError) as e:
                 import logging
-                log = logging.getLogger("lm_polygraph")
+                log = logging.getLogger("wagering")
                 log.warning(
                     f"Could not load optimizer state dict: {e}. "
                     "Continuing with fresh optimizer state."

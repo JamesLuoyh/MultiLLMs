@@ -22,8 +22,14 @@ SCRIPTS_PATH = PROJECT_ROOT / "scripts"
 
 if str(SRC_PATH) not in sys.path:
     sys.path.insert(0, str(SRC_PATH))
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 if str(SCRIPTS_PATH) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_PATH))
+
+from wagering.calibration import calibration_enabled, fit_or_load_logit_calibrator
+from wagering.methods.factory import load_wagering_method
+from wagering.utils import load_and_merge_configs
 
 # Import training and evaluation functions
 def load_module_from_path(module_name, file_path):
@@ -39,7 +45,7 @@ eval_module = load_module_from_path("wagering_eval", SCRIPTS_PATH / "wagering_ev
 train_main = train_module.main
 eval_main = eval_module.main
 
-log = logging.getLogger("lm_polygraph")
+log = logging.getLogger("wagering")
 
 
 def run_pipeline(
@@ -55,23 +61,51 @@ def run_pipeline(
     )
     
     # Suppress verbose library logging
-    logging.getLogger("lm_polygraph").setLevel(logging.INFO)
+    logging.getLogger("wagering").setLevel(logging.INFO)
     logging.getLogger("transformers").setLevel(logging.WARNING)
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("urllib3").setLevel(logging.WARNING)
-    
-    
+
+    if config_path is None:
+        raise ValueError("config_path is required")
+
+    args = load_and_merge_configs(config_path)
+    calibration_path = None
     checkpoint_path = None
+
+    wagering_method = load_wagering_method(
+        args["wagering_method"]["name"],
+        num_models=len(args["models"]),
+        config=args["wagering_method"].get("config", {}),
+    )
+    requires_training = len(wagering_method.get_trainable_parameters()) > 0 and bool(args.get("datasets"))
+
+    if calibration_enabled(args):
+        log.info("\n" + "=" * 80)
+        log.info("PHASE 1: CALIBRATION")
+        log.info("=" * 80)
+
+        try:
+            _, calibration_path, _ = fit_or_load_logit_calibrator(args)
+        except Exception as e:
+            log.error(f"Calibration failed: {e}")
+            import traceback
+            traceback.print_exc()
+            sys.exit(1)
     
     # Training phase
-    if not skip_training:
+    if not skip_training and requires_training:
         log.info("\n" + "=" * 80)
-        log.info("PHASE 1: TRAINING")
+        log.info("PHASE 2: TRAINING")
         log.info("=" * 80)
         
         try:
-            train_results = train_main(config_path=str(config_path))
+            train_results = train_main(
+                config_path=str(config_path),
+                calibration_path=calibration_path,
+            )
             checkpoint_path = train_results.get("checkpoint_path")
+            calibration_path = train_results.get("calibration_path", calibration_path)
             
             import wandb
             if wandb.run is not None:
@@ -83,23 +117,27 @@ def run_pipeline(
             traceback.print_exc()
             sys.exit(1)
     else:
-        log.info("Skipping training phase")
-        checkpoint_path = checkpoint_path_override
-    
-    if checkpoint_path is None:
+        if skip_training:
+            log.info("Skipping training phase")
+        else:
+            log.info("Skipping training phase because the wagering method has no trainable parameters or no training datasets were provided")
+        checkpoint_path = checkpoint_path_override or args.get("checkpoint_path")
+
+    if checkpoint_path is None and len(wagering_method.get_trainable_parameters()) > 0 and not skip_evaluation:
         log.error("No checkpoint path available for evaluation")
         sys.exit(1)
     
     # Evaluation phase
     if not skip_evaluation:
         log.info("\n" + "=" * 80)
-        log.info("PHASE 2: EVALUATION")
+        log.info("PHASE 3: EVALUATION")
         log.info("=" * 80)
         
         try:
             eval_results = eval_main(
                 config_path=str(config_path),
-                checkpoint_path=checkpoint_path
+                checkpoint_path=checkpoint_path,
+                calibration_path=calibration_path,
             )
             log.info("Evaluation complete")
             

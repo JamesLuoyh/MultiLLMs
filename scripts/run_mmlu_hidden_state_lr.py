@@ -27,17 +27,17 @@ from xgboost import XGBClassifier
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import roc_auc_score
 
-# Ensure the local src/ tree (which contains lm_polygraph) is importable without installation.
+# Ensure the local src/ tree (used by wagering scripts) is importable without installation.
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SRC_PATH = PROJECT_ROOT / "src"
 if str(SRC_PATH) not in sys.path:
     sys.path.insert(0, str(SRC_PATH))
 
-from lm_polygraph.utils.dataset import Dataset
-from lm_polygraph.utils.model import WhiteboxModel
-from lm_polygraph.utils.multi_llm_ensemble import _resolve_option_token_ids, filter_dataset_by_token_length
+from wagering.core.dataset import Dataset
+from wagering.core.model import WhiteboxModel
+from wagering.utils.multi_llm_ensemble import _resolve_option_token_ids, filter_dataset_by_token_length
 
-log = logging.getLogger("lm_polygraph")
+log = logging.getLogger("wagering")
 
 # Global flag for graceful shutdown
 _shutdown_requested = False

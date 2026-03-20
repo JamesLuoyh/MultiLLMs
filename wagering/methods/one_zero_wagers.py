@@ -6,7 +6,7 @@ import numpy as np
 from typing import Optional, Dict, Any, List
 
 from .base import WageringMethod
-from lm_polygraph.utils.model import WhiteboxModel
+from wagering.core.model import WhiteboxModel
 
 
 class OneZeroWagers(WageringMethod):

@@ -1,0 +1,35 @@
+# PubMedQA dataset configuration
+# Mixed-context prompting behavior:
+# - Context is assigned per example using balanced randomized routing across model indices.
+# - Each model receives roughly equal numbers of context-bearing prompts.
+# - Non-selected models for each example receive question + long answer only.
+# - Assignment is seeded by top-level `seed` (fallback: `shuffle_seed`) so sweeps vary routing.
+name: qiaojin/PubMedQA
+# Use split-specific subsets:
+# - training mode uses pqa_artificial
+# - evaluation/test mode uses pqa_artificial
+# Both modes intentionally use the HF "train" split, then apply a deterministic
+# balanced split over YES/NO labels with 6:2:2 train:val:test ratios.
+train_config_name: pqa_artificial
+eval_config_name: pqa_artificial
+# PubMedQA-specific split controls used by wagering/utils/dataset_utils.py
+pubmedqa_source_config_name: pqa_artificial
+pubmedqa_source_split: train
+pubmedqa_train_target_split: train_val
+pubmedqa_eval_target_split: test
+pubmedqa_split_ratios: [0.6, 0.2, 0.2]
+train_split: train
+eval_split: train
+display_name: pubmedqa
+text_column: question
+label_column: final_decision
+batch_size: 5
+max_prompt_tokens: 1400
+load_from_disk: false
+trust_remote_code: false
+instruct: false
+prompt: "Question:\n{question}\nContext:\n{context}\nLong Answer:\n{long_answer}\nIs the long answer provided correct or incorrect? Answer with YES or NO. Answer:"
+prompt_without_context: "Question:\n{question}\nLong Answer:\n{long_answer}\nIs the long answer provided correct or incorrect? Answer with YES or NO. Answer:"
+description: ""
+# Set option_tokens to [\"YES\", \"NO\"] in your top-level training/eval config when using this dataset.
+# Note: PubMedQA "maybe" labels are automatically filtered out.

@@ -113,12 +113,22 @@ ood_dataset:
   size: 8
 ```
 
+### Example: Cached-Logit Calibration Config
+
+```yaml
+calibrated: true
+_include_calibration: calibration/adaptive_temperature_1000samples.yaml
+```
+
+The calibration config is loaded once and trains one temperature head per model on cached hidden states and cached option logits. The frozen heads are then reused by training and evaluation, including eval-only methods such as equal_wagers.
+
 ## Benefits
 
 1. **No Duplication**: Model and dataset configs defined once
 2. **Consistency**: Training and evaluation use same model/dataset configs
 3. **Easy Updates**: Change model config once, affects all experiments
 4. **Clear Structure**: Split-specific overrides are explicit
+5. **Reusable Calibration**: Temperature scaling artifacts are stored separately and reused across methods when the same calibration config is referenced
 
 ## Adding New Models
 

@@ -55,9 +55,10 @@ training_batch_size: 100  # Batch size for training loop (different from batch s
 
 # Training options
 auto_resume: false  # Automatically resume from latest checkpoint if available
+balance_training_datasets: false  # If true, randomly subsample each dataset to min dataset size
 shuffle_data: true  # Shuffle training data across datasets
 shuffle_seed: 42  # Random seed for shuffling (will be overridden by sweep)
-early_stopping_patience: 10  # Stop training if no improvement for 10 epochs (default: 10)
+early_stopping_patience: 50  # Stop training if no improvement for 10 epochs (default: 10)
 
 # Wandb logging
 report_to_wandb: true

@@ -15,13 +15,13 @@ from pathlib import Path
 # Add src to path
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from lm_polygraph.utils.dataset import Dataset
-from lm_polygraph.utils.model import WhiteboxModel
-from lm_polygraph.utils.multi_llm_ensemble import _resolve_option_token_ids
-from lm_polygraph.utils.config_loader import load_and_merge_configs
+from wagering.core.dataset import Dataset
+from wagering.core.model import WhiteboxModel
+from wagering.utils.multi_llm_ensemble import _resolve_option_token_ids
+from wagering.utils.config_utils import load_and_merge_configs
 
 logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("lm_polygraph")
+log = logging.getLogger("wagering")
 
 
 def verify_token_alignment(config_path: str, model_path: str = None):
@@ -65,7 +65,7 @@ def verify_token_alignment(config_path: str, model_path: str = None):
             ood_dataset_cfg = config["ood_dataset"]
         
         # Load the dataset using load_datasets_from_config
-        from lm_polygraph.utils.wagering_utils import load_datasets_from_config
+        from wagering.utils.dataset_utils import load_datasets_from_config
         datasets, dataset_names = load_datasets_from_config([ood_dataset_cfg], split="test")
         arc_dataset = datasets[0] if datasets else None
     else:
@@ -80,7 +80,7 @@ def verify_token_alignment(config_path: str, model_path: str = None):
     log.info(f"Found ARC-Easy dataset: {dataset_names[0] if dataset_names else 'unknown'} with {len(arc_dataset.x)} examples")
     
     # Load a model (use first model from config)
-    from lm_polygraph.utils.wagering_utils import load_models_from_config
+    from wagering.utils.model_utils import load_models_from_config
     
     # The config loader processes _include_models and creates config["models"] as a list of model config dicts
     # load_models_from_config expects model_configs: List[Dict[str, Any]] directly

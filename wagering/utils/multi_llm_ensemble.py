@@ -11,20 +11,20 @@ import logging
 import pickle
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
 
-# Import from lm_polygraph for model and dataset classes only
+# Import wagering-local model and dataset classes
 import sys
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SRC_PATH = PROJECT_ROOT / "src"
 if str(SRC_PATH) not in sys.path:
     sys.path.insert(0, str(SRC_PATH))
 
-from lm_polygraph.utils.model import WhiteboxModel
-from lm_polygraph.utils.dataset import Dataset
+from wagering.core.model import WhiteboxModel
+from wagering.core.dataset import Dataset
 
 log = logging.getLogger("wagering")
 
@@ -144,10 +144,228 @@ def _get_cache_path(cache_key: Tuple) -> Path:
     return _WAGERING_CACHE_DIR / filename
 
 
+def _build_pubmedqa_balanced_assignments(
+    num_examples: int,
+    num_models: int,
+    seed: int,
+) -> np.ndarray:
+    """Create balanced per-example model assignments with randomized ordering."""
+    if num_models <= 0:
+        raise ValueError(f"num_models must be positive, got {num_models}")
+    if num_examples <= 0:
+        return np.empty((0,), dtype=np.int32)
+
+    rng = np.random.RandomState(seed)
+    base_count = num_examples // num_models
+    remainder = num_examples % num_models
+
+    assignments = np.repeat(np.arange(num_models, dtype=np.int32), base_count)
+    if remainder > 0:
+        extra_models = rng.permutation(np.arange(num_models, dtype=np.int32))[:remainder]
+        assignments = np.concatenate([assignments, extra_models.astype(np.int32)])
+
+    rng.shuffle(assignments)
+    return assignments.astype(np.int32, copy=False)
+
+
+def assign_pubmedqa_context_model(
+    dataset: Dataset,
+    model_paths: Sequence[str],
+    random_seed: Optional[int] = None,
+    dataset_index: Optional[int] = None,
+) -> Optional[Dict[str, object]]:
+    """
+    Assign PubMedQA context prompts per-example via balanced randomized routing.
+
+    Returns assignment metadata if the dataset uses mixed PubMedQA prompts,
+    otherwise returns None.
+    """
+    if getattr(dataset, "pubmedqa_prompt_strategy", None) != "mixed_context":
+        return None
+
+    paths = [str(path) for path in model_paths if path]
+    if not paths:
+        return None
+
+    num_examples = len(dataset.x)
+    num_models = len(paths)
+
+    normalized_seed: Optional[int] = None if random_seed is None else int(random_seed)
+
+    assignments: Optional[np.ndarray] = None
+    existing = getattr(dataset, "pubmedqa_context_assignment_by_example", None)
+    existing_seed = getattr(dataset, "pubmedqa_context_run_seed", None)
+    if isinstance(existing, list) and len(existing) == num_examples:
+        try:
+            existing_array = np.asarray(existing, dtype=np.int32)
+            if np.all((existing_array >= 0) & (existing_array < num_models)) and existing_seed == normalized_seed:
+                assignments = existing_array
+        except Exception:
+            assignments = None
+
+    if assignments is None:
+        dataset_signature = _get_dataset_signature(dataset)
+        seed_components = [
+            "pubmedqa_balanced_context",
+            str(dataset_signature),
+            "||".join(paths),
+            f"run_seed={normalized_seed}",
+        ]
+        if dataset_index is not None:
+            seed_components.append(f"dataset_index={int(dataset_index)}")
+        seed_input = "::".join(seed_components)
+        seed = int(hashlib.md5(seed_input.encode("utf-8")).hexdigest()[:8], 16)
+        assignments = _build_pubmedqa_balanced_assignments(
+            num_examples=num_examples,
+            num_models=num_models,
+            seed=seed,
+        )
+
+    assignment_hash = hashlib.md5(assignments.tobytes()).hexdigest()[:12]
+    context_counts = np.bincount(assignments, minlength=num_models).astype(np.int32).tolist()
+
+    dataset.pubmedqa_context_assignment_by_example = assignments.tolist()
+    dataset.pubmedqa_context_assignment_counts = context_counts
+    dataset.pubmedqa_context_assignment_hash = assignment_hash
+    dataset.pubmedqa_context_run_seed = normalized_seed
+    dataset.pubmedqa_context_model_index = None
+    dataset.pubmedqa_context_model_path = None
+
+    return {
+        "assignment_hash": assignment_hash,
+        "num_examples": int(num_examples),
+        "model_context_counts": context_counts,
+        "routing_seed": normalized_seed,
+    }
+
+
+def assign_pubmedqa_context_models(
+    datasets: Sequence[Dataset],
+    model_paths: Sequence[str],
+    random_seed: Optional[int] = None,
+) -> Dict[int, Dict[str, object]]:
+    """Assign PubMedQA context routing metadata for all datasets that need it."""
+    assignments: Dict[int, Dict[str, object]] = {}
+    for idx, dataset in enumerate(datasets):
+        selected = assign_pubmedqa_context_model(
+            dataset,
+            model_paths,
+            random_seed=random_seed,
+            dataset_index=idx,
+        )
+        if selected is not None:
+            assignments[idx] = selected
+    return assignments
+
+
+def _get_pubmedqa_context_assignments(dataset: Dataset) -> Optional[np.ndarray]:
+    """Return per-example context model indices for PubMedQA mixed-context datasets."""
+    assignments = getattr(dataset, "pubmedqa_context_assignment_by_example", None)
+    if not isinstance(assignments, list) or len(assignments) != len(dataset.x):
+        return None
+    try:
+        return np.asarray(assignments, dtype=np.int32)
+    except Exception:
+        return None
+
+
+def get_model_prompt_variant(
+    dataset: Dataset,
+    model_index: int,
+) -> Optional[str]:
+    """Return the prompt variant key used for a model on this dataset."""
+    if getattr(dataset, "pubmedqa_prompt_strategy", None) != "mixed_context":
+        return None
+
+    assignments = _get_pubmedqa_context_assignments(dataset)
+    if assignments is None:
+        raise RuntimeError(
+            "PubMedQA mixed-context dataset missing per-example assignments. "
+            "Call assign_pubmedqa_context_models before cache checks/collection."
+        )
+
+    assignment_hash = getattr(dataset, "pubmedqa_context_assignment_hash", None)
+    if not isinstance(assignment_hash, str) or not assignment_hash:
+        assignment_hash = hashlib.md5(assignments.tobytes()).hexdigest()[:12]
+        dataset.pubmedqa_context_assignment_hash = assignment_hash
+
+    return f"balanced_random_context_m{model_index}_{assignment_hash}"
+
+
+def get_model_specific_prompts(
+    dataset: Dataset,
+    model_index: int,
+) -> List[str]:
+    """Return prompt texts for this model, defaulting to dataset.x."""
+    if getattr(dataset, "pubmedqa_prompt_strategy", None) == "mixed_context":
+        with_context_prompts = getattr(dataset, "pubmedqa_with_context_x", None)
+        without_context_prompts = getattr(dataset, "pubmedqa_without_context_x", None)
+        assignments = _get_pubmedqa_context_assignments(dataset)
+
+        if (
+            isinstance(with_context_prompts, list)
+            and isinstance(without_context_prompts, list)
+            and assignments is not None
+        ):
+            if len(with_context_prompts) != len(without_context_prompts):
+                raise ValueError(
+                    "PubMedQA prompt variants have different lengths: "
+                    f"with_context={len(with_context_prompts)}, "
+                    f"without_context={len(without_context_prompts)}"
+                )
+            if len(with_context_prompts) != len(assignments):
+                raise ValueError(
+                    "PubMedQA assignment length does not match prompt length: "
+                    f"assignments={len(assignments)}, prompts={len(with_context_prompts)}"
+                )
+
+            return [
+                with_context_prompts[idx] if int(assignments[idx]) == model_index else without_context_prompts[idx]
+                for idx in range(len(assignments))
+            ]
+
+    return dataset.x
+
+
+def _resolve_label_to_index(
+    label: object,
+    option_tokens: List[str],
+) -> int:
+    """Resolve labels robustly, including case-insensitive YES/NO extraction."""
+    option_lookup = {str(option).strip().lower(): idx for idx, option in enumerate(option_tokens)}
+
+    if isinstance(label, bool):
+        if "yes" in option_lookup and "no" in option_lookup:
+            return option_lookup["yes"] if label else option_lookup["no"]
+        return int(label)
+
+    if isinstance(label, str):
+        stripped = label.strip()
+        if stripped in option_tokens:
+            return option_tokens.index(stripped)
+
+        lowered = stripped.lower()
+        if lowered in option_lookup:
+            return option_lookup[lowered]
+
+        if lowered in {"y", "yes"} and "yes" in option_lookup:
+            return option_lookup["yes"]
+        if lowered in {"n", "no"} and "no" in option_lookup:
+            return option_lookup["no"]
+
+        raise ValueError(
+            f"Could not map label '{label}' to option tokens {option_tokens}. "
+            "For PubMedQA, expected yes/no labels."
+        )
+
+    return int(label)
+
+
 def get_cached_logits_and_hidden_states_for_model(
     model_path: str,
     dataset: Dataset,
     option_tokens: List[str],
+    prompt_variant: Optional[str] = None,
 ) -> Optional[Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]]]:
     """
     Get cached logits and hidden states for a model if available from disk.
@@ -166,7 +384,7 @@ def get_cached_logits_and_hidden_states_for_model(
     model_key = model_path
     dataset_key = _get_dataset_signature(dataset)
     option_key = tuple(option_tokens)
-    cache_key = (model_key, dataset_key, option_key)
+    cache_key = (model_key, dataset_key, option_key, prompt_variant or "default")
     cache_path = _get_cache_path(cache_key)
 
     if cache_path.exists():
@@ -180,7 +398,12 @@ def get_cached_logits_and_hidden_states_for_model(
             if "hidden_states_pickle" in data:
                 hidden_states = pickle.loads(data["hidden_states_pickle"].item())
 
-            log.debug(f"Cache hit for model {model_path} and dataset size {len(dataset.x)}")
+            log.debug(
+                "Cache hit for model %s and dataset size %d (prompt_variant=%s)",
+                model_path,
+                len(dataset.x),
+                prompt_variant or "default",
+            )
             return logits, hidden_states, labels
         except Exception as e:
             raise Exception(f"Error loading cache from {cache_path}: {e}")
@@ -194,6 +417,7 @@ def set_cached_logits_and_hidden_states_for_model(
     logits: Optional[np.ndarray],
     hidden_states: Optional[np.ndarray],
     labels: Optional[np.ndarray],
+    prompt_variant: Optional[str] = None,
 ):
     """
     Cache logits and hidden states for a single model on disk.
@@ -209,7 +433,7 @@ def set_cached_logits_and_hidden_states_for_model(
     model_key = _get_model_path_key(model)
     dataset_key = _get_dataset_signature(dataset)
     option_key = tuple(option_tokens)
-    cache_key = (model_key, dataset_key, option_key)
+    cache_key = (model_key, dataset_key, option_key, prompt_variant or "default")
     cache_path = _get_cache_path(cache_key)
     
     # Load existing cache entry if present
@@ -272,7 +496,14 @@ def set_cached_logits_and_hidden_states_for_model(
             items_cached.append("hidden_states")
         if labels is not None:
             items_cached.append("labels")
-        log.info(f"Cached {', '.join(items_cached) if items_cached else 'data'} for model {model.model_path} and dataset size {len(dataset.x)} to {cache_path}")
+        log.info(
+            "Cached %s for model %s and dataset size %d (prompt_variant=%s) to %s",
+            ", ".join(items_cached) if items_cached else "data",
+            model.model_path,
+            len(dataset.x),
+            prompt_variant or "default",
+            cache_path,
+        )
     except Exception as e:
         raise Exception(f"Error saving cache to {cache_path}: {e}", exc_info=True)
 
@@ -460,6 +691,8 @@ def collect_option_logits_and_hidden_states_for_model(
     dataset: Dataset,
     option_tokens: List[str],
     max_new_tokens: int = 1,
+    model_identifier: Optional[str] = None,
+    model_index: int = 0,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Collect per-option log-probabilities AND hidden states for a model in a single forward pass.
@@ -476,6 +709,19 @@ def collect_option_logits_and_hidden_states_for_model(
         labels: np.ndarray, shape [num_examples]
     """
     model_device = model.device()
+    model_path = str(model_identifier) if model_identifier is not None else str(model.model_path)
+
+    model_prompts = get_model_specific_prompts(dataset, model_index=model_index)
+    prompt_variant = get_model_prompt_variant(dataset, model_index=model_index)
+
+    if len(model_prompts) != len(dataset.y):
+        raise ValueError(
+            "Prompt/label length mismatch while collecting logits. "
+            f"prompts={len(model_prompts)}, labels={len(dataset.y)}"
+        )
+
+    if prompt_variant is not None:
+        log.info("Using prompt_variant='%s' for model %s", prompt_variant, model_path)
 
     if torch.cuda.is_available() and getattr(model_device, "type", None) == "cuda":
         try:
@@ -483,17 +729,21 @@ def collect_option_logits_and_hidden_states_for_model(
         except Exception as e:
             raise RuntimeError(f"Could not set CUDA device to {model_device}: {e}") from e
     
-    sample_prompt = dataset.x[0] if len(dataset.x) > 0 else None
+    sample_prompt = model_prompts[0] if len(model_prompts) > 0 else None
     option_token_ids = _resolve_option_token_ids(model, option_tokens, sample_prompt=sample_prompt)
     
     all_log_probs: List[np.ndarray] = []
     all_hidden_states: List[np.ndarray] = []
     all_labels: List[int] = []
     
-    if len(dataset.x) == 0:
+    if len(model_prompts) == 0:
         raise ValueError("Dataset is empty (0 examples).")
-    
-    for batch_x, batch_y, _ in dataset:
+
+    for batch_start in range(0, len(model_prompts), dataset.batch_size):
+        batch_end = min(batch_start + dataset.batch_size, len(model_prompts))
+        batch_x = model_prompts[batch_start:batch_end]
+        batch_y = dataset.y[batch_start:batch_end]
+
         batch = model.tokenize(batch_x)
         batch = {k: v.to(model_device) for k, v in batch.items()}
         
@@ -568,8 +818,9 @@ def collect_option_logits_and_hidden_states_for_model(
             }
             log.info(f"Token names: {token_names}")
         
-        all_log_probs.append(batch_log_probs.cpu().numpy())
-        all_hidden_states.append(last_token_hidden.cpu().numpy())
+        # NumPy cannot materialize bfloat16 tensors directly; normalize to float32 first.
+        all_log_probs.append(batch_log_probs.detach().to(dtype=torch.float32).cpu().numpy())
+        all_hidden_states.append(last_token_hidden.detach().to(dtype=torch.float32).cpu().numpy())
         
         del generation
         del scores
@@ -589,10 +840,7 @@ def collect_option_logits_and_hidden_states_for_model(
                     pass
         
         for y in batch_y:
-            if isinstance(y, str):
-                idx = option_tokens.index(y)
-            else:
-                idx = int(y)
+            idx = _resolve_label_to_index(y, option_tokens)
             all_labels.append(idx)
     
     if len(all_log_probs) == 0:
