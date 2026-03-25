@@ -1,4 +1,6 @@
 import os
+import ast
+import json
 import pandas as pd
 import numpy as np
 import logging
@@ -85,6 +87,35 @@ def _build_pubmedqa_prompt(
         "Is the long answer provided correct or incorrect? "
         "Answer with YES or NO. Answer:"
     )
+
+
+def _normalize_multiple_choice_answer(label: object) -> Optional[str]:
+    """Map mixed answer representations to A/B/C/D labels."""
+    option_map = {0: "A", 1: "B", 2: "C", 3: "D"}
+    if label is None:
+        return None
+
+    if isinstance(label, int):
+        return option_map.get(int(label))
+
+    normalized = str(label).strip().upper()
+    if normalized in {"A", "B", "C", "D"}:
+        return normalized
+
+    if normalized in {"0", "1", "2", "3"}:
+        return option_map.get(int(normalized))
+
+    return None
+
+
+def _format_choices_block(option_a: str, option_b: str, option_c: str, option_d: str) -> str:
+    """Format non-empty multiple-choice options in A/B/C/D order."""
+    choices_list = []
+    for label, text in [("A", option_a), ("B", option_b), ("C", option_c), ("D", option_d)]:
+        cleaned = str(text).strip() if text is not None else ""
+        if cleaned:
+            choices_list.append(f"{label}) {cleaned}")
+    return "\n".join(choices_list)
 
 
 class Dataset:
@@ -292,6 +323,8 @@ class Dataset:
 
         pubmedqa_with_context_prompts = None
         pubmedqa_without_context_prompts = None
+        race_with_context_prompts = None
+        race_without_context_prompts = None
 
         if size is not None:
             log.info(f"Size parameter provided: {size}, dataset length: {len(dataset)}")
@@ -698,14 +731,169 @@ class Dataset:
                         f"cop=-1 indicates no answer and is skipped."
                     )
             log.debug(f"Formatted {len(x)} MedMCQA samples (skipped {skipped_count} invalid samples)")
+        elif "race" in dataset_name.lower() or (isinstance(dataset_path, str) and "race" in dataset_path.lower()):
+            # Special handling for RACE-style per-article format.
+            # We keep only the first question per article and build two prompt variants:
+            # 1) with article context, 2) without article context.
+            log.debug("Detected RACE dataset format, formatting first question per article")
+            x, y = [], []
+            race_with_context_prompts = []
+            race_without_context_prompts = []
+            skipped_count = 0
+
+            for inst in dataset:
+                article = str(inst.get("article", "")).strip()
+
+                # EleutherAI/race stores questions under `problems` per article.
+                first_problem = None
+                problems = inst.get("problems", None)
+                if isinstance(problems, str) and problems.strip():
+                    parsed_problems = None
+                    try:
+                        parsed_problems = ast.literal_eval(problems)
+                    except (SyntaxError, ValueError):
+                        try:
+                            parsed_problems = json.loads(problems)
+                        except (TypeError, ValueError):
+                            parsed_problems = None
+                    problems = parsed_problems
+                if isinstance(problems, list) and len(problems) > 0:
+                    if isinstance(problems[0], dict):
+                        first_problem = problems[0]
+
+                if first_problem is not None:
+                    question = str(first_problem.get("question", "")).strip()
+                    options = first_problem.get("options", [])
+                    answer_raw = first_problem.get("answer", None)
+                else:
+                    # Fallback for flattened RACE variants.
+                    question = str(inst.get("question", "")).strip()
+                    options = inst.get("options", [])
+                    answer_raw = inst.get("answer", None)
+
+                if not isinstance(options, list):
+                    skipped_count += 1
+                    continue
+
+                option_a = str(options[0]).strip() if len(options) > 0 else ""
+                option_b = str(options[1]).strip() if len(options) > 1 else ""
+                option_c = str(options[2]).strip() if len(options) > 2 else ""
+                option_d = str(options[3]).strip() if len(options) > 3 else ""
+
+                answer_letter = _normalize_multiple_choice_answer(answer_raw)
+                if answer_letter is None:
+                    skipped_count += 1
+                    continue
+
+                if not question or not (option_a or option_b or option_c or option_d):
+                    skipped_count += 1
+                    continue
+
+                choices_str = _format_choices_block(option_a, option_b, option_c, option_d)
+
+                if prompt:
+                    try:
+                        with_context_prompt = prompt.format(
+                            question=question,
+                            article=article,
+                            context=article,
+                            choices=choices_str,
+                            option_a=option_a,
+                            option_b=option_b,
+                            option_c=option_c,
+                            option_d=option_d,
+                            text=question,
+                        )
+                    except KeyError as e:
+                        log.warning(f"RACE prompt format error: {e}. Falling back to default with-context prompt.")
+                        with_context_prompt = (
+                            "Return the label of the correct answer for the question below.\n\n"
+                            f"Article:\n{article}\n\n"
+                            f"Question: {question}\n"
+                            f"Choices:\n{choices_str}\n"
+                            "Answer:"
+                        )
+                else:
+                    with_context_prompt = (
+                        "Return the label of the correct answer for the question below.\n\n"
+                        f"Article:\n{article}\n\n"
+                        f"Question: {question}\n"
+                        f"Choices:\n{choices_str}\n"
+                        "Answer:"
+                    )
+
+                if prompt_without_context:
+                    try:
+                        without_context_prompt = prompt_without_context.format(
+                            question=question,
+                            choices=choices_str,
+                            option_a=option_a,
+                            option_b=option_b,
+                            option_c=option_c,
+                            option_d=option_d,
+                            text=question,
+                        )
+                    except KeyError as e:
+                        log.warning(
+                            f"RACE prompt_without_context format error: {e}. "
+                            "Falling back to default without-context prompt."
+                        )
+                        without_context_prompt = (
+                            "Return the label of the correct answer for the question below.\n\n"
+                            f"Question: {question}\n"
+                            f"Choices:\n{choices_str}\n"
+                            "Answer:"
+                        )
+                else:
+                    without_context_prompt = (
+                        "Return the label of the correct answer for the question below.\n\n"
+                        f"Question: {question}\n"
+                        f"Choices:\n{choices_str}\n"
+                        "Answer:"
+                    )
+
+                if description:
+                    with_context_prompt = description + "\n\n" + with_context_prompt
+                    without_context_prompt = description + "\n\n" + without_context_prompt
+
+                # Use no-context prompt by default; model-specific routing can switch to article context.
+                x.append(without_context_prompt)
+                y.append(answer_letter)
+                race_with_context_prompts.append(with_context_prompt)
+                race_without_context_prompts.append(without_context_prompt)
+
+            if len(x) == 0:
+                raise ValueError(
+                    "No valid RACE samples found after processing. "
+                    f"Skipped {skipped_count} samples. "
+                    "Expected per-article rows with `problems` containing at least one question, "
+                    "4 options, and answer labels in A/B/C/D or 0-3 format."
+                )
+
+            log.debug(
+                f"Formatted {len(x)} RACE samples using first question per article "
+                f"(skipped {skipped_count} invalid samples)"
+            )
         elif "pubmedqa" in dataset_name.lower() or (isinstance(dataset_path, str) and "pubmedqa" in dataset_path.lower()):
             # Special handling for PubMedQA format
-            # Keep two prompt variants:
-            #   1) Full: question + context + long answer
-            #   2) Reduced: question + long answer
-            # The reduced variant is stored in dataset.x by default, and callers can
-            # choose the full variant for a sampled model.
-            log.debug("Detected PubMedQA dataset format, formatting question/context/long_answer prompts")
+            # Check if this is a no-context variant
+            is_pubmedqa_no_context = (
+                "no_context" in dataset_name.lower() or
+                "no-context" in dataset_name.lower() or
+                (isinstance(dataset_path, str) and ("no_context" in dataset_path.lower() or "no-context" in dataset_path.lower()))
+            )
+            
+            if is_pubmedqa_no_context:
+                # For no-context variant: only create no-context prompts, skip with-context creation
+                log.debug("Detected PubMedQA no-context variant, formatting question/long_answer prompts without context")
+            else:
+                # For standard PubMedQA: keep two prompt variants:
+                #   1) Full: question + context + long answer
+                #   2) Reduced: question + long answer
+                # The reduced variant is stored in dataset.x by default, and callers can
+                # choose the full variant for a sampled model.
+                log.debug("Detected PubMedQA dataset format, formatting question/context/long_answer prompts")
+            
             x, y = [], []
             pubmedqa_with_context_prompts = []
             pubmedqa_without_context_prompts = []
@@ -727,17 +915,26 @@ class Dataset:
                     skipped_count += 1
                     continue
 
-                if prompt:
-                    try:
-                        with_context_prompt = prompt.format(
-                            question=question,
-                            context=context_text,
-                            long_answer=long_answer,
-                            text=question,
-                            answer=long_answer,
-                        )
-                    except KeyError as e:
-                        log.warning(f"PubMedQA prompt format error: {e}. Falling back to default prompt.")
+                # For no-context variant, skip with-context prompt creation
+                if not is_pubmedqa_no_context:
+                    if prompt:
+                        try:
+                            with_context_prompt = prompt.format(
+                                question=question,
+                                context=context_text,
+                                long_answer=long_answer,
+                                text=question,
+                                answer=long_answer,
+                            )
+                        except KeyError as e:
+                            log.warning(f"PubMedQA prompt format error: {e}. Falling back to default prompt.")
+                            with_context_prompt = _build_pubmedqa_prompt(
+                                question=question,
+                                long_answer=long_answer,
+                                context_text=context_text,
+                                include_context=True,
+                            )
+                    else:
                         with_context_prompt = _build_pubmedqa_prompt(
                             question=question,
                             long_answer=long_answer,
@@ -745,12 +942,7 @@ class Dataset:
                             include_context=True,
                         )
                 else:
-                    with_context_prompt = _build_pubmedqa_prompt(
-                        question=question,
-                        long_answer=long_answer,
-                        context_text=context_text,
-                        include_context=True,
-                    )
+                    with_context_prompt = None
 
                 if prompt_without_context:
                     try:
@@ -779,14 +971,16 @@ class Dataset:
                     )
 
                 if description:
-                    with_context_prompt = description + "\n\n" + with_context_prompt
+                    with_context_prompt = description + "\n\n" + with_context_prompt if with_context_prompt else with_context_prompt
                     without_context_prompt = description + "\n\n" + without_context_prompt
 
                 # Use reduced prompt by default; caller can switch to full prompt per model.
                 x.append(without_context_prompt)
                 y.append(normalized_label)
-                pubmedqa_with_context_prompts.append(with_context_prompt)
-                pubmedqa_without_context_prompts.append(without_context_prompt)
+                # For standard pubmedqa, store both variants; for no-context, only store without-context
+                if not is_pubmedqa_no_context:
+                    pubmedqa_with_context_prompts.append(with_context_prompt)
+                    pubmedqa_without_context_prompts.append(without_context_prompt)
 
             if len(x) == 0:
                 raise ValueError(
@@ -922,12 +1116,25 @@ class Dataset:
 
         formatted_dataset = Dataset(x, y, batch_size, images=images)
 
-        if pubmedqa_with_context_prompts is not None and pubmedqa_without_context_prompts is not None:
+        # Only set mixed_context strategy for standard PubMedQA (not for no-context variant)
+        if (pubmedqa_with_context_prompts is not None and 
+            pubmedqa_without_context_prompts is not None and
+            len(pubmedqa_with_context_prompts) > 0):
             # Store both prompt variants to support model-specific prompt selection.
             formatted_dataset.pubmedqa_with_context_x = pubmedqa_with_context_prompts
             formatted_dataset.pubmedqa_without_context_x = pubmedqa_without_context_prompts
             formatted_dataset.pubmedqa_prompt_strategy = "mixed_context"
             formatted_dataset.pubmedqa_context_model_path = pubmedqa_context_model_path
+
+        if (
+            race_with_context_prompts is not None
+            and race_without_context_prompts is not None
+            and len(race_with_context_prompts) > 0
+        ):
+            # Store both prompt variants for per-model article-context routing.
+            formatted_dataset.race_with_context_x = race_with_context_prompts
+            formatted_dataset.race_without_context_x = race_without_context_prompts
+            formatted_dataset.race_prompt_strategy = "article_context_mixed"
 
         return formatted_dataset
 

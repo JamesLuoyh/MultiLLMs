@@ -26,10 +26,16 @@ if str(PROJECT_ROOT) not in sys.path:
 from wagering.core.dataset import Dataset
 from wagering.core.model import WhiteboxModel
 
-from wagering.utils import generate_calibration_dir, load_datasets_from_config, load_models_from_config
+from wagering.utils.checkpoint_utils import (
+    generate_calibration_dir,
+    generate_per_model_calibration_dir,
+)
+from wagering.utils import load_datasets_from_config, load_models_from_config
+from wagering.utils.dataset_utils import calibration_dataset_configs_include_pubmedqa
 from wagering.utils.multi_llm_ensemble import (
     assign_pubmedqa_context_models,
     collect_option_logits_and_hidden_states_for_model,
+    extract_hidden_state_features,
     get_model_prompt_variant,
     get_cached_logits_and_hidden_states_for_model,
     set_cached_logits_and_hidden_states_for_model,
@@ -68,13 +74,17 @@ def resolve_calibration_artifact_dir(args: Dict[str, Any]) -> Optional[Path]:
             "/common/users/yl2310/MultiLLMs/calibration_checkpoints",
         )
     )
-    return generate_calibration_dir(
-        base_dir=base_dir,
-        models=args["models"],
-        datasets=calibration_config["datasets"],
-        calibration_config=calibration_config,
-        create_hash=True,
-    )
+    # PubMedQA: single combined artifact keyed by full ensemble. Non-PubMedQA: per-model
+    # artifacts live under base_dir/per_model/ (see generate_per_model_calibration_dir).
+    if calibration_dataset_configs_include_pubmedqa(calibration_config["datasets"]):
+        return generate_calibration_dir(
+            base_dir=base_dir,
+            models=args["models"],
+            datasets=calibration_config["datasets"],
+            calibration_config=calibration_config,
+            create_hash=True,
+        )
+    return base_dir / "per_model"
 
 
 class TemperatureScalingHead(nn.Module):
@@ -133,13 +143,38 @@ class AdaptiveTemperatureCalibrator(nn.Module):
         model_paths: Sequence[str],
         input_dims: Sequence[int],
         config: Dict[str, Any],
+        *,
+        slot_model_paths: Optional[Sequence[str]] = None,
+        canonical_unique_heads: bool = False,
     ):
         super().__init__()
         if len(model_paths) != len(input_dims):
             raise ValueError("model_paths and input_dims must have the same length")
 
-        self.model_paths = list(model_paths)
+        self.head_model_paths = list(model_paths)
         self.input_dims = [int(dim) for dim in input_dims]
+        self._canonical_unique_heads = bool(canonical_unique_heads)
+        if slot_model_paths is not None:
+            self.slot_model_paths = list(slot_model_paths)
+        else:
+            self.slot_model_paths = list(model_paths)
+
+        if self._canonical_unique_heads:
+            self._path_to_head_idx = {p: i for i, p in enumerate(self.head_model_paths)}
+            for slot_idx, path in enumerate(self.slot_model_paths):
+                if path not in self._path_to_head_idx:
+                    raise ValueError(
+                        f"Ensemble slot {slot_idx} model path {path!r} has no calibration head "
+                        f"(heads: {self.head_model_paths})"
+                    )
+        else:
+            if len(self.slot_model_paths) != len(self.head_model_paths):
+                raise ValueError(
+                    "Without canonical_unique_heads, slot_model_paths must match heads length"
+                )
+
+        # Back-compat alias: older code reads .model_paths
+        self.model_paths = self.head_model_paths
         self.config = dict(config)
         self.device_name = str(self.config.get("device", "cpu"))
         self.device = torch.device(self.device_name)
@@ -174,6 +209,12 @@ class AdaptiveTemperatureCalibrator(nn.Module):
         )
         self.to(self.device)
         self.eval()
+
+    def _head_index_for_slot(self, slot_idx: int) -> int:
+        if not self._canonical_unique_heads:
+            return slot_idx
+        path = self.slot_model_paths[slot_idx]
+        return self._path_to_head_idx[path]
 
     @staticmethod
     def _coerce_hidden_states_by_model(hidden_states: Any) -> List[np.ndarray]:
@@ -388,23 +429,27 @@ class AdaptiveTemperatureCalibrator(nn.Module):
             raise ValueError("Hidden states must provide one array per model")
 
         calibrated_logits = np.empty_like(model_logits, dtype=np.float32)
-        for model_index in range(model_logits.shape[0]):
-            temperatures = self.predict_temperatures(hidden_states_by_model[model_index], model_index)
+        for slot_idx in range(model_logits.shape[0]):
+            head_idx = self._head_index_for_slot(slot_idx)
+            temperatures = self.predict_temperatures(hidden_states_by_model[slot_idx], head_idx)
             if temperatures.shape[0] != model_logits.shape[1]:
                 raise ValueError("Predicted temperatures do not align with logit count")
-            calibrated_logits[model_index] = model_logits[model_index] / temperatures[:, None]
+            calibrated_logits[slot_idx] = model_logits[slot_idx] / temperatures[:, None]
         return calibrated_logits
 
     def save_pretrained(self, save_dir: str | Path) -> str:
         """Save the calibrator artifact to disk."""
         save_path = Path(save_dir)
         save_path.mkdir(parents=True, exist_ok=True)
-        artifact = {
+        artifact: Dict[str, Any] = {
             "config": self.config,
-            "model_paths": self.model_paths,
+            "model_paths": self.head_model_paths,
             "input_dims": self.input_dims,
             "state_dict": self.state_dict(),
+            "canonical_unique_heads": self._canonical_unique_heads,
         }
+        if self._canonical_unique_heads:
+            artifact["slot_model_paths"] = self.slot_model_paths
         torch.save(artifact, save_path / self.artifact_name)
         return str(save_path)
 
@@ -413,6 +458,7 @@ class AdaptiveTemperatureCalibrator(nn.Module):
         cls,
         save_dir: str | Path,
         device: Optional[str] = None,
+        slot_model_paths: Optional[Sequence[str]] = None,
     ) -> "AdaptiveTemperatureCalibrator":
         """Load a saved calibrator artifact."""
         save_path = Path(save_dir)
@@ -420,12 +466,70 @@ class AdaptiveTemperatureCalibrator(nn.Module):
         config = dict(artifact["config"])
         if device is not None:
             config["device"] = device
-        calibrator = cls(
-            model_paths=artifact["model_paths"],
-            input_dims=artifact["input_dims"],
-            config=config,
-        )
+        canonical = bool(artifact.get("canonical_unique_heads", False))
+        head_paths = list(artifact["model_paths"])
+        if canonical:
+            slots = list(slot_model_paths) if slot_model_paths is not None else list(artifact.get("slot_model_paths", []))
+            if not slots:
+                raise ValueError(
+                    "Canonical temperature calibrator requires slot_model_paths (pass current ensemble paths)."
+                )
+            calibrator = cls(
+                model_paths=head_paths,
+                input_dims=artifact["input_dims"],
+                config=config,
+                slot_model_paths=slots,
+                canonical_unique_heads=True,
+            )
+        else:
+            calibrator = cls(
+                model_paths=head_paths,
+                input_dims=artifact["input_dims"],
+                config=config,
+                slot_model_paths=None,
+                canonical_unique_heads=False,
+            )
         calibrator.load_state_dict(artifact["state_dict"])
+        calibrator.freeze()
+        return calibrator
+
+    @classmethod
+    def merge_from_per_model_dirs(
+        cls,
+        per_model_dirs: Dict[str, Path],
+        unique_paths: Sequence[str],
+        ensemble_paths: Sequence[str],
+        device: Optional[str] = None,
+    ) -> "AdaptiveTemperatureCalibrator":
+        """Stack independently saved single-head artifacts into one calibrator (non-PubMedQA)."""
+        unique_paths = list(unique_paths)
+        input_dims: List[int] = []
+        merged_state: Dict[str, torch.Tensor] = {}
+        merged_config: Dict[str, Any] = {}
+
+        for i, path in enumerate(unique_paths):
+            save_dir = Path(per_model_dirs[path])
+            artifact_path = save_dir / cls.artifact_name
+            artifact = torch.load(artifact_path, map_location="cpu")
+            input_dims.append(int(artifact["input_dims"][0]))
+            if i == 0:
+                merged_config = dict(artifact["config"])
+                if device is not None:
+                    merged_config["device"] = device
+            state = artifact["state_dict"]
+            for k, v in state.items():
+                if k.startswith("heads.0."):
+                    suffix = k[len("heads.0.") :]
+                    merged_state[f"heads.{i}.{suffix}"] = v
+
+        calibrator = cls(
+            model_paths=unique_paths,
+            input_dims=input_dims,
+            config=merged_config,
+            slot_model_paths=list(ensemble_paths),
+            canonical_unique_heads=True,
+        )
+        calibrator.load_state_dict(merged_state, strict=True)
         calibrator.freeze()
         return calibrator
 
@@ -452,6 +556,8 @@ def _prepare_models_for_datasets(
                 dataset,
                 list(option_tokens),
                 prompt_variant=prompt_variant,
+                model_index=idx,
+                hidden_state_layers=[-1],
             )
             if cached_logits is None or (require_hidden_states and cached_hidden_states is None):
                 dataset_cache_ok = False
@@ -506,6 +612,8 @@ def _collect_calibration_arrays(
                 dataset,
                 list(option_tokens),
                 prompt_variant=prompt_variant,
+                model_index=model_idx,
+                hidden_state_layers=[-1],
             )
 
             if cached_logits is None or cached_hidden_states is None:
@@ -513,7 +621,7 @@ def _collect_calibration_arrays(
                     raise RuntimeError(
                         f"Cache miss for model path {model}. A loaded model instance is required to collect calibration caches."
                     )
-                model_logits, model_hidden_states, model_labels = collect_option_logits_and_hidden_states_for_model(
+                model_logits, model_hidden_states_all_layers, model_labels = collect_option_logits_and_hidden_states_for_model(
                     model,
                     dataset,
                     list(option_tokens),
@@ -525,10 +633,14 @@ def _collect_calibration_arrays(
                     dataset,
                     list(option_tokens),
                     model_logits,
-                    model_hidden_states,
+                    model_hidden_states_all_layers,
                     model_labels,
                     prompt_variant=prompt_variant,
+                    model_index=model_idx,
                 )
+                model_hidden_states = extract_hidden_state_features(model_hidden_states_all_layers, [-1])
+                if model_hidden_states is None:
+                    raise RuntimeError("Failed to extract hidden states for calibration")
             else:
                 model_logits = cached_logits
                 model_hidden_states = cached_hidden_states
@@ -573,6 +685,118 @@ def _collect_calibration_arrays(
     return stacked_logits, hidden_states_by_model, labels
 
 
+def _fit_or_load_per_model_calibrators(
+    args: Dict[str, Any],
+    calibration_config: Dict[str, Any],
+    base_root: Path,
+    force_refit: bool,
+) -> Tuple[AdaptiveTemperatureCalibrator, str, bool]:
+    """Fit or load one temperature head per unique HF path; merge for the ensemble (non-PubMedQA)."""
+    ensemble_paths = [m["path"] for m in args["models"] if "path" in m]
+    unique_paths = sorted(set(ensemble_paths))
+    if not unique_paths:
+        raise ValueError("No model paths in args['models']")
+
+    reuse_existing = bool(calibration_config.get("reuse_existing", True))
+    option_tokens = args.get("option_tokens", ["A", "B", "C", "D"])
+    dataset_split_seed = int(args.get("dataset_split_seed", 42))
+    device_str = str(calibration_config.get("device", "cpu"))
+
+    per_model_dirs: Dict[str, Path] = {
+        p: generate_per_model_calibration_dir(
+            base_dir=base_root,
+            model_path=p,
+            datasets=calibration_config["datasets"],
+            calibration_config=calibration_config,
+        )
+        for p in unique_paths
+    }
+
+    if reuse_existing and not force_refit:
+        all_exist = all(
+            (per_model_dirs[p] / AdaptiveTemperatureCalibrator.artifact_name).exists()
+            for p in unique_paths
+        )
+        if all_exist:
+            calibrator = AdaptiveTemperatureCalibrator.merge_from_per_model_dirs(
+                per_model_dirs=per_model_dirs,
+                unique_paths=unique_paths,
+                ensemble_paths=ensemble_paths,
+                device=device_str,
+            )
+            log.info(
+                "Loaded existing per-model temperature calibrators under %s (merged %d heads)",
+                base_root / "per_model",
+                len(unique_paths),
+            )
+            return calibrator, str(base_root / "per_model"), False
+
+    datasets, dataset_names = load_datasets_from_config(
+        calibration_config["datasets"],
+        split="train",
+        random_seed=dataset_split_seed,
+    )
+    log.info("Loaded %d calibration datasets: %s", len(datasets), dataset_names)
+
+    any_fitted = False
+    total_models = len(unique_paths)
+    for model_idx, p in enumerate(unique_paths, start=1):
+        artifact_file = per_model_dirs[p] / AdaptiveTemperatureCalibrator.artifact_name
+        if artifact_file.exists() and reuse_existing and not force_refit:
+            log.info(
+                "Calibration artifact already exists for model %d/%d: %s (skipping refit)",
+                model_idx,
+                total_models,
+                p,
+            )
+            continue
+        any_fitted = True
+        log.info(
+            "Calibration cache miss for model %d/%d: %s. Loading model to collect caches...",
+            model_idx,
+            total_models,
+            p,
+        )
+        models, _ = _prepare_models_for_datasets(
+            model_cfgs=[{"path": p}],
+            datasets=datasets,
+            option_tokens=option_tokens,
+            cache_path=args.get("cache_path"),
+            require_hidden_states=True,
+        )
+        all_logits, all_hidden, labels = _collect_calibration_arrays(
+            models=models,
+            datasets=datasets,
+            option_tokens=option_tokens,
+            balance_datasets=bool(calibration_config.get("balance_datasets", True)),
+            shuffle_seed=int(calibration_config.get("shuffle_seed", 42)),
+        )
+        dim = all_hidden[0].shape[1]
+        one_calibrator = AdaptiveTemperatureCalibrator(
+            model_paths=[p],
+            input_dims=[dim],
+            config=calibration_config,
+            slot_model_paths=[p],
+            canonical_unique_heads=False,
+        )
+        metrics = one_calibrator.fit(all_logits, all_hidden, labels)
+        one_calibrator.save_pretrained(per_model_dirs[p])
+        log.info(
+            "Saved per-model temperature calibrator for %s to %s metrics=%s",
+            p,
+            per_model_dirs[p],
+            metrics,
+        )
+
+    merged = AdaptiveTemperatureCalibrator.merge_from_per_model_dirs(
+        per_model_dirs=per_model_dirs,
+        unique_paths=unique_paths,
+        ensemble_paths=ensemble_paths,
+        device=device_str,
+    )
+    return merged, str(base_root / "per_model"), any_fitted
+
+
 def fit_or_load_logit_calibrator(
     args: Dict[str, Any],
     calibration_path: Optional[str] = None,
@@ -583,24 +807,38 @@ def fit_or_load_logit_calibrator(
         return None, None, False
 
     calibration_config = get_calibration_config(args)
-    artifact_dir = Path(calibration_path) if calibration_path is not None else resolve_calibration_artifact_dir(args)
-    if artifact_dir is None:
-        raise RuntimeError("Could not resolve calibration artifact directory")
+    include_pubmedqa = calibration_dataset_configs_include_pubmedqa(calibration_config["datasets"])
+    base_root = Path(calibration_path) if calibration_path is not None else Path(
+        calibration_config.get(
+            "checkpoint_base_dir",
+            "/common/users/yl2310/MultiLLMs/calibration_checkpoints",
+        )
+    )
 
+    if not include_pubmedqa:
+        return _fit_or_load_per_model_calibrators(
+            args, calibration_config, base_root, force_refit
+        )
+
+    artifact_dir = Path(calibration_path) if calibration_path is not None else generate_calibration_dir(
+        base_dir=base_root,
+        models=args["models"],
+        datasets=calibration_config["datasets"],
+        calibration_config=calibration_config,
+        create_hash=True,
+    )
     artifact_file = artifact_dir / AdaptiveTemperatureCalibrator.artifact_name
     reuse_existing = bool(calibration_config.get("reuse_existing", True))
     if artifact_file.exists() and reuse_existing and not force_refit:
         calibrator = AdaptiveTemperatureCalibrator.load_pretrained(
             artifact_dir,
             device=str(calibration_config.get("device", "cpu")),
+            slot_model_paths=None,
         )
         log.info("Loaded existing temperature calibrator from %s", artifact_dir)
         return calibrator, str(artifact_dir), False
 
-    dataset_split_seed = args.get(
-        "seed",
-        args.get("shuffle_seed", calibration_config.get("shuffle_seed", 42)),
-    )
+    dataset_split_seed = int(args.get("dataset_split_seed", 42))
     datasets, dataset_names = load_datasets_from_config(
         calibration_config["datasets"],
         split="train",
@@ -654,10 +892,13 @@ def fit_or_load_logit_calibrator(
         shuffle_seed=int(calibration_config.get("shuffle_seed", 42)),
     )
 
+    ensemble_paths = [model_cfg["path"] for model_cfg in args["models"]]
     calibrator = AdaptiveTemperatureCalibrator(
-        model_paths=[model_cfg["path"] for model_cfg in args["models"]],
+        model_paths=ensemble_paths,
         input_dims=[hidden_state.shape[1] for hidden_state in all_hidden_states],
         config=calibration_config,
+        slot_model_paths=None,
+        canonical_unique_heads=False,
     )
     metrics = calibrator.fit(
         all_model_logits=all_model_logits,

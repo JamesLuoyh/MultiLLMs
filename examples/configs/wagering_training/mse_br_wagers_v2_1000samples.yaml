@@ -11,7 +11,7 @@ _include_models:
   - models/llama3_aloe_8b_alpha.yaml
   - models/llama3_1_8b_instruct.yaml
   - models/biomistral_7b.yaml
-  - models/qwen3_5_9b.yaml
+  # - models/qwen3_5_9b.yaml
   # - models/llama_2_7b.yaml
 
 # Apply adaptive temperature scaling to cached option logits before wagering.

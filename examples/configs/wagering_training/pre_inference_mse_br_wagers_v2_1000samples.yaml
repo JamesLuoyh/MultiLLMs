@@ -22,7 +22,7 @@ _include_calibration: calibration/adaptive_temperature_1000samples.yaml
 
 # Wagering method (must match between training and evaluation)
 wagering_method:
-  name: centralized_wagers
+  name: pre_inference_mse_br_wagers_v2
   config:
     hidden_dim: 4096  # Dimension of hidden states (adjust based on model)
     hidden_layers: [512, 256]  # MLP hidden layer sizes
@@ -69,12 +69,12 @@ balance_training_datasets: true  # If true, randomly subsample each dataset to m
 shuffle_data: true  # Shuffle training data across datasets
 shuffle_seed: 42  # Random seed for shuffling (will be overridden by sweep)
 early_stopping_patience: 10000  # Stop training if no improvement for 20 epochs (default: 10)
-early_stopping_criterion: validation  # Use validation performance for early stopping (default: "validation")
+early_stopping_criterion: online_learning  # Use validation performance for early stopping (default: "validation")
 # Wandb logging
 report_to_wandb: true
 wandb_project: multi-llm-wagering
 wandb_entity: null
-wandb_name: centralized_wagers_linear_pooling
+wandb_name: pre_inference_mse_br_wagers_v2_log_pooling_samples
 
 # ============================================================================
 # EVALUATION CONFIGURATION

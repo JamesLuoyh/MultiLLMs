@@ -75,6 +75,8 @@ class WageringAnalytics:
             row["wagering_hidden_dim"] = wagering_method.common_hidden_dim
         if hasattr(wagering_method, 'hidden_layers'):
             row["wagering_hidden_layers"] = str(wagering_method.hidden_layers)
+        if hasattr(wagering_method, 'hidden_state_layers'):
+            row["wagering_hidden_state_layers"] = str(wagering_method.hidden_state_layers)
         if hasattr(wagering_method, 'learning_rate'):
             row["wagering_learning_rate"] = wagering_method.learning_rate
         if hasattr(wagering_method, 'temperature'):
@@ -128,6 +130,7 @@ class WageringAnalytics:
         row["final_ece"] = results.get("final_ece") if results.get("final_ece") is not None and not np.isnan(results.get("final_ece", np.nan)) else None
         row["final_auc"] = results.get("final_auc") if results.get("final_auc") is not None and not np.isnan(results.get("final_auc", np.nan)) else None
         row["final_d_regret"] = results.get("final_d_regret") if results.get("final_d_regret") is not None and not np.isnan(results.get("final_d_regret", np.nan)) else None
+        row["final_brier_d_regret"] = results.get("final_brier_d_regret") if results.get("final_brier_d_regret") is not None and not np.isnan(results.get("final_brier_d_regret", np.nan)) else None
         row["final_meta_acc"] = results.get("final_meta_acc") if results.get("final_meta_acc") is not None and not np.isnan(results.get("final_meta_acc", np.nan)) else None
         row["final_meta_nll"] = results.get("final_meta_nll") if results.get("final_meta_nll") is not None and not np.isnan(results.get("final_meta_nll", np.nan)) else None
         row["final_meta_auc"] = results.get("final_meta_auc") if results.get("final_meta_auc") is not None and not np.isnan(results.get("final_meta_auc", np.nan)) else None
@@ -185,6 +188,8 @@ class WageringAnalytics:
             row["wagering_hidden_dim"] = wagering_method.common_hidden_dim
         if hasattr(wagering_method, 'hidden_layers'):
             row["wagering_hidden_layers"] = str(wagering_method.hidden_layers)
+        if hasattr(wagering_method, 'hidden_state_layers'):
+            row["wagering_hidden_state_layers"] = str(wagering_method.hidden_state_layers)
         if hasattr(wagering_method, 'learning_rate'):
             row["wagering_learning_rate"] = wagering_method.learning_rate
         if hasattr(wagering_method, 'temperature'):
@@ -242,6 +247,7 @@ class WageringAnalytics:
             row["auc"] = results.get("auc") if results.get("auc") is not None and not np.isnan(results.get("auc", np.nan)) else None
             row["ece"] = results.get("ece") if results.get("ece") is not None and not np.isnan(results.get("ece", np.nan)) else None
             row["d_regret"] = results.get("d_regret") if results.get("d_regret") is not None and not np.isnan(results.get("d_regret", np.nan)) else None
+            row["brier_d_regret"] = results.get("brier_d_regret") if results.get("brier_d_regret") is not None and not np.isnan(results.get("brier_d_regret", np.nan)) else None
             row["meta_acc"] = results.get("meta_acc") if results.get("meta_acc") is not None and not np.isnan(results.get("meta_acc", np.nan)) else None
             row["meta_nll"] = results.get("meta_nll") if results.get("meta_nll") is not None and not np.isnan(results.get("meta_nll", np.nan)) else None
             row["meta_auc"] = results.get("meta_auc") if results.get("meta_auc") is not None and not np.isnan(results.get("meta_auc", np.nan)) else None
@@ -292,12 +298,13 @@ class WageringAnalytics:
                 'shuffle_data', 'shuffle_seed', 'early_stopping_patience', 'save_every',
                 'datasets', 'models', 'training_datasets', 'evaluation_dataset',
                 'wagering_hidden_dim', 'wagering_hidden_layers',
+                'wagering_hidden_state_layers',
                 'wagering_learning_rate', 'wagering_temperature', 'wagering_grad_clip_norm',
                 'wagering_normalize_hidden_states', 'wagering_device', 'seed', 'dataset_size'
             ]
             result_columns = [
                 col for col in combined_df.columns
-                if (col.startswith('final_') or col in ['accuracy', 'nll', 'brier', 'auc', 'ece', 'num_examples', 'd_regret', 'meta_acc', 'meta_nll', 'meta_auc'])
+                if (col.startswith('final_') or col in ['accuracy', 'nll', 'brier', 'auc', 'ece', 'num_examples', 'd_regret', 'brier_d_regret', 'meta_acc', 'meta_nll', 'meta_auc'])
                 or (col not in settings_columns and pd.api.types.is_numeric_dtype(combined_df[col]))
             ]
         

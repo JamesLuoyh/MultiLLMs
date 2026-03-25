@@ -14,6 +14,7 @@ from .moe_wagers import MoEWagers
 from .kelly_wagers import KellyWagers
 from .br_regret_wagers import BrRegretWagers
 from .mse_br_wagers import MSEBrWagers
+from .pre_inference_mse_br_wagers_v2 import PreInferenceMSEBrWagersV2
 from .weighted_score_wagers import WeightedScoreWagers
 from .one_zero_wagers import OneZeroWagers
 from .zero_one_wagers import ZeroOneWagers
@@ -28,6 +29,7 @@ __all__ = [
     "KellyWagers",
     "BrRegretWagers",
     "MSEBrWagers",
+    "PreInferenceMSEBrWagersV2",
     "WeightedScoreWagers",
     "OneZeroWagers",
     "ZeroOneWagers",

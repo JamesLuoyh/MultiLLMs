@@ -5,9 +5,12 @@ Simplified version with direct, predictable naming.
 """
 
 import hashlib
+import json
 import re
 from pathlib import Path
 from typing import List, Dict, Any, Optional
+
+from wagering.utils.dataset_utils import calibration_dataset_configs_include_pubmedqa
 
 
 def sanitize_name(name: str, max_length: int = 20) -> str:
@@ -84,6 +87,21 @@ def get_dataset_name(dataset_config: Dict[str, Any]) -> str:
     if len(parts) >= 1:
         return sanitize_name(parts[-1], max_length=20)
     return sanitize_name(str(name), max_length=20)
+
+
+def _stable_json_value(value: Any) -> Any:
+    """Normalize values into deterministic JSON-compatible structures."""
+    if isinstance(value, dict):
+        return {str(k): _stable_json_value(v) for k, v in sorted(value.items(), key=lambda item: str(item[0]))}
+    if isinstance(value, (list, tuple)):
+        return [_stable_json_value(v) for v in value]
+    return value
+
+
+def _strip_shuffle_seed_fields(config: Dict[str, Any]) -> Dict[str, Any]:
+    """Remove sweep/runtime seed fields that should not partition calibration artifacts."""
+    excluded = {"shuffle_seed", "seed"}
+    return {k: v for k, v in config.items() if k not in excluded}
 
 
 def generate_checkpoint_dir(
@@ -171,6 +189,41 @@ def generate_checkpoint_dir(
     return base_dir / dir_name
 
 
+def generate_per_model_calibration_dir(
+    base_dir: Path,
+    model_path: str,
+    datasets: List[Dict[str, Any]],
+    calibration_config: Dict[str, Any],
+    create_hash: bool = True,
+) -> Path:
+    """Directory for one HF model's temperature head (non-PubMedQA only).
+
+    Keyed by that model path plus calibration datasets and hyperparameters — not by
+    ensemble size or order — so any subset of models can reuse previously fitted heads.
+    """
+    base_dir = Path(base_dir)
+    per_model_root = base_dir / "per_model"
+    per_model_root.mkdir(parents=True, exist_ok=True)
+
+    calibration_name = sanitize_name(
+        calibration_config.get("name", "adaptive_temperature_scaling"), max_length=25
+    )
+    normalized_payload = {
+        "model_path": model_path,
+        "datasets": _stable_json_value(datasets),
+        "calibration": _stable_json_value(_strip_shuffle_seed_fields(calibration_config)),
+    }
+    serialized = json.dumps(
+        normalized_payload, sort_keys=True, separators=(",", ":"), default=str
+    )
+    config_hash = hashlib.md5(serialized.encode("utf-8")).hexdigest()[:8]
+    model_digest = hashlib.md5(model_path.encode("utf-8")).hexdigest()[:12]
+    dir_name = f"{calibration_name}_{model_digest}_{config_hash}"
+    if not create_hash:
+        dir_name = f"{calibration_name}_{model_digest}"
+    return per_model_root / dir_name
+
+
 def get_checkpoint_metadata(
     models: List[Dict[str, Any]],
     datasets: List[Dict[str, Any]],
@@ -229,7 +282,15 @@ def generate_calibration_dir(
     calibration_config: Dict[str, Any],
     create_hash: bool = True,
 ) -> Path:
-    """Generate a unique artifact directory for cached-logit calibration."""
+    """Generate a unique artifact directory for cached-logit temperature calibration.
+
+    When **no** calibration dataset config is PubMedQA, the directory name and content hash
+    use **sorted unique** model paths only: ensemble order and duplicate slots do not create
+    a separate artifact, as long as the calibration dataset configs match.
+
+    When **any** calibration dataset is PubMedQA, the full ordered model list is used (mixed-
+    context routing depends on slot index and count).
+    """
     base_dir = Path(base_dir)
     base_dir.mkdir(parents=True, exist_ok=True)
 
@@ -238,22 +299,52 @@ def generate_calibration_dir(
     if not datasets:
         raise ValueError("Must provide at least one dataset")
 
-    model_names = [get_model_name(m["path"]) for m in models if "path" in m]
-    if not model_names:
+    ordered_model_paths = [m["path"] for m in models if "path" in m]
+    if not ordered_model_paths:
         raise ValueError("No valid model paths found in model configs")
+
+    # PubMedQA: ensemble order and duplicate slots matter (mixed-context routing).
+    # Non-PubMedQA: reuse calibration across order/duplicates; key by unique paths only.
+    pubmedqa_calibration = calibration_dataset_configs_include_pubmedqa(datasets)
+    if pubmedqa_calibration:
+        models_for_hash = ordered_model_paths
+        model_names = [get_model_name(path) for path in ordered_model_paths]
+        indexed_model_names = [f"m{idx}_{name}" for idx, name in enumerate(model_names)]
+    else:
+        models_for_hash = sorted(set(ordered_model_paths))
+        model_names = [get_model_name(path) for path in models_for_hash]
+        indexed_model_names = [f"u{idx}_{name}" for idx, name in enumerate(model_names)]
 
     dataset_names = [get_dataset_name(d) for d in datasets]
     calibration_name = sanitize_name(calibration_config.get("name", "adaptive_temperature_scaling"), max_length=25)
 
     components = [
-        f"models_{'_'.join(sorted(set(model_names)))}",
+        f"models_{'_'.join(indexed_model_names)}",
         f"datasets_{'_'.join(sorted(set(dataset_names)))}",
         f"calibration_{calibration_name}",
     ]
-    dir_name = "_".join(components)
 
+    normalized_payload = {
+        "models": models_for_hash,
+        "datasets": _stable_json_value(datasets),
+        "calibration": _stable_json_value(_strip_shuffle_seed_fields(calibration_config)),
+    }
+    serialized = json.dumps(normalized_payload, sort_keys=True, separators=(",", ":"), default=str)
+    config_hash = hashlib.md5(serialized.encode("utf-8")).hexdigest()[:8]
+
+    dir_name = "_".join(components)
     if create_hash:
-        config_hash = hashlib.md5(f"{models}_{datasets}_{calibration_config}".encode()).hexdigest()[:8]
         dir_name = f"{dir_name}_{config_hash}"
+
+    # Avoid filesystem component limits (typically 255 chars) when many models are listed.
+    if len(dir_name) > 220:
+        models_digest = hashlib.md5("|".join(models_for_hash).encode("utf-8")).hexdigest()[:8]
+        datasets_digest = hashlib.md5("|".join(sorted(set(dataset_names))).encode("utf-8")).hexdigest()[:8]
+        compact_dir_name = (
+            f"models_{len(models_for_hash)}m_{models_digest}_"
+            f"datasets_{len(set(dataset_names))}d_{datasets_digest}_"
+            f"calibration_{calibration_name}"
+        )
+        dir_name = f"{compact_dir_name}_{config_hash}" if create_hash else compact_dir_name
 
     return base_dir / dir_name

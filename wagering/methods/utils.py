@@ -1,3 +1,6 @@
+import re
+from typing import Iterable, List
+
 import torch
 
 def compute_scoring_rule(model_probs: torch.Tensor, outcome: int, scoring_rule: str) -> torch.Tensor:
@@ -49,3 +52,49 @@ def compute_scoring_rule(model_probs: torch.Tensor, outcome: int, scoring_rule: 
             raise ValueError(f"Unknown scoring rule: {scoring_rule}")
         
         return scores
+
+
+def is_likely_pubmedqa_prompt(prompt: str) -> bool:
+    """Heuristic detection for PubMedQA-style prompts used in this codebase."""
+    lowered = str(prompt).lower()
+    return (
+        "question:" in lowered
+        and "long answer:" in lowered
+        and "answer with yes or no" in lowered
+    )
+
+
+def strip_pubmedqa_context(prompt: str) -> str:
+    """
+    Remove the Context section from a PubMedQA prompt while preserving all other sections.
+
+    Expected format includes Question, optional Context, and Long Answer blocks.
+    If no Context block is found, returns the original prompt unchanged.
+    """
+    text = str(prompt)
+
+    context_pattern = re.compile(
+        r"(\n?\s*context:\s*\n?)(.*?)(?=\n\s*long answer:\s*|\Z)",
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+
+    if not context_pattern.search(text):
+        return text
+
+    stripped = context_pattern.sub("\n", text)
+    stripped = re.sub(r"\n{3,}", "\n\n", stripped).strip()
+    return stripped
+
+
+def preprocess_pubmedqa_prompts_for_embedding(
+    prompts: Iterable[str],
+    strip_context: bool = True,
+) -> List[str]:
+    """Optionally strip PubMedQA context blocks before embedding generation."""
+    processed: List[str] = []
+    for prompt in prompts:
+        prompt_text = str(prompt)
+        if strip_context and is_likely_pubmedqa_prompt(prompt_text):
+            prompt_text = strip_pubmedqa_context(prompt_text)
+        processed.append(prompt_text)
+    return processed

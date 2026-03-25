@@ -7,27 +7,39 @@
 
 # Models (shared between training and evaluation)
 _include_models:
-  - models/gemma_2_9b_it.yaml
   - models/llama3_aloe_8b_alpha.yaml
-  - models/llama3_1_8b_instruct.yaml
-  - models/biomistral_7b.yaml
-  # - models/qwen3_5_9b.yaml
-  # - models/llama_2_7b.yaml
+  - models/llama3_aloe_8b_alpha.yaml
+  - models/llama3_aloe_8b_alpha.yaml
+  - models/llama3_aloe_8b_alpha.yaml
+  - models/llama3_aloe_8b_alpha.yaml
+  - models/llama3_aloe_8b_alpha.yaml
+  - models/llama3_aloe_8b_alpha.yaml
+  - models/llama3_aloe_8b_alpha.yaml
+  - models/llama3_aloe_8b_alpha.yaml
+  - models/llama3_aloe_8b_alpha.yaml
+  - models/llama3_aloe_8b_alpha.yaml
+  - models/llama3_aloe_8b_alpha.yaml
+  - models/llama3_aloe_8b_alpha.yaml
+  - models/llama3_aloe_8b_alpha.yaml
+  - models/llama3_aloe_8b_alpha.yaml
+  - models/llama3_aloe_8b_alpha.yaml
+
 
 # Apply adaptive temperature scaling to cached option logits before wagering.
 calibrated: true
-_include_calibration: calibration/adaptive_temperature_1000samples.yaml
+_include_calibration: calibration/adaptive_temperature_pubmedqa_1000samples.yaml
 
 
 
 # Wagering method (must match between training and evaluation)
 wagering_method:
-  name: centralized_wagers
+  name: mse_br_wagers_v3
   config:
     hidden_dim: 4096  # Dimension of hidden states (adjust based on model)
     hidden_layers: [512, 256]  # MLP hidden layer sizes
+    hidden_state_layers: [0, -2, -1]  # Which layers' hidden states to use for wagering (0 = first layer, -1 = last layer)
     learning_rate: 5e-5  # Learning rate for router optimizer (lowered from 1e-4 to prevent wager collapse)
-    lr_decay_factor: 0.95  # Decay learning rate by this factor every lr_decay_steps (1.0 = no decay)
+    lr_decay_factor: 1  # Decay learning rate by this factor every lr_decay_steps (1.0 = no decay)
     lr_decay_steps: 100  # Number of optimizer steps between decay applications
     temperature: 2.0  # Temperature for softmax (higher = softer, prevents one model from dominating)
     grad_clip_norm: 1.0  # Gradient clipping norm (prevents gradient explosion)
@@ -39,7 +51,7 @@ aggregation:
   config: {}
 
 # Common options
-option_tokens: ["A", "B", "C", "D"]
+option_tokens: ["YES", "NO"]
 cache_path: /common/users/yl2310/MultiLLMs/cache
 
 # ============================================================================
@@ -48,33 +60,34 @@ cache_path: /common/users/yl2310/MultiLLMs/cache
 
 # Training datasets
 _include_datasets:
-  - datasets/mmlu_full.yaml
-  - datasets/medmcqa.yaml
+  - datasets/pubmedqa.yaml
 
 # Override dataset-specific settings for training
-datasets:
-  - train_split: auxiliary_train
-  - train_split: train
+# datasets:
+  # - size: 200
+#   - train_split: auxiliary_train
+#   - train_split: train
 
 # Training parameters
 num_epochs: 1  # Default: 100 epochs
 # Base directory for checkpoints (unique subdirectory will be generated)
 checkpoint_base_dir: /common/users/yl2310/MultiLLMs/checkpoints
 save_every: 100  # Save checkpoint every 100 batches
-training_batch_size: 10  # Batch size for training loop (different from batch size for collecting hidden states)
+training_batch_size: 100  # Batch size for training loop (different from batch size for collecting hidden states)
 
 # Training options
 auto_resume: false  # Automatically resume from latest checkpoint if available
 balance_training_datasets: true  # If true, randomly subsample each dataset to min dataset size
 shuffle_data: true  # Shuffle training data across datasets
-shuffle_seed: 42  # Random seed for shuffling (will be overridden by sweep)
-early_stopping_patience: 10000  # Stop training if no improvement for 20 epochs (default: 10)
-early_stopping_criterion: validation  # Use validation performance for early stopping (default: "validation")
+shuffle_seed: 18  # Random seed for shuffling (will be overridden by sweep)
+early_stopping_patience: 100000  # Stop training if no improvement for 20 epochs (default: 10)
+early_stopping_criterion: online_learning  # Use validation performance for early stopping (default: "validation")
+
 # Wandb logging
 report_to_wandb: true
 wandb_project: multi-llm-wagering
 wandb_entity: null
-wandb_name: centralized_wagers_linear_pooling
+wandb_name: mse_br_wagers_v3_pubmedqa
 
 # ============================================================================
 # EVALUATION CONFIGURATION
@@ -86,21 +99,9 @@ wandb_name: centralized_wagers_linear_pooling
 
 # Test datasets
 _include_test_datasets:
-  - datasets/mmlu_full.yaml
-  - datasets/medmcqa.yaml
+  - datasets/pubmedqa.yaml
 
 # Override dataset-specific settings for evaluation
 test_datasets:
-  - display_name: mmlu_full_test
-    eval_split: test
-  - display_name: medmcqa_test
-    eval_split: validation  # MedMCQA test split has no labels, use validation
-
-# OOD dataset
-_include_ood_dataset: datasets/arc_challenge.yaml
-
-# Override OOD dataset-specific settings
-ood_dataset:
-  display_name: arc_challenge_ood
-  eval_split: test
+  - display_name: pubmedqa_test
 

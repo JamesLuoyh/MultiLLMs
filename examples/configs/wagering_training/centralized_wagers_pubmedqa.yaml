@@ -6,18 +6,15 @@
 # ============================================================================
 
 # Models (shared between training and evaluation)
-_include_models:
-  - models/gemma_2_9b_it.yaml
-  - models/gemma_2_9b_it.yaml
-  - models/gemma_2_9b_it.yaml
-  - models/gemma_2_9b_it.yaml
-  - models/gemma_2_9b_it.yaml
-  - models/gemma_2_9b_it.yaml
-  - models/gemma_2_9b_it.yaml
-  - models/gemma_2_9b_it.yaml
-  - models/gemma_2_9b_it.yaml
-  - models/gemma_2_9b_it.yaml
-
+_include_models:  
+  - models/llama3_aloe_8b_alpha.yaml
+  - models/llama3_aloe_8b_alpha.yaml
+  - models/llama3_aloe_8b_alpha.yaml
+  - models/llama3_aloe_8b_alpha.yaml
+  - models/llama3_aloe_8b_alpha.yaml
+  - models/llama3_aloe_8b_alpha.yaml
+  - models/llama3_aloe_8b_alpha.yaml
+  - models/llama3_aloe_8b_alpha.yaml
 
 # Apply adaptive temperature scaling to cached option logits before wagering.
 calibrated: true
@@ -56,8 +53,8 @@ _include_datasets:
   - datasets/pubmedqa.yaml
 
 # Override dataset-specific settings for training
-datasets:
-  - size: 20000
+# datasets:
+  # - size: 200
 #   - train_split: auxiliary_train
 #   - train_split: train
 
@@ -66,13 +63,13 @@ num_epochs: 1  # Default: 100 epochs
 # Base directory for checkpoints (unique subdirectory will be generated)
 checkpoint_base_dir: /common/users/yl2310/MultiLLMs/checkpoints
 save_every: 100  # Save checkpoint every 100 batches
-training_batch_size: 10  # Batch size for training loop (different from batch size for collecting hidden states)
+training_batch_size: 100  # Batch size for training loop (different from batch size for collecting hidden states)
 
 # Training options
 auto_resume: false  # Automatically resume from latest checkpoint if available
 balance_training_datasets: true  # If true, randomly subsample each dataset to min dataset size
 shuffle_data: true  # Shuffle training data across datasets
-shuffle_seed: 42  # Random seed for shuffling (will be overridden by sweep)
+shuffle_seed: 1  # Random seed for shuffling (will be overridden by sweep)
 early_stopping_patience: 100000  # Stop training if no improvement for 20 epochs (default: 10)
 early_stopping_criterion: validation  # Use validation performance for early stopping (default: "validation")
 
@@ -97,5 +94,4 @@ _include_test_datasets:
 # Override dataset-specific settings for evaluation
 test_datasets:
   - display_name: pubmedqa_test
-    size: 10
 

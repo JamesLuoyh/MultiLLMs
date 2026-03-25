@@ -23,10 +23,15 @@ from wagering.core.metrics import ECE
 # Local wagering imports
 from wagering.methods.base import WageringMethod
 from wagering.training.analytics import WageringAnalytics
-from wagering.training.trainer import compute_dynamic_regret, compute_meta_metrics
+from wagering.training.trainer import (
+    compute_brier_dynamic_regret,
+    compute_dynamic_regret,
+    compute_meta_metrics,
+)
 from wagering.aggregation.base import AggregationFunction
 from wagering.utils.multi_llm_ensemble import (
     collect_option_logits_and_hidden_states_for_model,
+    extract_hidden_state_features,
     get_model_prompt_variant,
     get_cached_logits_and_hidden_states_for_model,
     set_cached_logits_and_hidden_states_for_model,
@@ -83,6 +88,7 @@ class WageringEvaluator:
         self.training_checkpoint_path = training_checkpoint_path
         self.seed = seed
         self.logit_calibrator = logit_calibrator
+        self.hidden_state_layers = getattr(self.wagering_method, "hidden_state_layers", None)
         
         if self.checkpoint_dir is not None:
             self.checkpoint_dir = Path(checkpoint_dir)
@@ -206,6 +212,7 @@ class WageringEvaluator:
         # Check cache per model and collect if needed
         all_model_logits_list = []
         all_model_hidden_states_list = [] if needs_hidden_states else None
+        all_model_calibration_hidden_states_list = [] if self.logit_calibrator is not None else None
         labels = None
         
         for i, model in enumerate(self.models):
@@ -217,6 +224,8 @@ class WageringEvaluator:
                 dataset,
                 self.option_tokens,
                 prompt_variant=prompt_variant,
+                model_index=i,
+                hidden_state_layers=self.hidden_state_layers,
             )
             
             if cached_logits is not None:
@@ -227,6 +236,20 @@ class WageringEvaluator:
                     if cached_hidden_states is not None:
                         log.info(f"Model {i+1}/{len(self.models)}: Using cached hidden states")
                         all_model_hidden_states_list.append(cached_hidden_states)
+                        if all_model_calibration_hidden_states_list is not None:
+                            calibration_hidden_states = get_cached_logits_and_hidden_states_for_model(
+                                model_path,
+                                dataset,
+                                self.option_tokens,
+                                prompt_variant=prompt_variant,
+                                model_index=i,
+                                hidden_state_layers=[-1],
+                            )[1]
+                            if calibration_hidden_states is None:
+                                raise RuntimeError(
+                                    "Temperature calibration requires last-layer hidden states in cache"
+                                )
+                            all_model_calibration_hidden_states_list.append(calibration_hidden_states)
                     else:
                         log.info(f"Model {i+1}/{len(self.models)}: Hidden states not cached - will collect")
                         # Need to collect for this model
@@ -234,12 +257,13 @@ class WageringEvaluator:
                             raise RuntimeError(
                                 f"Cache miss for model path {model}. Model must be loaded to collect logits."
                             )
-                        model_logits, model_hidden_states, model_labels = collect_option_logits_and_hidden_states_for_model(
+                        model_logits, model_hidden_states_all_layers, model_labels = collect_option_logits_and_hidden_states_for_model(
                             model,
                             dataset,
                             self.option_tokens,
                             model_identifier=str(model_path),
                             model_index=i,
+                            hidden_state_layers=self.hidden_state_layers,
                         )
                         # Update cache with hidden states
                         set_cached_logits_and_hidden_states_for_model(
@@ -247,12 +271,32 @@ class WageringEvaluator:
                             dataset,
                             self.option_tokens,
                             model_logits,
-                            model_hidden_states,
+                            model_hidden_states_all_layers,
                             model_labels,
                             prompt_variant=prompt_variant,
+                            model_index=i,
+                            hidden_state_layers=self.hidden_state_layers,
                         )
+                        model_hidden_states = extract_hidden_state_features(
+                            model_hidden_states_all_layers,
+                            self.hidden_state_layers,
+                        )
+                        if model_hidden_states is None:
+                            raise RuntimeError(
+                                "Hidden-state cache is in legacy format and cannot satisfy hidden_state_layers; recache is required"
+                            )
                         all_model_logits_list[-1] = model_logits  # Use freshly collected logits
                         all_model_hidden_states_list.append(model_hidden_states)
+                        if all_model_calibration_hidden_states_list is not None:
+                            calibration_hidden_states = extract_hidden_state_features(
+                                model_hidden_states_all_layers,
+                                [-1],
+                            )
+                            if calibration_hidden_states is None:
+                                raise RuntimeError(
+                                    "Temperature calibration requires last-layer hidden states"
+                                )
+                            all_model_calibration_hidden_states_list.append(calibration_hidden_states)
                         labels = model_labels
                 
                 # Set labels from cache if not already set
@@ -265,12 +309,13 @@ class WageringEvaluator:
                     raise RuntimeError(
                         f"Cache miss for model path {model}. Model must be loaded to collect logits."
                     )
-                model_logits, model_hidden_states, model_labels = collect_option_logits_and_hidden_states_for_model(
+                model_logits, model_hidden_states_all_layers, model_labels = collect_option_logits_and_hidden_states_for_model(
                     model,
                     dataset,
                     self.option_tokens,
                     model_identifier=str(model_path),
                     model_index=i,
+                    hidden_state_layers=self.hidden_state_layers,
                 )
                 
                 # Cache the results for this model
@@ -279,14 +324,35 @@ class WageringEvaluator:
                     dataset,
                     self.option_tokens,
                     model_logits,
-                    model_hidden_states,
+                    model_hidden_states_all_layers,
                     model_labels,
                     prompt_variant=prompt_variant,
+                    model_index=i,
+                    hidden_state_layers=self.hidden_state_layers,
                 )
+
+                model_hidden_states = extract_hidden_state_features(
+                    model_hidden_states_all_layers,
+                    self.hidden_state_layers,
+                )
+                if model_hidden_states is None:
+                    raise RuntimeError(
+                        "Hidden-state cache is in legacy format and cannot satisfy hidden_state_layers; recache is required"
+                    )
                 
                 all_model_logits_list.append(model_logits)
                 if needs_hidden_states:
                     all_model_hidden_states_list.append(model_hidden_states)
+                if all_model_calibration_hidden_states_list is not None:
+                    calibration_hidden_states = extract_hidden_state_features(
+                        model_hidden_states_all_layers,
+                        [-1],
+                    )
+                    if calibration_hidden_states is None:
+                        raise RuntimeError(
+                            "Temperature calibration requires last-layer hidden states"
+                        )
+                    all_model_calibration_hidden_states_list.append(calibration_hidden_states)
                 labels = model_labels
         
         # Stack into final arrays
@@ -311,11 +377,18 @@ class WageringEvaluator:
             labels = np.array(labels, dtype=np.int32)
 
         if self.logit_calibrator is not None:
-            if all_model_hidden_states is None:
+            if all_model_calibration_hidden_states_list is None:
                 raise RuntimeError("Temperature calibration requires cached hidden states during evaluation")
+
+            calibration_hidden_dims = [hs.shape[-1] for hs in all_model_calibration_hidden_states_list]
+            if len(set(calibration_hidden_dims)) == 1:
+                calibration_hidden_states = np.stack(all_model_calibration_hidden_states_list, axis=0)
+            else:
+                calibration_hidden_states = all_model_calibration_hidden_states_list
+
             all_model_logits = self.logit_calibrator.apply_to_stacked_logits(
                 all_model_logits,
-                all_model_hidden_states,
+                calibration_hidden_states,
             )
             log.info("Applied frozen temperature scaling to cached evaluation logits")
         
@@ -461,6 +534,7 @@ class WageringEvaluator:
         
         # Compute Dynamic Regret and Meta Metrics
         d_regret = None
+        brier_d_regret = None
         meta_acc = None
         meta_nll = None
         meta_auc = None
@@ -468,6 +542,9 @@ class WageringEvaluator:
             # Get model logits in the right format [num_examples, num_models, num_options]
             model_logits = np.transpose(all_model_logits, (1, 0, 2))
             d_regret, best_expert_ids = compute_dynamic_regret(
+                model_logits, all_aggregated_probs, labels
+            )
+            brier_d_regret = compute_brier_dynamic_regret(
                 model_logits, all_aggregated_probs, labels
             )
             meta_metrics = compute_meta_metrics(wagers_history, best_expert_ids)
@@ -490,6 +567,7 @@ class WageringEvaluator:
             "auc": auc,
             "ece": ece,
             "d_regret": d_regret,
+            "brier_d_regret": brier_d_regret,
             "meta_acc": meta_acc,
             "meta_nll": meta_nll,
             "meta_auc": meta_auc,
@@ -499,9 +577,10 @@ class WageringEvaluator:
         auc_str = f"{auc:.4f}" if auc is not None and not np.isnan(auc) else "N/A"
         ece_str = f"{ece:.4f}" if ece is not None and not np.isnan(ece) else "N/A"
         d_regret_str = f"{d_regret:.4f}" if d_regret is not None and not np.isnan(d_regret) else "N/A"
+        brier_d_regret_str = f"{brier_d_regret:.4f}" if brier_d_regret is not None and not np.isnan(brier_d_regret) else "N/A"
         meta_acc_str = f"{meta_acc:.4f}" if meta_acc is not None and not np.isnan(meta_acc) else "N/A"
         log.info(f"{dataset_name} - Accuracy: {accuracy:.4f}, NLL: {nll:.4f}, Brier: {brier_str}, AUC: {auc_str}, ECE: {ece_str}, "
-                 f"DRegret: {d_regret_str}, MetaAcc: {meta_acc_str}")
+             f"DRegret: {d_regret_str}, BrierDRegret: {brier_d_regret_str}, MetaAcc: {meta_acc_str}")
         
         # Log average wagers per model
         avg_wagers = np.mean(wagers_history, axis=0)
@@ -550,6 +629,7 @@ class WageringEvaluator:
                 "auc": auc if auc is not None and not np.isnan(auc) else None,
                 "ece": ece if ece is not None and not np.isnan(ece) else None,
                 "d_regret": d_regret if d_regret is not None and not np.isnan(d_regret) else None,
+                "brier_d_regret": brier_d_regret if brier_d_regret is not None and not np.isnan(brier_d_regret) else None,
                 "meta_acc": meta_acc if meta_acc is not None and not np.isnan(meta_acc) else None,
                 "meta_nll": meta_nll if meta_nll is not None and not np.isnan(meta_nll) else None,
                 "meta_auc": meta_auc if meta_auc is not None and not np.isnan(meta_auc) else None,

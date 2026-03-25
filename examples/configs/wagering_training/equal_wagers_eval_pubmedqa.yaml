@@ -3,16 +3,17 @@
 
 # Include model configs (must match training)
 _include_models:
-  - models/gemma_2_9b_it.yaml
-  - models/gemma_2_9b_it.yaml
-  - models/gemma_2_9b_it.yaml
-  - models/gemma_2_9b_it.yaml
-  - models/gemma_2_9b_it.yaml
-  - models/gemma_2_9b_it.yaml
-  - models/gemma_2_9b_it.yaml
-  - models/gemma_2_9b_it.yaml
-  - models/gemma_2_9b_it.yaml
-  - models/gemma_2_9b_it.yaml
+  - models/llama3_aloe_8b_alpha.yaml
+  - models/llama3_aloe_8b_alpha.yaml
+  - models/llama3_aloe_8b_alpha.yaml
+  - models/llama3_aloe_8b_alpha.yaml
+  - models/llama3_aloe_8b_alpha.yaml
+  - models/llama3_aloe_8b_alpha.yaml
+  - models/llama3_aloe_8b_alpha.yaml
+  - models/llama3_aloe_8b_alpha.yaml
+  - models/llama3_aloe_8b_alpha.yaml
+  - models/llama3_aloe_8b_alpha.yaml
+
 # Checkpoint path (for equal_wagers, this can be a dummy path since no training is needed)
 checkpoint_path: /common/users/yl2310/MultiLLMs/checkpoints/dummy_equal_wagers
 
@@ -20,7 +21,8 @@ checkpoint_path: /common/users/yl2310/MultiLLMs/checkpoints/dummy_equal_wagers
 calibrated: true
 _include_calibration: calibration/adaptive_temperature_pubmedqa_1000samples.yaml
 
-
+shuffle_data: true  # Shuffle training data across datasets
+shuffle_seed: 17
 # Wagering method - equal wagers (no trainable parameters)
 wagering_method:
   name: equal_wagers
@@ -72,7 +74,6 @@ _include_test_datasets:
 # Override dataset-specific settings for evaluation
 test_datasets:
   - display_name: pubmedqa_test
-    size: 1000
 
 # Evaluation parameters
 option_tokens: ["YES", "NO"]

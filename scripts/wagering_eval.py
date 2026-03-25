@@ -135,7 +135,8 @@ def main(
         )
     
     # Load test datasets
-    dataset_split_seed = args.get("seed", args.get("shuffle_seed", 42))
+    # Keep eval dataset composition stable across shuffle-seed sweeps.
+    dataset_split_seed = int(args.get("dataset_split_seed", 42))
     test_datasets = []
     if "test_datasets" in args:
         test_ds, test_names = load_datasets_from_config(
@@ -201,6 +202,7 @@ def main(
         num_models=num_models,
         config=wagering_config.get("config", {}),
     )
+    hidden_state_layers = wagering_config.get("config", {}).get("hidden_state_layers")
 
     requires_checkpoint = len(wagering_method.get_trainable_parameters()) > 0
 
@@ -240,6 +242,8 @@ def main(
                 ds,
                 option_tokens,
                 prompt_variant=prompt_variant,
+                model_index=idx,
+                hidden_state_layers=hidden_state_layers,
             )
             if cached_logits is None or (needs_hidden_states and cached_hidden_states is None):
                 model_cached = False
@@ -498,6 +502,7 @@ def main(
         "auc": [],
         "ece": [],
         "d_regret": [],
+        "brier_d_regret": [],
         "meta_acc": [],
         "meta_nll": [],
         "meta_auc": [],
@@ -530,6 +535,7 @@ def main(
         auc_val = get_metric_float(result, "auc")
         ece_val = get_metric_float(result, "ece")
         d_regret_val = get_metric_float(result, "d_regret")
+        brier_d_regret_val = get_metric_float(result, "brier_d_regret")
         meta_acc_val = get_metric_float(result, "meta_acc")
         meta_nll_val = get_metric_float(result, "meta_nll")
         meta_auc_val = get_metric_float(result, "meta_auc")
@@ -546,6 +552,8 @@ def main(
             aggregate_metrics["ece"].append(ece_val)
         if d_regret_val is not None:
             aggregate_metrics["d_regret"].append(d_regret_val)
+        if brier_d_regret_val is not None:
+            aggregate_metrics["brier_d_regret"].append(brier_d_regret_val)
         if meta_acc_val is not None:
             aggregate_metrics["meta_acc"].append(meta_acc_val)
         if meta_nll_val is not None:
@@ -559,6 +567,7 @@ def main(
         auc_str = get_metric_str(result, "auc")
         ece_str = get_metric_str(result, "ece")
         d_regret_str = get_metric_str(result, "d_regret")
+        brier_d_regret_str = get_metric_str(result, "brier_d_regret")
         meta_acc_str = get_metric_str(result, "meta_acc")
         meta_nll_str = get_metric_str(result, "meta_nll")
         meta_auc_str = get_metric_str(result, "meta_auc")
@@ -566,10 +575,10 @@ def main(
         log.info(
             f"{dataset_name}: Accuracy={accuracy_str}, "
             f"NLL={nll_str}, Brier={brier_str}, AUC={auc_str}, ECE={ece_str}, "
-            f"DRegret={d_regret_str}, MetaAcc={meta_acc_str}, MetaNLL={meta_nll_str}, MetaAUC={meta_auc_str}"
+            f"DRegret={d_regret_str}, BrierDRegret={brier_d_regret_str}, MetaAcc={meta_acc_str}, MetaNLL={meta_nll_str}, MetaAUC={meta_auc_str}"
         )
         
-        results_summary[dataset_name] = f"Accuracy={accuracy_str}, AUC={auc_str}, ECE={ece_str}, NLL={nll_str}, Brier={brier_str}, DRegret={d_regret_str}, MetaAcc={meta_acc_str}, MetaAuc={meta_auc_str}, MetaNLL={meta_nll_str}"
+        results_summary[dataset_name] = f"Accuracy={accuracy_str}, AUC={auc_str}, ECE={ece_str}, NLL={nll_str}, Brier={brier_str}, DRegret={d_regret_str}, BrierDRegret={brier_d_regret_str}, MetaAcc={meta_acc_str}, MetaAuc={meta_auc_str}, MetaNLL={meta_nll_str}"
 
     def aggregate_metric_str(values):
         if not values:
@@ -583,13 +592,14 @@ def main(
     overall_auc = aggregate_metric_str(aggregate_metrics["auc"])
     overall_ece = aggregate_metric_str(aggregate_metrics["ece"])
     overall_d_regret = aggregate_metric_str(aggregate_metrics["d_regret"])
+    overall_brier_d_regret = aggregate_metric_str(aggregate_metrics["brier_d_regret"])
     overall_meta_acc = aggregate_metric_str(aggregate_metrics["meta_acc"])
     overall_meta_nll = aggregate_metric_str(aggregate_metrics["meta_nll"])
     overall_meta_auc = aggregate_metric_str(aggregate_metrics["meta_auc"])
 
     results_summary["overall"] = (
         f"Accuracy={overall_accuracy}, AUC={overall_auc}, ECE={overall_ece}, "
-        f"NLL={overall_nll}, Brier={overall_brier}, DRegret={overall_d_regret}, MetaAcc={overall_meta_acc}, "
+        f"NLL={overall_nll}, Brier={overall_brier}, DRegret={overall_d_regret}, BrierDRegret={overall_brier_d_regret}, MetaAcc={overall_meta_acc}, "
         f"MetaAuc={overall_meta_auc}, MetaNLL={overall_meta_nll}"
     )
     

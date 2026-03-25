@@ -28,6 +28,7 @@ from wagering.training.analytics import WageringAnalytics
 from wagering.aggregation.base import AggregationFunction
 from wagering.utils.multi_llm_ensemble import (
     collect_option_logits_and_hidden_states_for_model,
+    extract_hidden_state_features,
     get_model_prompt_variant,
     get_cached_logits_and_hidden_states_for_model,
     set_cached_logits_and_hidden_states_for_model,
@@ -42,6 +43,14 @@ import re
 
 from sklearn.metrics import roc_auc_score
 from wagering.core.metrics import ECE
+
+
+def _compute_model_probs_from_logits(model_logits: np.ndarray) -> np.ndarray:
+    """Convert logits [num_examples, num_models, num_options] to probabilities."""
+    max_logits = np.max(model_logits, axis=2, keepdims=True)
+    stabilized = model_logits - max_logits
+    exp_stabilized = np.exp(stabilized)
+    return exp_stabilized / (np.sum(exp_stabilized, axis=2, keepdims=True) + 1e-20)
 
 
 def compute_dynamic_regret(
@@ -61,31 +70,54 @@ def compute_dynamic_regret(
         (d_regret, best_expert_ids): Average dynamic regret and best expert id per example
     """
     num_examples = model_logits.shape[0]
-    num_models = model_logits.shape[1]
-    
-    # Convert model logits to probabilities
-    max_logits = np.max(model_logits, axis=2, keepdims=True)  # [num_examples, num_models, 1]
-    stabilized = model_logits - max_logits
-    log_z = max_logits + np.log(np.exp(stabilized).sum(axis=2, keepdims=True))
-    model_probs = np.exp(model_logits - log_z)  # [num_examples, num_models, num_options]
-    
-    # Compute NLL for each model on each example
-    model_nlls = np.zeros((num_examples, num_models))
-    for i in range(num_examples):
-        for j in range(num_models):
-            model_nlls[i, j] = -np.log(model_probs[i, j, labels[i]] + 1e-10)
+    labels_arr = np.asarray(labels, dtype=np.int64)
+    model_probs = _compute_model_probs_from_logits(model_logits)
+
+    # Compute NLL for each model on each example [num_examples, num_models].
+    true_label_indices = labels_arr[:, np.newaxis, np.newaxis]
+    model_true_probs = np.take_along_axis(model_probs, true_label_indices, axis=2).squeeze(axis=2)
+    model_nlls = -np.log(model_true_probs + 1e-10)
     
     # Find best expert (lowest NLL) for each example
     best_expert_ids = np.argmin(model_nlls, axis=1)  # [num_examples]
     best_expert_nlls = model_nlls[np.arange(num_examples), best_expert_ids]  # [num_examples]
     
     # Compute aggregated NLL
-    aggregated_nlls = -np.log(aggregated_probs[np.arange(num_examples), labels] + 1e-10)  # [num_examples]
+    aggregated_nlls = -np.log(aggregated_probs[np.arange(num_examples), labels_arr] + 1e-10)  # [num_examples]
     
     # Dynamic regret = aggregated_nll - best_expert_nll
     d_regret = np.mean(aggregated_nlls - best_expert_nlls)
     
     return d_regret, best_expert_ids
+
+
+def compute_brier_dynamic_regret(
+    model_logits: np.ndarray,
+    aggregated_probs: np.ndarray,
+    labels: np.ndarray,
+) -> float:
+    """
+    Compute Brier Dynamic Regret: aggregated_brier - best_expert_brier.
+
+    Args:
+        model_logits: [num_examples, num_models, num_options] - logits from each model
+        aggregated_probs: [num_examples, num_options] - aggregated probability distributions
+        labels: [num_examples] - true labels
+
+    Returns:
+        Average Brier dynamic regret over examples.
+    """
+    labels_arr = np.asarray(labels, dtype=np.int64)
+    num_options = aggregated_probs.shape[1]
+    one_hot_labels = np.eye(num_options, dtype=np.float64)[labels_arr]
+
+    model_probs = _compute_model_probs_from_logits(model_logits)
+    model_brier = np.sum((model_probs - one_hot_labels[:, np.newaxis, :]) ** 2, axis=2)
+    best_expert_brier = np.min(model_brier, axis=1)
+
+    aggregated_brier = np.sum((aggregated_probs - one_hot_labels) ** 2, axis=1)
+    brier_d_regret = np.mean(aggregated_brier - best_expert_brier)
+    return float(brier_d_regret)
 
 
 def compute_meta_metrics(
@@ -211,6 +243,7 @@ class WageringTrainer:
         self.validation_split_ratio = validation_split_ratio
         self.balance_training_datasets = balance_training_datasets
         self.logit_calibrator = logit_calibrator
+        self.hidden_state_layers = getattr(self.wagering_method, "hidden_state_layers", None)
         
         if self.checkpoint_dir:
             self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -664,6 +697,7 @@ class WageringTrainer:
             
             # Compute Dynamic Regret and Meta Metrics if model_logits and wagers provided
             d_regret = None
+            brier_d_regret = None
             meta_acc = None
             meta_nll = None
             meta_auc = None
@@ -672,6 +706,9 @@ class WageringTrainer:
                     dataset_model_logits = model_logits[mask]
                     dataset_wagers = wagers_history[mask]
                     d_regret, best_expert_ids = compute_dynamic_regret(
+                        dataset_model_logits, dataset_probs, dataset_labels
+                    )
+                    brier_d_regret = compute_brier_dynamic_regret(
                         dataset_model_logits, dataset_probs, dataset_labels
                     )
                     meta_metrics = compute_meta_metrics(dataset_wagers, best_expert_ids)
@@ -687,6 +724,7 @@ class WageringTrainer:
                 "ece": float(ece) if not np.isnan(ece) else None,
                 "auc": float(auc) if not np.isnan(auc) else None,
                 "d_regret": float(d_regret) if d_regret is not None and not np.isnan(d_regret) else None,
+                "brier_d_regret": float(brier_d_regret) if brier_d_regret is not None and not np.isnan(brier_d_regret) else None,
                 "meta_acc": float(meta_acc) if meta_acc is not None and not np.isnan(meta_acc) else None,
                 "meta_nll": float(meta_nll) if meta_nll is not None and not np.isnan(meta_nll) else None,
                 "meta_auc": float(meta_auc) if meta_auc is not None and not np.isnan(meta_auc) else None,
@@ -891,6 +929,7 @@ class WageringTrainer:
         num_val_examples = len(self.validation_dataset.x)
         val_nash_gaps = np.zeros((num_val_examples, len(self.models)))  # Track Nash gaps if provided by wagering method
         val_score_diffs = np.zeros((num_val_examples, len(self.models)))  # Track score differences if provided by wagering method
+        val_sigmoid_wagers = np.zeros((num_val_examples, len(self.models)))  # Track sigmoid wagers if provided by wagering method
         eval_batch_size = self.batch_size  # Process validation in batches
         
         for batch_start in range(0, num_val_examples, eval_batch_size):
@@ -927,6 +966,7 @@ class WageringTrainer:
                 questions=batch_questions,
             )  # [batch_size, num_models]
             batch_wagers = res_dict["wagers"]  # [batch_size, num_models]
+            batch_sigmoid_wagers = res_dict.get("sigmoid_wagers", None)  # [batch_size, num_models]
             batch_nash_gap = res_dict.get("nash_gap", None)
             batch_score_diff = res_dict.get("score_diff", None)
             # Aggregate predictions for batch
@@ -943,6 +983,10 @@ class WageringTrainer:
                 val_score_diffs[batch_start:batch_end] = batch_score_diff
             else:
                 val_score_diffs = None
+            if batch_sigmoid_wagers is not None and val_sigmoid_wagers is not None:
+                val_sigmoid_wagers[batch_start:batch_end] = batch_sigmoid_wagers
+            else:
+                val_sigmoid_wagers = None
             val_predictions.extend(batch_predictions.tolist())
             val_probs.extend(batch_aggregated_probs.tolist())
             val_wagers.extend(batch_wagers.tolist())
@@ -951,6 +995,9 @@ class WageringTrainer:
         val_predictions = np.array(val_predictions, dtype=np.int32)
         val_probs = np.stack(val_probs, axis=0)
         val_wagers = np.stack(val_wagers, axis=0)  # [num_val_examples, num_models]
+
+        if val_sigmoid_wagers is not None:
+            val_sigmoid_wagers = np.asarray(val_sigmoid_wagers, dtype=np.float32)
         if val_nash_gaps is not None:
             val_nash_gaps = np.mean(val_nash_gaps, axis=0)  # Average Nash gap per model over validation set
         if val_score_diffs is not None:
@@ -988,6 +1035,7 @@ class WageringTrainer:
         
         # Compute Dynamic Regret and Meta Metrics
         val_d_regret = None
+        val_brier_d_regret = None
         val_meta_acc = None
         val_meta_nll = None
         val_meta_auc = None
@@ -995,6 +1043,9 @@ class WageringTrainer:
             # Get validation model logits in the right format [num_examples, num_models, num_options]
             val_model_logits = np.transpose(self.all_model_val_logits, (1, 0, 2))
             val_d_regret, best_expert_ids = compute_dynamic_regret(
+                val_model_logits, val_probs, self.validation_labels
+            )
+            val_brier_d_regret = compute_brier_dynamic_regret(
                 val_model_logits, val_probs, self.validation_labels
             )
             meta_metrics = compute_meta_metrics(val_wagers, best_expert_ids)
@@ -1013,6 +1064,7 @@ class WageringTrainer:
             "ece": val_ece if val_ece is not None and not np.isnan(val_ece) else None,
             "auc": val_auc if val_auc is not None and not np.isnan(val_auc) else None,
             "d_regret": val_d_regret if val_d_regret is not None and not np.isnan(val_d_regret) else None,
+            "brier_d_regret": val_brier_d_regret if val_brier_d_regret is not None and not np.isnan(val_brier_d_regret) else None,
             "meta_acc": val_meta_acc if val_meta_acc is not None and not np.isnan(val_meta_acc) else None,
             "meta_nll": val_meta_nll if val_meta_nll is not None and not np.isnan(val_meta_nll) else None,
             "meta_auc": val_meta_auc if val_meta_auc is not None and not np.isnan(val_meta_auc) else None,
@@ -1021,9 +1073,10 @@ class WageringTrainer:
         ece_str = f"{val_ece:.4f}" if val_ece is not None and not np.isnan(val_ece) else 'N/A'
         auc_str = f"{val_auc:.4f}" if val_auc is not None and not np.isnan(val_auc) else 'N/A'
         d_regret_str = f"{val_d_regret:.4f}" if val_d_regret is not None and not np.isnan(val_d_regret) else 'N/A'
+        brier_d_regret_str = f"{val_brier_d_regret:.4f}" if val_brier_d_regret is not None and not np.isnan(val_brier_d_regret) else 'N/A'
         meta_acc_str = f"{val_meta_acc:.4f}" if val_meta_acc is not None and not np.isnan(val_meta_acc) else 'N/A'
         log.info(f"Validation metrics: accuracy={val_accuracy:.4f}, nll={val_nll:.4f}, ece={ece_str}, auc={auc_str}, "
-                 f"d_regret={d_regret_str}, meta_acc={meta_acc_str}")
+             f"d_regret={d_regret_str}, brier_d_regret={brier_d_regret_str}, meta_acc={meta_acc_str}")
         
         # Compute grouped metrics by dataset
         if hasattr(self, 'validation_dataset_indices') and self.validation_dataset_indices is not None:
@@ -1046,7 +1099,7 @@ class WageringTrainer:
             }
             self._plot_validation_wagers_by_dataset(val_wagers, val_results)
         
-        return metrics, val_nash_gaps, val_score_diffs, val_wagers
+        return metrics, val_nash_gaps, val_score_diffs, val_wagers, val_sigmoid_wagers
     
     def _collect_logits(self):
         """
@@ -1072,11 +1125,13 @@ class WageringTrainer:
         
         per_dataset_logits = []  # List of [num_models, num_examples_ds, num_options]
         per_dataset_hidden_states = []  # List of List[num_models] each [num_examples_ds, hidden_dim_i]
+        per_dataset_calibration_hidden_states = [] if self.logit_calibrator is not None else None
         
         for dataset_idx, dataset in enumerate(self.datasets):
             log.debug(f"Processing dataset {dataset_idx + 1}/{num_datasets} for cache collection")
             dataset_logits_list = []
             dataset_hidden_states_list = []
+            dataset_calibration_hidden_states_list = [] if self.logit_calibrator is not None else None
             
             for model_idx, model in enumerate(self.models):
                 model_path = model if isinstance(model, str) else model.model_path
@@ -1086,6 +1141,8 @@ class WageringTrainer:
                     dataset,
                     self.option_tokens,
                     prompt_variant=prompt_variant,
+                    model_index=model_idx,
+                    hidden_state_layers=self.hidden_state_layers,
                 )
                 
                 if cached_logits is not None and cached_hidden_states is not None:
@@ -1104,22 +1161,33 @@ class WageringTrainer:
                         raise RuntimeError(
                             f"Cache miss for model path {model}. Model must be loaded to collect logits."
                         )
-                    model_logits, model_hidden_states, model_labels = collect_option_logits_and_hidden_states_for_model(
+                    model_logits, model_hidden_states_all_layers, model_labels = collect_option_logits_and_hidden_states_for_model(
                         model,
                         dataset,
                         self.option_tokens,
                         model_identifier=str(model_path),
                         model_index=model_idx,
+                        hidden_state_layers=self.hidden_state_layers,
                     )
                     set_cached_logits_and_hidden_states_for_model(
                         model,
                         dataset,
                         self.option_tokens,
                         model_logits,
-                        model_hidden_states,
+                        model_hidden_states_all_layers,
                         model_labels,
                         prompt_variant=prompt_variant,
+                        model_index=model_idx,
+                        hidden_state_layers=self.hidden_state_layers,
                     )
+                    model_hidden_states = extract_hidden_state_features(
+                        model_hidden_states_all_layers,
+                        self.hidden_state_layers,
+                    )
+                    if model_hidden_states is None:
+                        raise RuntimeError(
+                            "Hidden-state cache is in legacy format and cannot satisfy hidden_state_layers; recache is required"
+                        )
                 else:
                     if isinstance(model, str):
                         raise RuntimeError(
@@ -1130,22 +1198,33 @@ class WageringTrainer:
                         f"Cache miss - collecting logits and hidden states (device: {model.device()})"
                     )
                     try:
-                        model_logits, model_hidden_states, model_labels = collect_option_logits_and_hidden_states_for_model(
+                        model_logits, model_hidden_states_all_layers, model_labels = collect_option_logits_and_hidden_states_for_model(
                             model,
                             dataset,
                             self.option_tokens,
                             model_identifier=str(model_path),
                             model_index=model_idx,
+                            hidden_state_layers=self.hidden_state_layers,
                         )
                         set_cached_logits_and_hidden_states_for_model(
                             model,
                             dataset,
                             self.option_tokens,
                             model_logits,
-                            model_hidden_states,
+                            model_hidden_states_all_layers,
                             model_labels,
                             prompt_variant=prompt_variant,
+                            model_index=model_idx,
+                            hidden_state_layers=self.hidden_state_layers,
                         )
+                        model_hidden_states = extract_hidden_state_features(
+                            model_hidden_states_all_layers,
+                            self.hidden_state_layers,
+                        )
+                        if model_hidden_states is None:
+                            raise RuntimeError(
+                                "Hidden-state cache is in legacy format and cannot satisfy hidden_state_layers; recache is required"
+                            )
                     except Exception as e:
                         raise RuntimeError(
                             f"Error collecting logits and hidden states for model {model_idx + 1} on dataset {dataset_idx + 1}: {e}"
@@ -1153,10 +1232,27 @@ class WageringTrainer:
                 
                 dataset_logits_list.append(model_logits)
                 dataset_hidden_states_list.append(model_hidden_states)
+
+                if dataset_calibration_hidden_states_list is not None:
+                    calibration_hidden_states = get_cached_logits_and_hidden_states_for_model(
+                        model_path,
+                        dataset,
+                        self.option_tokens,
+                        prompt_variant=prompt_variant,
+                        model_index=model_idx,
+                        hidden_state_layers=[-1],
+                    )[1]
+                    if calibration_hidden_states is None:
+                        raise RuntimeError(
+                            "Temperature calibration requires last-layer hidden states in cache"
+                        )
+                    dataset_calibration_hidden_states_list.append(calibration_hidden_states)
             
             # Stack logits for this dataset: [num_models, num_examples_ds, num_options]
             per_dataset_logits.append(np.stack(dataset_logits_list, axis=0))
             per_dataset_hidden_states.append(dataset_hidden_states_list)
+            if per_dataset_calibration_hidden_states is not None and dataset_calibration_hidden_states_list is not None:
+                per_dataset_calibration_hidden_states.append(dataset_calibration_hidden_states_list)
         
         # Combine per-dataset logits along the example dimension
         self.all_model_logits = np.concatenate(per_dataset_logits, axis=1)  # [num_models, num_examples, num_options]
@@ -1192,6 +1288,16 @@ class WageringTrainer:
             log.debug(f"Models have different hidden dimensions: {dict(enumerate(hidden_dims_per_model))}")
             log.debug("Storing hidden states as list (will be handled by wagering method)")
             self.all_hidden_states = combined_hidden_states_by_model
+
+        if per_dataset_calibration_hidden_states is not None:
+            calibration_hidden_by_model = []
+            for m in range(num_models):
+                model_hs = [per_dataset_calibration_hidden_states[d][m] for d in range(num_datasets)]
+                calibration_hidden_by_model.append(np.concatenate(model_hs, axis=0))
+            if len(set(hs.shape[-1] for hs in calibration_hidden_by_model)) == 1:
+                self.all_calibration_hidden_states = np.stack(calibration_hidden_by_model, axis=0)
+            else:
+                self.all_calibration_hidden_states = calibration_hidden_by_model
         
         # Note: Validation split happens in _apply_shuffling() after cache loading
 
@@ -1230,9 +1336,13 @@ class WageringTrainer:
         if not hasattr(self, "all_hidden_states") or self.all_hidden_states is None:
             raise RuntimeError("Logit calibration requested but cached hidden states are unavailable")
 
+        calibration_hidden_states = getattr(self, "all_calibration_hidden_states", None)
+        if calibration_hidden_states is None:
+            raise RuntimeError("Logit calibration requested but last-layer hidden states are unavailable")
+
         self.all_model_logits = self.logit_calibrator.apply_to_stacked_logits(
             self.all_model_logits,
-            self.all_hidden_states,
+            calibration_hidden_states,
         )
         log.info("Applied frozen temperature scaling to cached training logits")
     
@@ -1514,14 +1624,15 @@ class WageringTrainer:
             val_nash_gap_max = None
             val_score_diff = None
             val_wagers = None
+            val_sigmoid_wagers = None
             if self.validation_dataset is not None:
-                val_metrics, val_nash_gap, val_score_diff, val_wagers = self._evaluate_validation()
+                val_metrics, val_nash_gap, val_score_diff, val_wagers, val_sigmoid_wagers = self._evaluate_validation()
                 val_d_regret = val_metrics.get("d_regret", None)
                 if val_metrics:
                     self.last_val_metrics = val_metrics
 
-                if val_wagers is not None and val_score_diff is not None:
-                    latest_val_wagers_for_plot = np.asarray(val_wagers, dtype=np.float32).copy()
+                if val_sigmoid_wagers is not None and val_score_diff is not None:
+                    latest_val_wagers_for_plot = np.asarray(val_sigmoid_wagers, dtype=np.float32).copy()
                     latest_val_score_diff_for_plot = np.asarray(val_score_diff, dtype=np.float32).copy()
                     latest_val_epoch = epoch
             else:
@@ -1557,8 +1668,8 @@ class WageringTrainer:
                     # training updates would modify the stored checkpoint state
                     self.best_wagering_method_state = copy.deepcopy(self.wagering_method.state_dict())
                     self.best_epoch = epoch
-                    if val_wagers is not None and val_score_diff is not None:
-                        best_val_wagers_for_plot = np.asarray(val_wagers, dtype=np.float32).copy()
+                    if val_sigmoid_wagers is not None and val_score_diff is not None:
+                        best_val_wagers_for_plot = np.asarray(val_sigmoid_wagers, dtype=np.float32).copy()
                         best_val_score_diff_for_plot = np.asarray(val_score_diff, dtype=np.float32).copy()
         
                     log.debug(f"Saving best checkpoint state dict keys: {list(self.best_wagering_method_state.keys())}")
@@ -1802,6 +1913,8 @@ class WageringTrainer:
                     hyperparams["wagering/hidden_dim"] = self.wagering_method.hidden_dim
                 if hasattr(self.wagering_method, 'hidden_layers'):
                     hyperparams["wagering/hidden_layers"] = str(self.wagering_method.hidden_layers)
+                if hasattr(self.wagering_method, 'hidden_state_layers'):
+                    hyperparams["wagering/hidden_state_layers"] = str(self.wagering_method.hidden_state_layers)
                 if hasattr(self.wagering_method, 'learning_rate'):
                     hyperparams["wagering/learning_rate"] = self.wagering_method.learning_rate
                 if hasattr(self.wagering_method, 'device_str'):
@@ -1930,6 +2043,7 @@ class WageringTrainer:
         
         # Compute Dynamic Regret and Meta Metrics
         d_regret = None
+        brier_d_regret = None
         meta_acc = None
         meta_nll = None
         meta_auc = None
@@ -1944,6 +2058,9 @@ class WageringTrainer:
             final_model_logits = np.transpose(final_model_logits_transposed, (1, 0, 2))  # [num_examples, num_models, num_options]
             
             d_regret, best_expert_ids = compute_dynamic_regret(
+                final_model_logits, all_aggregated_probs, processed_labels
+            )
+            brier_d_regret = compute_brier_dynamic_regret(
                 final_model_logits, all_aggregated_probs, processed_labels
             )
             meta_metrics = compute_meta_metrics(wagers_history, best_expert_ids)
@@ -1982,6 +2099,7 @@ class WageringTrainer:
             "final_ece": ece,
             "final_auc": auc,
             "final_d_regret": d_regret,
+            "final_brier_d_regret": brier_d_regret,
             "final_meta_acc": meta_acc,
             "final_meta_nll": meta_nll,
             "final_meta_auc": meta_auc,
@@ -2048,6 +2166,7 @@ class WageringTrainer:
                 "train/final/ece": ece if ece is not None and not np.isnan(ece) else None,
                 "train/final/auc": auc if auc is not None and not np.isnan(auc) else None,
                 "train/final/d_regret": d_regret if d_regret is not None and not np.isnan(d_regret) else None,
+                "train/final/brier_d_regret": brier_d_regret if brier_d_regret is not None and not np.isnan(brier_d_regret) else None,
                 "train/final/meta_acc": meta_acc if meta_acc is not None and not np.isnan(meta_acc) else None,
                 "train/final/meta_nll": meta_nll if meta_nll is not None and not np.isnan(meta_nll) else None,
                 "train/final/meta_auc": meta_auc if meta_auc is not None and not np.isnan(meta_auc) else None,
@@ -2062,6 +2181,8 @@ class WageringTrainer:
                     f"train/final/{dataset_key}/nll": dataset_metrics["nll"],
                     f"train/final/{dataset_key}/ece": dataset_metrics.get("ece"),
                     f"train/final/{dataset_key}/auc": dataset_metrics.get("auc"),
+                    f"train/final/{dataset_key}/d_regret": dataset_metrics.get("d_regret"),
+                    f"train/final/{dataset_key}/brier_d_regret": dataset_metrics.get("brier_d_regret"),
                     f"train/final/{dataset_key}/num_examples": dataset_metrics["num_examples"],
                 })
                 
@@ -2087,7 +2208,7 @@ class WageringTrainer:
             final_val_metrics = {}
             final_val_nash_gap = None
             if self.validation_dataset is not None:
-                final_val_metrics, final_val_nash_gap, _, _ = self._evaluate_validation()
+                final_val_metrics, final_val_nash_gap, _, _, _  = self._evaluate_validation()
 
             # Fallback to last available validation metrics if current evaluation is unavailable
             if not final_val_metrics and self.last_val_metrics:
@@ -2126,6 +2247,8 @@ class WageringTrainer:
                     wandb_val_final_dict["val/final/auc"] = final_val_metrics.get("auc")
                 if final_val_metrics.get("d_regret") is not None and not np.isnan(final_val_metrics.get("d_regret", np.nan)):
                     wandb_val_final_dict["val/final/d_regret"] = final_val_metrics.get("d_regret")
+                if final_val_metrics.get("brier_d_regret") is not None and not np.isnan(final_val_metrics.get("brier_d_regret", np.nan)):
+                    wandb_val_final_dict["val/final/brier_d_regret"] = final_val_metrics.get("brier_d_regret")
                 if final_val_metrics.get("meta_acc") is not None and not np.isnan(final_val_metrics.get("meta_acc", np.nan)):
                     wandb_val_final_dict["val/final/meta_acc"] = final_val_metrics.get("meta_acc")
                 if final_val_metrics.get("meta_nll") is not None and not np.isnan(final_val_metrics.get("meta_nll", np.nan)):
@@ -2152,6 +2275,8 @@ class WageringTrainer:
                             wandb_val_final_dict[f"val/final/{dataset_key}/auc"] = dataset_metrics.get("auc")
                         if dataset_metrics.get("d_regret") is not None and not np.isnan(dataset_metrics.get("d_regret", np.nan)):
                             wandb_val_final_dict[f"val/final/{dataset_key}/d_regret"] = dataset_metrics.get("d_regret")
+                        if dataset_metrics.get("brier_d_regret") is not None and not np.isnan(dataset_metrics.get("brier_d_regret", np.nan)):
+                            wandb_val_final_dict[f"val/final/{dataset_key}/brier_d_regret"] = dataset_metrics.get("brier_d_regret")
                         if dataset_metrics.get("meta_acc") is not None and not np.isnan(dataset_metrics.get("meta_acc", np.nan)):
                             wandb_val_final_dict[f"val/final/{dataset_key}/meta_acc"] = dataset_metrics.get("meta_acc")
                         if dataset_metrics.get("meta_nll") is not None and not np.isnan(dataset_metrics.get("meta_nll", np.nan)):

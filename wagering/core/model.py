@@ -53,6 +53,10 @@ class WhiteboxModel:
         for key in ["presence_penalty", "allow_newlines"]:
             args_copy.pop(key, None)
 
+        # Remove max_length if max_new_tokens is set to avoid transformers warning
+        if args_copy.get("max_new_tokens") is not None and "max_length" in args_copy:
+            args_copy.pop("max_length", None)
+
         return args_copy
 
     class _ScoresProcessor:
@@ -64,6 +68,19 @@ class WhiteboxModel:
         def __call__(self, input_ids=None, scores=None):
             self.scores.append(scores.log_softmax(-1))
             return scores
+
+    @staticmethod
+    def _generation_arg_names() -> set:
+        names = set(GenerationParameters.__dataclass_fields__.keys())
+        names.update(
+            {
+                "max_length",
+                "min_length",
+                "output_hidden_states",
+                "return_dict_in_generate",
+            }
+        )
+        return names
 
     def generate(self, **args):
         """Generate with stored per-step log-probabilities."""
@@ -79,18 +96,25 @@ class WhiteboxModel:
         default_params.update(args)
         merged_args = self._validate_args(default_params)
 
-        # Avoid the transformers warning when model configs define max_length
-        # and callers provide max_new_tokens. max_new_tokens remains authoritative.
-        if (
-            merged_args.get("max_new_tokens") is not None
-            and "max_length" not in merged_args
-            and hasattr(self.model, "generation_config")
-            and self.model.generation_config is not None
-            and "generation_config" not in merged_args
-        ):
-            generation_config = deepcopy(self.model.generation_config)
-            generation_config.max_length = None
+        generation_config = merged_args.get("generation_config")
+        if generation_config is not None:
+            # Transformers deprecates mixing generation_config with explicit generation
+            # kwargs. Consolidate all generation controls into generation_config.
+            generation_config = deepcopy(generation_config)
+            for key in self._generation_arg_names():
+                if key == "generation_config" or key not in merged_args:
+                    continue
+                value = merged_args.pop(key)
+                if value is not None and hasattr(generation_config, key):
+                    setattr(generation_config, key, value)
+
+            if getattr(generation_config, "max_new_tokens", None) is not None:
+                generation_config.max_length = None
+
             merged_args["generation_config"] = generation_config
+        elif merged_args.get("max_new_tokens") is not None:
+            # Keep explicit-kwargs mode consistent and warning-free.
+            merged_args["max_length"] = None
 
         if "stop_strings" in merged_args:
             merged_args["tokenizer"] = self.tokenizer

@@ -17,6 +17,8 @@ _include_models:
   - models/gemma_2_9b_it.yaml
   - models/gemma_2_9b_it.yaml
   - models/gemma_2_9b_it.yaml
+  - models/gemma_2_9b_it.yaml
+  - models/gemma_2_9b_it.yaml
 
 
 # Apply adaptive temperature scaling to cached option logits before wagering.
@@ -56,8 +58,6 @@ _include_datasets:
   - datasets/pubmedqa.yaml
 
 # Override dataset-specific settings for training
-datasets:
-  - size: 20000
 #   - train_split: auxiliary_train
 #   - train_split: train
 

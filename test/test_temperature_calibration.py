@@ -137,7 +137,11 @@ def test_equal_wagers_evaluator_uses_calibrator_hidden_states(monkeypatch):
 
     monkeypatch.setattr(
         "wagering.inference.evaluator.get_cached_logits_and_hidden_states_for_model",
-        lambda model_path, ds, option_tokens: (cached_logits, cached_hidden_states, cached_labels),
+        lambda model_path, ds, option_tokens, prompt_variant=None, model_index=None: (
+            cached_logits,
+            cached_hidden_states,
+            cached_labels,
+        ),
     )
 
     evaluator = WageringEvaluator(

@@ -157,7 +157,9 @@ def main(config_path: Optional[str] = None, calibration_path: Optional[str] = No
     
     # Load training datasets
     log.info("Loading training datasets...")
-    dataset_split_seed = args.get("seed", args.get("shuffle_seed", 42))
+    # Keep dataset membership/splits stable across shuffle-seed sweeps.
+    # `shuffle_seed` is only for in-training shuffling after cache collection.
+    dataset_split_seed = int(args.get("dataset_split_seed", 42))
     train_datasets, dataset_names = load_datasets_from_config(
         args["datasets"],
         split="train",
@@ -222,6 +224,7 @@ def main(config_path: Optional[str] = None, calibration_path: Optional[str] = No
         num_models=num_models,
         config=wagering_config.get("config", {}),
     )
+    hidden_state_layers = wagering_config.get("config", {}).get("hidden_state_layers")
     log.info(f"Loaded wagering method: {wagering_config['name']}")
 
     wagering_method_name = type(wagering_method).__name__
@@ -248,6 +251,8 @@ def main(config_path: Optional[str] = None, calibration_path: Optional[str] = No
                 dataset,
                 option_tokens,
                 prompt_variant=prompt_variant,
+                model_index=idx,
+                hidden_state_layers=hidden_state_layers,
             )
             if cached_logits is None or (needs_hidden_states and cached_hidden_states is None):
                 model_cache_ok = False

@@ -43,6 +43,7 @@ def load_wagering_method(
     from .mse_br_wagers import MSEBrWagers
     from .mse_br_wagers_v2 import MSEBrWagersV2
     from .mse_br_wagers_v3 import MSEBrWagersV3
+    from .pre_inference_mse_br_wagers_v2 import PreInferenceMSEBrWagersV2
 
     
     # Built-in methods mapping
@@ -60,6 +61,7 @@ def load_wagering_method(
         "mse_br_wagers": MSEBrWagers,
         "mse_br_wagers_v2": MSEBrWagersV2,
         "mse_br_wagers_v3": MSEBrWagersV3,
+        "pre_inference_mse_br_wagers_v2": PreInferenceMSEBrWagersV2,
     }
     
     if method_name in methods:

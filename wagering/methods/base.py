@@ -156,10 +156,67 @@ class WageringMethod(ABC):
             save_directory: Directory to save to
         """
         import os
+        import tempfile
+        import logging
         os.makedirs(save_directory, exist_ok=True)
         # Default implementation: save state dict
         import torch
-        torch.save(self.state_dict(), os.path.join(save_directory, "wagering_state.pt"))
+        log = logging.getLogger("wagering")
+
+        state = self.state_dict()
+        target_path = os.path.join(save_directory, "wagering_state.pt")
+
+        # Write to a temporary file in the same directory and atomically replace target.
+        # This avoids partial/corrupted checkpoints on flaky network filesystems.
+        attempts = [
+            {},
+            {"_use_new_zipfile_serialization": False},
+        ]
+        last_error = None
+
+        for attempt_idx, attempt_kwargs in enumerate(attempts, start=1):
+            tmp_path = None
+            try:
+                with tempfile.NamedTemporaryFile(
+                    mode="wb",
+                    suffix=".pt.tmp",
+                    prefix="wagering_state_",
+                    dir=save_directory,
+                    delete=False,
+                ) as tmp_file:
+                    tmp_path = tmp_file.name
+                    try:
+                        torch.save(state, tmp_file, **attempt_kwargs)
+                    except TypeError:
+                        # Some wrapped/older torch.save variants reject extra kwargs.
+                        # Retry without kwargs for compatibility.
+                        if attempt_kwargs:
+                            torch.save(state, tmp_file)
+                        else:
+                            raise
+                    tmp_file.flush()
+                    os.fsync(tmp_file.fileno())
+
+                os.replace(tmp_path, target_path)
+                return
+            except Exception as exc:
+                last_error = exc
+                if tmp_path is not None:
+                    try:
+                        os.remove(tmp_path)
+                    except OSError:
+                        pass
+                log.warning(
+                    "Checkpoint save attempt %d failed at %s (kwargs=%s): %s",
+                    attempt_idx,
+                    target_path,
+                    attempt_kwargs,
+                    exc,
+                )
+
+        raise RuntimeError(
+            f"Failed to save wagering checkpoint to {target_path} after {len(attempts)} attempts"
+        ) from last_error
     
     def load_pretrained(self, save_directory: str):
         """

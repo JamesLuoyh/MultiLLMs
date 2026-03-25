@@ -28,7 +28,7 @@ max_prompt_tokens: 1400
 load_from_disk: false
 trust_remote_code: false
 instruct: false
-prompt: "Question:\n{question}\nContext:\n{context}\nLong Answer:\n{long_answer}\nIs the long answer provided correct or incorrect? Answer with YES or NO. Answer:"
+prompt: "Question:\n{question}\nContext: You are an expert in medical science and you have classified access to the following context: \n{context}\nLong Answer:\n{long_answer}\nIs the long answer provided correct or incorrect? Answer with YES or NO. Answer:"
 prompt_without_context: "Question:\n{question}\nLong Answer:\n{long_answer}\nIs the long answer provided correct or incorrect? Answer with YES or NO. Answer:"
 description: ""
 # Set option_tokens to [\"YES\", \"NO\"] in your top-level training/eval config when using this dataset.

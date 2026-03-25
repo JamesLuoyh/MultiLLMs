@@ -49,6 +49,8 @@ class MSEBrWagersV2(WageringMethod):
                 - learning_rate: Learning rate for optimizer (default: 1e-5)
                 - device: Device to run on (default: 'cuda' if available, else 'cpu')
                 -score_function: Scoring function name ('linear', 'log', 'brier', 'normalized_linear') (default: 'linear')
+                                - hidden_state_layers: Optional list of transformer layer indices to concatenate
+                                    for hidden-state features (0-based, supports negative indices like -1 for last)
         """
         super().__init__(num_models, config)
         
@@ -64,6 +66,16 @@ class MSEBrWagersV2(WageringMethod):
         self.device = torch.device(self.device_str)
         self.lr_decay_factor = float(config.get("lr_decay_factor", 1.0))  # Factor to multiply LR by (1.0 = no decay)
         self.lr_decay_steps = int(config.get("lr_decay_steps", 1))  # Decay every N optimizer steps
+        hidden_state_layers_cfg = config.get("hidden_state_layers")
+        if hidden_state_layers_cfg is None:
+            self.hidden_state_layers = None
+        else:
+            if not isinstance(hidden_state_layers_cfg, (list, tuple)):
+                raise ValueError(
+                    "hidden_state_layers must be a list/tuple of ints, "
+                    f"got {type(hidden_state_layers_cfg).__name__}"
+                )
+            self.hidden_state_layers = [int(x) for x in hidden_state_layers_cfg]
         
         # Initialize scoring function
         
@@ -225,7 +237,7 @@ class MSEBrWagersV2(WageringMethod):
             # Fallback to uniform wagers
             raise ValueError("Invalid wagers detected (NaN or inf).")
         
-        return {"wagers": wagers_np, "nash_gap": nash_gap, "score_diff": score_diff}
+        return {"wagers": wagers_np, "sigmoid_wagers": sigmoid_wagers.detach().cpu().numpy(), "nash_gap": nash_gap, "score_diff": score_diff}
     
     def extract_wagers_brs_and_nash_gap(self, sigmoid_wagers, model_logits_tensor, gold_label_tensor):
         
@@ -498,6 +510,7 @@ class MSEBrWagersV2(WageringMethod):
                 "temperature": self.temperature,
                 "grad_clip_norm": self.grad_clip_norm,
                 "normalize_hidden_states": self.normalize_hidden_states,
+                "hidden_state_layers": self.hidden_state_layers,
                 "score_function": self.score_function_name,
                 "device": self.device_str,
             },

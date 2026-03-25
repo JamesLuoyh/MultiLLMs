@@ -1,0 +1,32 @@
+# RACE dataset configuration
+# Mixed-context prompting behavior:
+# - Article context is assigned per example using balanced randomized routing across model indices.
+# - Each model receives roughly equal numbers of context-bearing prompts.
+# - Non-selected models for each example receive question + choices only.
+# - Assignment is seeded by top-level `seed` (fallback: `shuffle_seed`) so sweeps vary routing.
+name: EleutherAI/race
+# This EleutherAI grouped-by-article variant exposes only HF `test` split.
+# We intentionally load that source split and apply deterministic internal split
+# in wagering/utils/dataset_utils.py.
+race_source_split: test
+race_train_target_split: train
+race_eval_target_split: test
+race_split_ratios: [0.8, 0.1, 0.1]
+# Keep train/eval split names pinned to source split for non-RACE fallback code paths.
+train_split: test
+eval_split: test
+display_name: race
+text_column: article
+label_column: answer
+batch_size: 5
+load_from_disk: false
+trust_remote_code: false
+instruct: false
+
+# Prompt with article context (used for the randomly assigned model per example)
+prompt: "Return the label of the correct answer for the question below.\n\nArticle:\n{article}\n\nQuestion: {question}\nChoices:\n{choices}\nAnswer:"
+
+# Prompt without article context (default prompt for non-assigned models)
+prompt_without_context: "Return the label of the correct answer for the question below.\n\nQuestion: {question}\nChoices:\n{choices}\nAnswer:"
+
+description: ""

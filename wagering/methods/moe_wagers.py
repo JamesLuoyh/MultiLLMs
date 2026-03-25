@@ -17,6 +17,7 @@ if str(SRC_PATH) not in sys.path:
     sys.path.insert(0, str(SRC_PATH))
 
 from .base import WageringMethod
+from .utils import preprocess_pubmedqa_prompts_for_embedding
 from wagering.core.model import WhiteboxModel
 from wagering.aggregation.linear_pooling import LinearPooling
 
@@ -62,6 +63,7 @@ class MoEWagers(WageringMethod):
         self.temperature = float(config.get("temperature", 2.0))
         self.grad_clip_norm = float(config.get("grad_clip_norm", 1.0))
         self.freeze_bert = config.get("freeze_bert", True)
+        self.pubmedqa_strip_context = bool(config.get("pubmedqa_strip_context", True))
         self.device_str = str(config.get("device", "cuda" if torch.cuda.is_available() else "cpu"))
         self.device = torch.device(self.device_str)
         
@@ -117,9 +119,14 @@ class MoEWagers(WageringMethod):
         Returns:
             embedding: torch.Tensor of shape [embedding_dim] (CLS token embedding)
         """
+        processed_question = preprocess_pubmedqa_prompts_for_embedding(
+            [question],
+            strip_context=self.pubmedqa_strip_context,
+        )[0]
+
         # Tokenize the question
         inputs = self.tokenizer(
-            question,
+            processed_question,
             return_tensors="pt",
             truncation=True,
             max_length=512,
@@ -145,9 +152,14 @@ class MoEWagers(WageringMethod):
         Returns:
             embeddings: torch.Tensor of shape [batch_size, embedding_dim]
         """
+        processed_questions = preprocess_pubmedqa_prompts_for_embedding(
+            questions,
+            strip_context=self.pubmedqa_strip_context,
+        )
+
         # Tokenize the batch
         inputs = self.tokenizer(
-            questions,
+            processed_questions,
             return_tensors="pt",
             truncation=True,
             max_length=512,
@@ -312,6 +324,7 @@ class MoEWagers(WageringMethod):
                 "temperature": self.temperature,
                 "grad_clip_norm": self.grad_clip_norm,
                 "freeze_bert": self.freeze_bert,
+                "pubmedqa_strip_context": self.pubmedqa_strip_context,
                 "device": self.device_str,
             },
         }

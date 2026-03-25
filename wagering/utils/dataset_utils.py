@@ -6,6 +6,8 @@ Simplified version with strict error handling.
 
 import logging
 import sys
+import hashlib
+import json
 from pathlib import Path
 from typing import List, Dict, Any, Tuple, Optional, Sequence
 
@@ -22,6 +24,53 @@ from wagering.core.dataset import Dataset
 log = logging.getLogger(__name__)
 
 
+def _stable_cache_value(value: Any) -> Any:
+    """Normalize nested values to JSON-stable structures for cache signatures."""
+    if isinstance(value, dict):
+        return {str(k): _stable_cache_value(v) for k, v in sorted(value.items(), key=lambda item: str(item[0]))}
+    if isinstance(value, (list, tuple)):
+        return [_stable_cache_value(v) for v in value]
+    return value
+
+
+def _build_dataset_cache_config_signature(
+    dataset_cfg: Dict[str, Any],
+    *,
+    dataset_name: str,
+    load_split: str,
+    resolved_path: Any,
+    resolved_split: str,
+    resolved_config_name: Optional[str],
+    dataset_target_split: Optional[str],
+    random_seed: Optional[int],
+) -> Dict[str, Any]:
+    """Build a deterministic dataset configuration signature for cache keys."""
+    signature_payload: Dict[str, Any] = {
+        "dataset_name": dataset_name,
+        "load_split": load_split,
+        "resolved_path": resolved_path,
+        "resolved_split": resolved_split,
+        "resolved_config_name": resolved_config_name,
+        "dataset_target_split": dataset_target_split,
+        # Keep random seed in signature only if explicitly pinned in dataset config.
+        "split_seed": dataset_cfg.get("split_seed") if "split_seed" in dataset_cfg else None,
+        "dataset_config": dict(dataset_cfg),
+    }
+    if "split_seed" not in dataset_cfg:
+        # Ignore global run-time seed to maximize cache reuse across shuffle sweeps.
+        signature_payload["runtime_random_seed"] = None
+    else:
+        signature_payload["runtime_random_seed"] = random_seed
+
+    normalized_payload = _stable_cache_value(signature_payload)
+    serialized = json.dumps(normalized_payload, sort_keys=True, separators=(",", ":"), default=str)
+    return {
+        "schema_version": 2,
+        "payload": normalized_payload,
+        "signature": hashlib.md5(serialized.encode("utf-8")).hexdigest(),
+    }
+
+
 def _is_pubmedqa_dataset_config(dataset_cfg: Dict[str, Any]) -> bool:
     """Return True when a dataset config targets PubMedQA."""
     fields = [
@@ -35,6 +84,31 @@ def _is_pubmedqa_dataset_config(dataset_cfg: Dict[str, Any]) -> bool:
     ]
     normalized = " ".join(str(field).lower() for field in fields if field is not None)
     return "pubmedqa" in normalized or "pubmed_qa" in normalized
+
+
+def _is_race_dataset_config(dataset_cfg: Dict[str, Any]) -> bool:
+    """Return True when a dataset config targets RACE."""
+    fields = [
+        dataset_cfg.get("name", ""),
+        dataset_cfg.get("display_name", ""),
+        dataset_cfg.get("config_name", ""),
+        dataset_cfg.get("train_config_name", ""),
+        dataset_cfg.get("eval_config_name", ""),
+        dataset_cfg.get("test_config_name", ""),
+    ]
+    normalized = " ".join(str(field).lower() for field in fields if field is not None)
+    if "eleutherai/race" in normalized:
+        return True
+    padded = f" {normalized} "
+    return " race " in padded
+
+
+def calibration_dataset_configs_include_pubmedqa(dataset_configs: Sequence[Dict[str, Any]]) -> bool:
+    """True if any calibration dataset uses mixed-context routing (PubMedQA or RACE)."""
+    return any(
+        _is_pubmedqa_dataset_config(cfg) or _is_race_dataset_config(cfg)
+        for cfg in dataset_configs
+    )
 
 
 def _normalize_pubmedqa_split_ratios(raw_ratios: Any) -> Tuple[float, float, float]:
@@ -73,6 +147,42 @@ def _normalize_pubmedqa_split_ratios(raw_ratios: Any) -> Tuple[float, float, flo
     return tuple(float(v) for v in ratio_array.tolist())
 
 
+def _normalize_race_split_ratios(raw_ratios: Any) -> Tuple[float, float, float]:
+    """Normalize RACE split ratios to a valid (train, val, test) tuple."""
+    default_ratios = (0.6, 0.2, 0.2)
+    if raw_ratios is None:
+        return default_ratios
+
+    if not isinstance(raw_ratios, Sequence) or len(raw_ratios) != 3:
+        log.warning(
+            "Invalid race_split_ratios=%s. Falling back to default ratios %s.",
+            raw_ratios,
+            default_ratios,
+        )
+        return default_ratios
+
+    try:
+        ratio_array = np.array([float(v) for v in raw_ratios], dtype=np.float64)
+    except (TypeError, ValueError):
+        log.warning(
+            "Could not parse race_split_ratios=%s. Falling back to default ratios %s.",
+            raw_ratios,
+            default_ratios,
+        )
+        return default_ratios
+
+    if np.any(ratio_array < 0) or not np.any(ratio_array > 0):
+        log.warning(
+            "Non-positive race_split_ratios=%s. Falling back to default ratios %s.",
+            raw_ratios,
+            default_ratios,
+        )
+        return default_ratios
+
+    ratio_array = ratio_array / ratio_array.sum()
+    return tuple(float(v) for v in ratio_array.tolist())
+
+
 def _subset_pubmedqa_dataset(dataset: Dataset, indices: np.ndarray) -> Dataset:
     """Apply an index subset while keeping PubMedQA prompt variants aligned."""
     index_list = [int(i) for i in indices.tolist()]
@@ -85,6 +195,120 @@ def _subset_pubmedqa_dataset(dataset: Dataset, indices: np.ndarray) -> Dataset:
         dataset.pubmedqa_with_context_x = [with_context_prompts[i] for i in index_list]
     if isinstance(without_context_prompts, list):
         dataset.pubmedqa_without_context_x = [without_context_prompts[i] for i in index_list]
+
+    return dataset
+
+
+def _subset_race_dataset(dataset: Dataset, indices: np.ndarray) -> Dataset:
+    """Apply an index subset while keeping RACE prompt variants aligned."""
+    index_list = [int(i) for i in indices.tolist()]
+    with_context_prompts = getattr(dataset, "race_with_context_x", None)
+    without_context_prompts = getattr(dataset, "race_without_context_x", None)
+
+    dataset.select(index_list)
+
+    if isinstance(with_context_prompts, list):
+        dataset.race_with_context_x = [with_context_prompts[i] for i in index_list]
+    if isinstance(without_context_prompts, list):
+        dataset.race_without_context_x = [without_context_prompts[i] for i in index_list]
+
+    return dataset
+
+
+def _apply_race_split(
+    dataset: Dataset,
+    dataset_name: str,
+    target_split: str,
+    split_seed: int,
+    split_ratios: Tuple[float, float, float],
+    requested_size: Optional[int],
+) -> Dataset:
+    """Deterministically split a single-source RACE split into train/val/test partitions."""
+    split_aliases = {
+        "train": "train",
+        "val": "validation",
+        "validation": "validation",
+        "test": "test",
+        "train_val": "train_val",
+        "train+val": "train_val",
+    }
+    normalized_target = split_aliases.get(str(target_split).strip().lower())
+    if normalized_target is None:
+        raise ValueError(
+            f"Unsupported RACE target split '{target_split}'. "
+            "Use one of: train, validation, test, train_val."
+        )
+
+    total_examples = len(dataset.x)
+    if total_examples <= 0:
+        raise ValueError(f"RACE dataset '{dataset_name}' is empty before splitting")
+
+    rng = np.random.RandomState(int(split_seed))
+    all_indices = np.arange(total_examples, dtype=np.int64)
+    rng.shuffle(all_indices)
+
+    ratio_array = np.array(split_ratios, dtype=np.float64)
+    raw_counts = ratio_array * float(total_examples)
+    split_counts = np.floor(raw_counts).astype(np.int64)
+    remainder = int(total_examples - split_counts.sum())
+    if remainder > 0:
+        residual_order = np.argsort(-(raw_counts - split_counts))
+        for idx in residual_order[:remainder]:
+            split_counts[idx] += 1
+
+    train_count, val_count, test_count = [int(v) for v in split_counts.tolist()]
+
+    train_indices = np.array(all_indices[:train_count], copy=True)
+    val_start = train_count
+    val_end = train_count + val_count
+    val_indices = np.array(all_indices[val_start:val_end], copy=True)
+    test_indices = np.array(all_indices[val_end:], copy=True)
+
+    split_indices_map = {
+        "train": train_indices,
+        "validation": val_indices,
+        "test": test_indices,
+        "train_val": np.concatenate([train_indices, val_indices]),
+    }
+    selected_indices = np.array(split_indices_map[normalized_target], copy=True)
+    rng.shuffle(selected_indices)
+
+    if requested_size is not None:
+        requested_size_int = int(requested_size)
+        if requested_size_int <= 0:
+            raise ValueError(
+                f"Invalid size={requested_size_int} for RACE dataset '{dataset_name}'. "
+                "Expected a positive integer."
+            )
+        if requested_size_int < selected_indices.shape[0]:
+            selected_indices = selected_indices[:requested_size_int]
+
+    dataset = _subset_race_dataset(dataset, selected_indices)
+
+    dataset.race_split_source = "single_source_split"
+    dataset.race_balanced_split = normalized_target
+    dataset.race_split_seed = int(split_seed)
+    dataset.race_split_ratios = tuple(float(v) for v in ratio_array.tolist())
+    dataset.race_split_counts = {
+        "source_examples": int(total_examples),
+        "train_examples": train_count,
+        "validation_examples": val_count,
+        "test_examples": test_count,
+        "selected_examples": int(len(dataset.x)),
+    }
+
+    log.info(
+        "RACE deterministic split for %s: split=%s, seed=%d, source=%d, "
+        "counts(train/val/test)=(%d/%d/%d), selected=%d",
+        dataset_name,
+        normalized_target,
+        int(split_seed),
+        int(total_examples),
+        train_count,
+        val_count,
+        test_count,
+        int(len(dataset.x)),
+    )
 
     return dataset
 
@@ -313,6 +537,7 @@ def load_datasets_from_config(
         
         dataset_path = dataset_cfg["name"]
         is_pubmedqa = _is_pubmedqa_dataset_config(dataset_cfg)
+        is_race = _is_race_dataset_config(dataset_cfg)
         requested_size = dataset_cfg.get("size", None)
 
         if is_pubmedqa:
@@ -328,16 +553,37 @@ def load_datasets_from_config(
             )
             actual_split = dataset_cfg.get("pubmedqa_source_split", "train")
             if split == "train":
-                pubmedqa_target_split = dataset_cfg.get("pubmedqa_train_target_split", "train_val")
+                dataset_target_split = dataset_cfg.get("pubmedqa_train_target_split", "train_val")
             elif split == "test":
-                pubmedqa_target_split = dataset_cfg.get("pubmedqa_eval_target_split", "test")
+                dataset_target_split = dataset_cfg.get("pubmedqa_eval_target_split", "test")
             else:
-                pubmedqa_target_split = dataset_cfg.get("pubmedqa_validation_target_split", split)
+                dataset_target_split = dataset_cfg.get("pubmedqa_validation_target_split", split)
+        elif is_race:
+            config_name = dataset_cfg.get(
+                "race_source_config_name",
+                dataset_cfg.get(
+                    "train_config_name",
+                    dataset_cfg.get(
+                        "eval_config_name",
+                        dataset_cfg.get("config_name"),
+                    ),
+                ),
+            )
+            actual_split = dataset_cfg.get(
+                "race_source_split",
+                dataset_cfg.get("train_split", dataset_cfg.get("eval_split", "test")),
+            )
+            if split == "train":
+                dataset_target_split = dataset_cfg.get("race_train_target_split", "train")
+            elif split == "test":
+                dataset_target_split = dataset_cfg.get("race_eval_target_split", "test")
+            else:
+                dataset_target_split = dataset_cfg.get("race_validation_target_split", split)
         elif split == "train":
             config_name = dataset_cfg.get("train_config_name", dataset_cfg.get("config_name"))
             split_key = "train_split"
             actual_split = dataset_cfg.get(split_key, split)
-            pubmedqa_target_split = None
+            dataset_target_split = None
         else:
             config_name = dataset_cfg.get(
                 "eval_config_name",
@@ -345,7 +591,7 @@ def load_datasets_from_config(
             )
             split_key = "eval_split"
             actual_split = dataset_cfg.get(split_key, split)
-            pubmedqa_target_split = None
+            dataset_target_split = None
 
         if config_name and isinstance(dataset_path, str):
             dataset_path = [dataset_path, config_name]
@@ -354,7 +600,7 @@ def load_datasets_from_config(
             str(dataset_path).replace("/", "_").replace("[", "").replace("]", "")
         )
 
-        source_size = dataset_cfg.get("source_size", None) if is_pubmedqa else requested_size
+        source_size = dataset_cfg.get("source_size", None) if (is_pubmedqa or is_race) else requested_size
         
         # Load dataset
         try:
@@ -396,11 +642,42 @@ def load_datasets_from_config(
                 dataset = _apply_pubmedqa_balanced_split(
                     dataset=dataset,
                     dataset_name=dataset_name,
-                    target_split=pubmedqa_target_split,
+                    target_split=dataset_target_split,
                     split_seed=split_seed,
                     split_ratios=split_ratios,
                     requested_size=requested_size,
                 )
+            elif is_race:
+                seed_candidate = dataset_cfg.get("split_seed", random_seed if random_seed is not None else 42)
+                try:
+                    split_seed = int(seed_candidate)
+                except (TypeError, ValueError) as e:
+                    raise ValueError(
+                        f"Invalid split_seed for RACE dataset '{dataset_name}': {seed_candidate}"
+                    ) from e
+
+                split_ratios = _normalize_race_split_ratios(dataset_cfg.get("race_split_ratios"))
+                dataset = _apply_race_split(
+                    dataset=dataset,
+                    dataset_name=dataset_name,
+                    target_split=dataset_target_split,
+                    split_seed=split_seed,
+                    split_ratios=split_ratios,
+                    requested_size=requested_size,
+                )
+
+            dataset.cache_dataset_config = _build_dataset_cache_config_signature(
+                dataset_cfg=dataset_cfg,
+                dataset_name=dataset_name,
+                load_split=split,
+                resolved_path=dataset_path,
+                resolved_split=actual_split,
+                resolved_config_name=config_name,
+                dataset_target_split=dataset_target_split,
+                random_seed=random_seed,
+            )
+            dataset.cache_dataset_name = dataset_name
+            dataset.cache_dataset_split = actual_split
         except Exception as e:
             raise RuntimeError(
                 f"Failed to load dataset {i} (name: {dataset_path}, split: {actual_split}): {e}"
@@ -417,7 +694,12 @@ def load_datasets_from_config(
         if is_pubmedqa:
             log.info(
                 f"Loaded dataset {i+1}/{len(dataset_configs)}: {dataset_name} "
-                f"(source_split: {actual_split}, target_split: {pubmedqa_target_split}, size: {len(dataset.x)})"
+                f"(source_split: {actual_split}, target_split: {dataset_target_split}, size: {len(dataset.x)})"
+            )
+        elif is_race:
+            log.info(
+                f"Loaded dataset {i+1}/{len(dataset_configs)}: {dataset_name} "
+                f"(source_split: {actual_split}, target_split: {dataset_target_split}, size: {len(dataset.x)})"
             )
         else:
             log.info(
