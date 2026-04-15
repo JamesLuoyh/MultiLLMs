@@ -163,12 +163,11 @@ class PreInferenceMSEBrWagersV2(WageringMethod):
 
         brs = scores - average_scores
         brs = torch.clamp(brs, min=1e-16, max=1.0 - 1e-16)
-        nash_gap = brs * (scores - average_scores - 0.5 * brs) - sigmoid_wagers * (
-            scores - average_scores - 0.5 * sigmoid_wagers
-        )
+        total_payout = sigmoid_wagers * (scores - average_scores - 0.5 * sigmoid_wagers)
+        nash_gap = brs * (scores - average_scores - 0.5 * brs) - total_payout
         score_diff = scores - average_scores
 
-        return brs, nash_gap, score_diff
+        return brs, nash_gap, score_diff, total_payout
 
     def compute_wagers(
         self,
@@ -215,13 +214,14 @@ class PreInferenceMSEBrWagersV2(WageringMethod):
 
             model_logits_tensor = torch.as_tensor(model_logits, dtype=torch.float32, device=self.device)
             gold_label_tensor = torch.as_tensor(gold_label, dtype=torch.long, device=self.device)
-            _, nash_gap, score_diff = self.extract_wagers_brs_and_nash_gap(
+            _, nash_gap, score_diff, total_payout = self.extract_wagers_brs_and_nash_gap(
                 sigmoid_wagers,
                 model_logits_tensor,
                 gold_label_tensor,
             )
             result["nash_gap"] = nash_gap.detach().cpu().numpy()
             result["score_diff"] = score_diff.detach().cpu().numpy()
+            result["total_payout"] = total_payout.detach().cpu().numpy()
 
         wagers_np = result["wagers"]
         if np.any(np.isnan(wagers_np)) or np.any(np.isinf(wagers_np)):
@@ -292,7 +292,7 @@ class PreInferenceMSEBrWagersV2(WageringMethod):
             sigmoid_wagers = torch.sigmoid(raw_wagers_tensor / self.temperature)
             sigmoid_wagers = torch.clamp(sigmoid_wagers, min=1e-16, max=1.0 - 1e-16)
 
-            brs, _, _ = self.extract_wagers_brs_and_nash_gap(
+            brs, _, _, _ = self.extract_wagers_brs_and_nash_gap(
                 sigmoid_wagers,
                 model_logits_tensor,
                 gold_label_tensor,

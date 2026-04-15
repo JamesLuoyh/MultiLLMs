@@ -10,7 +10,8 @@ from .base import AggregationFunction
 
 class LogarithmicPooling(AggregationFunction):
     """
-    Logarithmic pooling: averaging in log-probability space.
+    Logarithmic pooling: averaging in log-probability space with internal
+    normalization of non-negative wagers.
     """
     
     def aggregate(
@@ -38,6 +39,15 @@ class LogarithmicPooling(AggregationFunction):
             
             if wagers.shape != (batch_size, num_models):
                 raise ValueError(f"Wagers shape mismatch")
+
+            if np.any(wagers < 0):
+                raise ValueError("Wagers must be non-negative")
+
+            wager_sums = np.sum(wagers, axis=1, keepdims=True)
+            if np.any(wager_sums <= 1e-10):
+                raise ValueError("Wagers must have positive sum")
+
+            normalized_wagers = wagers / wager_sums
             
             # Convert to log-probabilities
             max_logits = np.max(model_logits, axis=2, keepdims=True)
@@ -46,7 +56,7 @@ class LogarithmicPooling(AggregationFunction):
             log_probs = model_logits - log_norm
             
             # Weighted average in log space
-            weighted_log = wagers[:, :, None] * log_probs
+            weighted_log = normalized_wagers[:, :, None] * log_probs
             pooled_log_unnorm = weighted_log.sum(axis=1)
             
             # Normalize
@@ -68,9 +78,15 @@ class LogarithmicPooling(AggregationFunction):
         elif model_logits.ndim == 2 and wagers.ndim == 1:
             if wagers.shape[0] != model_logits.shape[0]:
                 raise ValueError("Wagers shape must match number of models")
-            
-            if not np.isclose(np.sum(wagers), 1.0, atol=1e-6):
-                raise ValueError(f"Wagers must sum to 1.0")
+
+            if np.any(wagers < 0):
+                raise ValueError("Wagers must be non-negative")
+
+            wager_sum = np.sum(wagers)
+            if wager_sum <= 1e-10:
+                raise ValueError("Wagers must have positive sum")
+
+            normalized_wagers = wagers / wager_sum
             
             # Convert to log-probabilities
             max_logits = np.max(model_logits, axis=1, keepdims=True)
@@ -79,7 +95,7 @@ class LogarithmicPooling(AggregationFunction):
             log_probs = model_logits - log_norm
             
             # Weighted average in log space
-            weighted_log = wagers[:, None] * log_probs
+            weighted_log = normalized_wagers[:, None] * log_probs
             pooled_log_unnorm = weighted_log.sum(axis=0)
             
             # Normalize

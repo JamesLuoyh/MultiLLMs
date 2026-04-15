@@ -33,6 +33,36 @@ def _stable_cache_value(value: Any) -> Any:
     return value
 
 
+def _local_path_fingerprint(value: Any) -> Any:
+    """Return a stable fingerprint for existing local file paths in nested values.
+
+    This helps invalidate logits/hidden-state caches when a dataset file is
+    regenerated at the same path (for example, CSV content changes while the
+    filename stays constant).
+    """
+    if isinstance(value, dict):
+        return {str(k): _local_path_fingerprint(v) for k, v in sorted(value.items(), key=lambda item: str(item[0]))}
+    if isinstance(value, (list, tuple)):
+        return [_local_path_fingerprint(v) for v in value]
+    if isinstance(value, (str, Path)):
+        raw_path = str(value)
+        try:
+            path_obj = Path(raw_path).expanduser()
+        except Exception:
+            return {"path": raw_path, "exists": False}
+
+        if path_obj.exists() and path_obj.is_file():
+            stat = path_obj.stat()
+            return {
+                "path": str(path_obj),
+                "exists": True,
+                "size": int(stat.st_size),
+                "mtime_ns": int(getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1e9))),
+            }
+        return {"path": raw_path, "exists": False}
+    return value
+
+
 def _build_dataset_cache_config_signature(
     dataset_cfg: Dict[str, Any],
     *,
@@ -49,12 +79,18 @@ def _build_dataset_cache_config_signature(
         "dataset_name": dataset_name,
         "load_split": load_split,
         "resolved_path": resolved_path,
+        "resolved_path_fingerprint": _local_path_fingerprint(resolved_path),
         "resolved_split": resolved_split,
         "resolved_config_name": resolved_config_name,
         "dataset_target_split": dataset_target_split,
         # Keep random seed in signature only if explicitly pinned in dataset config.
         "split_seed": dataset_cfg.get("split_seed") if "split_seed" in dataset_cfg else None,
         "dataset_config": dict(dataset_cfg),
+        "dataset_files_fingerprint": _local_path_fingerprint({
+            "name": dataset_cfg.get("name"),
+            "data_files": dataset_cfg.get("data_files"),
+            "data_dir": dataset_cfg.get("data_dir"),
+        }),
     }
     if "split_seed" not in dataset_cfg:
         # Ignore global run-time seed to maximize cache reuse across shuffle sweeps.
@@ -80,7 +116,7 @@ def _is_pubmedqa_dataset_config(dataset_cfg: Dict[str, Any]) -> bool:
         dataset_cfg.get("train_config_name", ""),
         dataset_cfg.get("eval_config_name", ""),
         dataset_cfg.get("test_config_name", ""),
-        dataset_cfg.get("pubmedqa_source_config_name", ""),
+        dataset_cfg.get("source_config_name", ""),
     ]
     normalized = " ".join(str(field).lower() for field in fields if field is not None)
     return "pubmedqa" in normalized or "pubmed_qa" in normalized
@@ -111,15 +147,15 @@ def calibration_dataset_configs_include_pubmedqa(dataset_configs: Sequence[Dict[
     )
 
 
-def _normalize_pubmedqa_split_ratios(raw_ratios: Any) -> Tuple[float, float, float]:
-    """Normalize PubMedQA split ratios to a valid (train, val, test) tuple."""
+def _normalize_split_ratios(raw_ratios: Any) -> Tuple[float, float, float]:
+    """Normalize split ratios to a valid (train, val, test) tuple."""
     default_ratios = (0.6, 0.2, 0.2)
     if raw_ratios is None:
         return default_ratios
 
     if not isinstance(raw_ratios, Sequence) or len(raw_ratios) != 3:
         log.warning(
-            "Invalid pubmedqa_split_ratios=%s. Falling back to default ratios %s.",
+            "Invalid split_ratios=%s. Falling back to default ratios %s.",
             raw_ratios,
             default_ratios,
         )
@@ -129,7 +165,7 @@ def _normalize_pubmedqa_split_ratios(raw_ratios: Any) -> Tuple[float, float, flo
         ratio_array = np.array([float(v) for v in raw_ratios], dtype=np.float64)
     except (TypeError, ValueError):
         log.warning(
-            "Could not parse pubmedqa_split_ratios=%s. Falling back to default ratios %s.",
+            "Could not parse split_ratios=%s. Falling back to default ratios %s.",
             raw_ratios,
             default_ratios,
         )
@@ -137,7 +173,7 @@ def _normalize_pubmedqa_split_ratios(raw_ratios: Any) -> Tuple[float, float, flo
 
     if np.any(ratio_array < 0) or not np.any(ratio_array > 0):
         log.warning(
-            "Non-positive pubmedqa_split_ratios=%s. Falling back to default ratios %s.",
+            "Non-positive split_ratios=%s. Falling back to default ratios %s.",
             raw_ratios,
             default_ratios,
         )
@@ -477,6 +513,194 @@ def _apply_pubmedqa_balanced_split(
     return dataset
 
 
+def _apply_balanced_binary_split(
+    dataset: Dataset,
+    dataset_name: str,
+    target_split: str,
+    split_seed: int,
+    split_ratios: Tuple[float, float, float],
+    requested_size: Optional[int],
+    positive_label: Optional[str] = None,
+) -> Dataset:
+    """Balance binary labels, perform deterministic split, then subset.
+
+    This is a PubMedQA-like split policy for non-PubMed binary datasets.
+    """
+    split_aliases = {
+        "train": "train",
+        "val": "validation",
+        "validation": "validation",
+        "test": "test",
+        "train_val": "train_val",
+        "train+val": "train_val",
+    }
+    normalized_target = split_aliases.get(str(target_split).strip().lower())
+    if normalized_target is None:
+        raise ValueError(
+            f"Unsupported balanced-binary target split '{target_split}'. "
+            "Use one of: train, validation, test, train_val."
+        )
+
+    raw_labels = np.array([str(label).strip().upper() for label in dataset.y], dtype=object)
+    unique_labels = sorted(set(raw_labels.tolist()))
+    if len(unique_labels) != 2:
+        raise ValueError(
+            f"Dataset '{dataset_name}' must be binary for balanced split "
+            f"(found labels={unique_labels})."
+        )
+
+    if positive_label is None:
+        positive_candidates = ["1", "YES", "TRUE", "POSITIVE"]
+        chosen_positive = next((v for v in positive_candidates if v in unique_labels), unique_labels[1])
+    else:
+        chosen_positive = str(positive_label).strip().upper()
+        if chosen_positive not in unique_labels:
+            raise ValueError(
+                f"positive_label='{positive_label}' not found in dataset labels {unique_labels}"
+            )
+
+    negative_label = next(lbl for lbl in unique_labels if lbl != chosen_positive)
+
+    pos_indices = np.where(raw_labels == chosen_positive)[0]
+    neg_indices = np.where(raw_labels == negative_label)[0]
+    if pos_indices.size == 0 or neg_indices.size == 0:
+        raise ValueError(
+            f"Dataset '{dataset_name}' must contain both classes for balanced split "
+            f"(positive={pos_indices.size}, negative={neg_indices.size})."
+        )
+
+    min_class_count = int(min(pos_indices.size, neg_indices.size))
+    rng = np.random.RandomState(int(split_seed))
+
+    pos_pool = np.array(pos_indices, copy=True)
+    neg_pool = np.array(neg_indices, copy=True)
+    rng.shuffle(pos_pool)
+    rng.shuffle(neg_pool)
+    pos_pool = pos_pool[:min_class_count]
+    neg_pool = neg_pool[:min_class_count]
+
+    ratio_array = np.array(split_ratios, dtype=np.float64)
+    raw_counts = ratio_array * float(min_class_count)
+    split_counts = np.floor(raw_counts).astype(np.int64)
+    remainder = int(min_class_count - split_counts.sum())
+    if remainder > 0:
+        residual_order = np.argsort(-(raw_counts - split_counts))
+        for idx in residual_order[:remainder]:
+            split_counts[idx] += 1
+
+    train_count, val_count, test_count = [int(v) for v in split_counts.tolist()]
+
+    train_pos = pos_pool[:train_count]
+    val_pos = pos_pool[train_count: train_count + val_count]
+    test_pos = pos_pool[train_count + val_count:]
+
+    train_neg = neg_pool[:train_count]
+    val_neg = neg_pool[train_count: train_count + val_count]
+    test_neg = neg_pool[train_count + val_count:]
+
+    train_indices = np.concatenate([train_pos, train_neg])
+    val_indices = np.concatenate([val_pos, val_neg])
+    test_indices = np.concatenate([test_pos, test_neg])
+
+    rng.shuffle(train_indices)
+    rng.shuffle(val_indices)
+    rng.shuffle(test_indices)
+
+    split_indices_map = {
+        "train": train_indices,
+        "validation": val_indices,
+        "test": test_indices,
+        "train_val": np.concatenate([train_indices, val_indices]),
+    }
+    selected_indices = np.array(split_indices_map[normalized_target], copy=True)
+    rng.shuffle(selected_indices)
+
+    if requested_size is not None:
+        requested_size_int = int(requested_size)
+        if requested_size_int <= 0:
+            raise ValueError(
+                f"Invalid size={requested_size_int} for dataset '{dataset_name}'. "
+                "Expected a positive integer."
+            )
+
+        if requested_size_int < selected_indices.shape[0]:
+            selected_labels = raw_labels[selected_indices]
+            split_pos_indices = selected_indices[selected_labels == chosen_positive]
+            split_neg_indices = selected_indices[selected_labels == negative_label]
+            per_class_limit = min(
+                split_pos_indices.shape[0],
+                split_neg_indices.shape[0],
+                requested_size_int // 2,
+            )
+
+            if per_class_limit <= 0:
+                raise ValueError(
+                    f"Requested size={requested_size_int} is too small to keep class balance "
+                    f"for dataset '{dataset_name}'."
+                )
+
+            rng.shuffle(split_pos_indices)
+            rng.shuffle(split_neg_indices)
+
+            selected_indices = np.concatenate(
+                [split_pos_indices[:per_class_limit], split_neg_indices[:per_class_limit]]
+            )
+            rng.shuffle(selected_indices)
+
+            balanced_size = int(selected_indices.shape[0])
+            if balanced_size < requested_size_int:
+                log.warning(
+                    "Requested size=%d for dataset '%s' adjusted to %d to preserve class balance.",
+                    requested_size_int,
+                    dataset_name,
+                    balanced_size,
+                )
+
+    # Keep any mixed-context prompt variants aligned with the selected subset.
+    dataset_type_hint = str(getattr(dataset, "pubmedqa_prompt_strategy", "")).strip().lower()
+    if dataset_type_hint == "mixed_context":
+        dataset = _subset_pubmedqa_dataset(dataset, selected_indices)
+    else:
+        dataset.select([int(i) for i in selected_indices.tolist()])
+
+    dataset.binary_balanced_split = normalized_target
+    dataset.binary_split_seed = int(split_seed)
+    dataset.binary_split_ratios = tuple(float(v) for v in ratio_array.tolist())
+    dataset.binary_positive_label = chosen_positive
+    dataset.binary_negative_label = negative_label
+    dataset.binary_balanced_counts = {
+        "source_positive": int(pos_indices.size),
+        "source_negative": int(neg_indices.size),
+        "balanced_per_label": int(min_class_count),
+        "train_per_label": train_count,
+        "validation_per_label": val_count,
+        "test_per_label": test_count,
+        "selected_examples": int(len(dataset.x)),
+    }
+
+    if normalized_target == "train_val":
+        train_val_size = train_count + val_count
+        if train_val_size > 0:
+            dataset.binary_train_val_split_ratio = float(val_count / train_val_size)
+
+    log.info(
+        "Balanced binary split for %s: split=%s, seed=%d, source_pos=%d, source_neg=%d, "
+        "balanced_per_label=%d, per_label_counts(train/val/test)=(%d/%d/%d), selected=%d",
+        dataset_name,
+        normalized_target,
+        int(split_seed),
+        int(pos_indices.size),
+        int(neg_indices.size),
+        int(min_class_count),
+        train_count,
+        val_count,
+        test_count,
+        int(len(dataset.x)),
+    )
+
+    return dataset
+
+
 def load_datasets_from_config(
     dataset_configs: List[Dict[str, Any]],
     split: str = "train",
@@ -504,13 +728,11 @@ def load_datasets_from_config(
             - eval_config_name: HF subset/config for evaluation mode (optional)
             - test_config_name: Alias for eval_config_name (optional)
             - config_name: HF subset/config fallback for all modes (optional)
-                        - pubmedqa_source_config_name: PubMedQA source subset (default "pqa_artificial")
-                        - pubmedqa_source_split: PubMedQA source split (default "train")
-                        - pubmedqa_train_target_split: PubMedQA target split for training phase
-                            (default "train_val")
-                        - pubmedqa_eval_target_split: PubMedQA target split for evaluation phase
-                            (default "test")
-                        - pubmedqa_split_ratios: PubMedQA train/val/test ratios (default [0.6, 0.2, 0.2])
+                        - source_config_name: source subset/config for split-sensitive datasets
+                        - source_split: source split for split-sensitive datasets (default "train")
+                        - train_target_split: target split for training phase (default "train_val")
+                        - eval_target_split: target split for evaluation phase (default "test")
+                        - split_ratios: train/val/test ratios (default [0.6, 0.2, 0.2])
                         - split_seed: Seed for deterministic PubMedQA splitting (optional)
             - size: Number of examples to load (optional, loads all if None)
                         - source_size: Source cap before PubMedQA split (optional)
@@ -538,11 +760,16 @@ def load_datasets_from_config(
         dataset_path = dataset_cfg["name"]
         is_pubmedqa = _is_pubmedqa_dataset_config(dataset_cfg)
         is_race = _is_race_dataset_config(dataset_cfg)
+        generic_split_keys_present = any(
+            key in dataset_cfg
+            for key in ("split_ratios", "train_target_split", "eval_target_split")
+        )
+        use_balanced_binary_split = (not is_pubmedqa and not is_race and generic_split_keys_present)
         requested_size = dataset_cfg.get("size", None)
 
         if is_pubmedqa:
             config_name = dataset_cfg.get(
-                "pubmedqa_source_config_name",
+                "source_config_name",
                 dataset_cfg.get(
                     "train_config_name",
                     dataset_cfg.get(
@@ -551,13 +778,13 @@ def load_datasets_from_config(
                     ),
                 ),
             )
-            actual_split = dataset_cfg.get("pubmedqa_source_split", "train")
+            actual_split = dataset_cfg.get("source_split", "train")
             if split == "train":
-                dataset_target_split = dataset_cfg.get("pubmedqa_train_target_split", "train_val")
+                dataset_target_split = dataset_cfg.get("train_target_split", "train_val")
             elif split == "test":
-                dataset_target_split = dataset_cfg.get("pubmedqa_eval_target_split", "test")
+                dataset_target_split = dataset_cfg.get("eval_target_split", "test")
             else:
-                dataset_target_split = dataset_cfg.get("pubmedqa_validation_target_split", split)
+                dataset_target_split = dataset_cfg.get("validation_target_split", split)
         elif is_race:
             config_name = dataset_cfg.get(
                 "race_source_config_name",
@@ -600,10 +827,17 @@ def load_datasets_from_config(
             str(dataset_path).replace("/", "_").replace("[", "").replace("]", "")
         )
 
-        source_size = dataset_cfg.get("source_size", None) if (is_pubmedqa or is_race) else requested_size
+        source_size = dataset_cfg.get("source_size", None) if (is_pubmedqa or is_race or use_balanced_binary_split) else requested_size
         
         # Load dataset
         try:
+            requested_local_files_only = dataset_cfg.get("local_files_only", True)
+            if requested_local_files_only is not True:
+                log.warning(
+                    "Dataset '%s' requested local_files_only=%r; enforcing local-first loading with fallback.",
+                    dataset_name,
+                    requested_local_files_only,
+                )
             dataset_load_kwargs = {
                 "batch_size": dataset_cfg.get("batch_size", 8),
                 "prompt": dataset_cfg.get("prompt", ""),
@@ -616,7 +850,21 @@ def load_datasets_from_config(
                 "size": source_size,
                 "load_from_disk": dataset_cfg.get("load_from_disk", False),
                 "trust_remote_code": dataset_cfg.get("trust_remote_code", False),
+                "local_files_only": True,
+                "allow_remote_fallback": dataset_cfg.get("allow_remote_fallback", True),
             }
+            # Forward optional dataset-loader keys (e.g. JSON data_files/field).
+            for optional_key in (
+                "data_files",
+                "data_dir",
+                "field",
+                "dataset_format",
+                "probability_label_column",
+                "positive_label",
+                "mixed_context_routing",
+            ):
+                if optional_key in dataset_cfg and dataset_cfg.get(optional_key) is not None:
+                    dataset_load_kwargs[optional_key] = dataset_cfg.get(optional_key)
             if "prompt_without_context" in dataset_cfg:
                 dataset_load_kwargs["prompt_without_context"] = dataset_cfg["prompt_without_context"]
             if "pubmedqa_context_model_path" in dataset_cfg:
@@ -638,7 +886,7 @@ def load_datasets_from_config(
                         f"Invalid split_seed for PubMedQA dataset '{dataset_name}': {seed_candidate}"
                     ) from e
 
-                split_ratios = _normalize_pubmedqa_split_ratios(dataset_cfg.get("pubmedqa_split_ratios"))
+                split_ratios = _normalize_split_ratios(dataset_cfg.get("split_ratios"))
                 dataset = _apply_pubmedqa_balanced_split(
                     dataset=dataset,
                     dataset_name=dataset_name,
@@ -664,6 +912,31 @@ def load_datasets_from_config(
                     split_seed=split_seed,
                     split_ratios=split_ratios,
                     requested_size=requested_size,
+                )
+            elif use_balanced_binary_split:
+                seed_candidate = dataset_cfg.get("split_seed", random_seed if random_seed is not None else 42)
+                try:
+                    split_seed = int(seed_candidate)
+                except (TypeError, ValueError) as e:
+                    raise ValueError(
+                        f"Invalid split_seed for balanced-binary dataset '{dataset_name}': {seed_candidate}"
+                    ) from e
+
+                split_ratios = _normalize_split_ratios(dataset_cfg.get("split_ratios"))
+                if split == "train":
+                    target_split = dataset_cfg.get("train_target_split", "train_val")
+                elif split == "test":
+                    target_split = dataset_cfg.get("eval_target_split", "test")
+                else:
+                    target_split = dataset_cfg.get("validation_target_split", split)
+                dataset = _apply_balanced_binary_split(
+                    dataset=dataset,
+                    dataset_name=dataset_name,
+                    target_split=target_split,
+                    split_seed=split_seed,
+                    split_ratios=split_ratios,
+                    requested_size=requested_size,
+                    positive_label=dataset_cfg.get("positive_label"),
                 )
 
             dataset.cache_dataset_config = _build_dataset_cache_config_signature(

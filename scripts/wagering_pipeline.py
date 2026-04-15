@@ -9,6 +9,7 @@ Usage: python wagering_pipeline.py <config_file.yaml>
 
 import logging
 import os
+import shutil
 import sys
 import argparse
 from pathlib import Path
@@ -26,6 +27,36 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 if str(SCRIPTS_PATH) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_PATH))
+
+
+def _configure_default_hf_cache_env() -> None:
+    """Prefer shared HF cache when home cache is unavailable and env vars are unset."""
+    if (
+        os.environ.get("HF_HOME")
+        or os.environ.get("HF_HUB_CACHE")
+        or os.environ.get("HUGGINGFACE_HUB_CACHE")
+        or os.environ.get("HF_DATASETS_CACHE")
+    ):
+        return
+
+    user = os.environ.get("USER", "").strip()
+    if not user:
+        return
+
+    shared_cache_root = f"/common/users/{user}/.cache"
+    if not os.path.isdir(shared_cache_root):
+        return
+
+    shared_hf_home = os.path.join(shared_cache_root, "huggingface")
+    if not os.path.isdir(shared_hf_home):
+        return
+
+    os.environ["HF_HOME"] = shared_hf_home
+    os.environ["HF_HUB_CACHE"] = os.path.join(shared_hf_home, "hub")
+    os.environ["HF_DATASETS_CACHE"] = os.path.join(shared_hf_home, "datasets")
+
+
+_configure_default_hf_cache_env()
 
 from wagering.calibration import calibration_enabled, fit_or_load_logit_calibrator
 from wagering.methods.factory import load_wagering_method
@@ -48,11 +79,62 @@ eval_main = eval_module.main
 log = logging.getLogger("wagering")
 
 
+def _parse_gpu_ids(csv: str) -> str:
+    """Normalize comma-separated GPU ids for CUDA_VISIBLE_DEVICES."""
+    gpu_ids = [p.strip() for p in str(csv).split(",") if p.strip()]
+    if not gpu_ids:
+        raise ValueError("No GPUs provided. Example: --gpus 0,1,2,3")
+    return ",".join(gpu_ids)
+
+
+def _cleanup_checkpoints(checkpoint_path: Optional[str], mode: str = "transition"):
+    """Clean up checkpoint artifacts after pipeline completion.
+
+    Modes:
+      - none: do not delete anything
+      - transition: delete epoch transition checkpoints only
+      - all: delete the entire created checkpoint directory
+    """
+    if checkpoint_path is None:
+        return
+    if mode == "none":
+        return
+
+    ckpt_dir = Path(checkpoint_path)
+    if not ckpt_dir.exists():
+        return
+
+    if mode == "all":
+        try:
+            shutil.rmtree(ckpt_dir)
+            log.info("Removed checkpoint directory %s", ckpt_dir)
+        except Exception as e:
+            log.warning("Could not remove checkpoint directory %s: %s", ckpt_dir, e)
+        return
+
+    removed = 0
+    for path in ckpt_dir.glob("checkpoint_epoch_*_step_*.pt"):
+        try:
+            path.unlink()
+            removed += 1
+        except Exception as e:
+            log.warning("Could not remove transition checkpoint %s: %s", path, e)
+    for path in ckpt_dir.glob("checkpoint_epoch_*_step_*.pt.tmp"):
+        try:
+            path.unlink()
+            removed += 1
+        except Exception as e:
+            log.warning("Could not remove transition checkpoint tmp %s: %s", path, e)
+    log.info("Removed %d transition checkpoints from %s", removed, ckpt_dir)
+
+
 def run_pipeline(
     config_path: Optional[Path] = None,
     skip_training: bool = False,
     skip_evaluation: bool = False,
     checkpoint_path_override: Optional[str] = None,
+    gpus: Optional[str] = None,
+    cleanup_checkpoints: str = "transition",
 ):
     """Run end-to-end pipeline with unified wandb run."""
     logging.basicConfig(
@@ -69,9 +151,15 @@ def run_pipeline(
     if config_path is None:
         raise ValueError("config_path is required")
 
+    if gpus is not None:
+        visible_gpus = _parse_gpu_ids(gpus)
+        os.environ["CUDA_VISIBLE_DEVICES"] = visible_gpus
+        log.info("Using CUDA_VISIBLE_DEVICES=%s", visible_gpus)
+
     args = load_and_merge_configs(config_path)
     calibration_path = None
     checkpoint_path = None
+    created_checkpoint_path = None
 
     wagering_method = load_wagering_method(
         args["wagering_method"]["name"],
@@ -105,6 +193,7 @@ def run_pipeline(
                 calibration_path=calibration_path,
             )
             checkpoint_path = train_results.get("checkpoint_path")
+            created_checkpoint_path = checkpoint_path
             calibration_path = train_results.get("calibration_path", calibration_path)
             
             import wandb
@@ -153,6 +242,8 @@ def run_pipeline(
     log.info("PIPELINE COMPLETE")
     log.info("=" * 80)
 
+    _cleanup_checkpoints(created_checkpoint_path, mode=cleanup_checkpoints)
+
 
 def main():
     """Parse arguments and run pipeline."""
@@ -175,10 +266,27 @@ def main():
         help="Skip evaluation phase"
     )
     parser.add_argument(
+        "--gpus",
+        type=str,
+        default=None,
+        help="Comma-separated GPU ids to expose via CUDA_VISIBLE_DEVICES (example: 1,2,3)",
+    )
+    parser.add_argument(
         "--checkpoint-path",
         type=str,
         default=None,
         help="Override checkpoint path (use with --skip-training)"
+    )
+    parser.add_argument(
+        "--cleanup-checkpoints",
+        type=str,
+        choices=["none", "transition", "all"],
+        default="transition",
+        help=(
+            "Checkpoint cleanup mode after pipeline completion: "
+            "none (keep all), transition (remove checkpoint_epoch_* files), "
+            "all (delete entire checkpoint directory)."
+        ),
     )
     
     args = parser.parse_args()
@@ -193,6 +301,8 @@ def main():
         skip_training=args.skip_training,
         skip_evaluation=args.skip_evaluation,
         checkpoint_path_override=args.checkpoint_path,
+        gpus=args.gpus,
+        cleanup_checkpoints=args.cleanup_checkpoints,
     )
 
 

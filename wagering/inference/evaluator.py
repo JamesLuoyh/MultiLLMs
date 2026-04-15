@@ -24,6 +24,7 @@ from wagering.core.metrics import ECE
 from wagering.methods.base import WageringMethod
 from wagering.training.analytics import WageringAnalytics
 from wagering.training.trainer import (
+    _compute_model_brier_scores,
     compute_brier_dynamic_regret,
     compute_dynamic_regret,
     compute_meta_metrics,
@@ -32,8 +33,10 @@ from wagering.aggregation.base import AggregationFunction
 from wagering.utils.multi_llm_ensemble import (
     collect_option_logits_and_hidden_states_for_model,
     extract_hidden_state_features,
+    get_concatenated_router_prompts,
     get_model_prompt_variant,
     get_cached_logits_and_hidden_states_for_model,
+    resolve_hidden_state_layers_for_model,
     set_cached_logits_and_hidden_states_for_model,
 )
 
@@ -88,19 +91,25 @@ class WageringEvaluator:
         self.training_checkpoint_path = training_checkpoint_path
         self.seed = seed
         self.logit_calibrator = logit_calibrator
+        self.use_concatenated_prompt_context = bool(
+            getattr(self.wagering_method, "use_concatenated_prompt_context", False)
+        )
+        self._router_concatenated_prompt_cache: Dict[int, List[str]] = {}
         self.hidden_state_layers = getattr(self.wagering_method, "hidden_state_layers", None)
+        self.hidden_state_layers_per_model = getattr(self.wagering_method, "hidden_state_layers_per_model", None)
+        self.method_requires_model_perplexities = bool(
+            getattr(self.wagering_method, "requires_model_perplexities", False)
+        )
         
         if self.checkpoint_dir is not None:
             self.checkpoint_dir = Path(checkpoint_dir)
             self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         
         self.wagering_method.eval_mode()
-        
-        # Global step counter for wandb logging across all datasets
-        # This ensures each dataset gets unique step numbers and time series work correctly
-        # Continue from training's last step if provided to avoid wandb step ordering warnings
+
+        # Global step counter for wandb logging across all datasets.
+        # Continue from training's last step when provided to keep step monotonic.
         if wandb_starting_step is not None:
-            # Use provided starting step (from training's last step)
             self._global_wandb_step = int(wandb_starting_step)
             run_step = self._get_wandb_run_step()
             if run_step is not None:
@@ -108,42 +117,59 @@ class WageringEvaluator:
             log.info(f"Initialized wandb step counter to {self._global_wandb_step} (continuing from training)")
         elif self.wandb_logger:
             try:
-                # Get current step from wandb run if it exists (when resuming)
-                # When wandb resumes a run, we need to continue from where training left off
+                # When resuming a run, continue from the current run step if available.
                 if hasattr(self.wandb_logger, 'run') and self.wandb_logger.run is not None:
-                    # Try to get the step from wandb's run object
-                    # wandb tracks the current step internally
                     try:
-                        # The step is available as wandb.run.step or can be queried from the API
-                        # For resumed runs, we need to get the last logged step
                         run = self.wandb_logger.run
-                        # Try accessing step directly (available in newer wandb versions)
                         if hasattr(run, 'step') and run.step is not None:
                             self._global_wandb_step = run.step
                         else:
-                            # Fallback: try to get from summary (may not be available immediately)
-                            # If unavailable, we'll start from 0 and wandb will handle it
-                            # but this may cause warnings - better to use a high starting step
-                            # Check if this is a resumed run by looking at run.id
-                            # For now, start from 0 and let wandb handle step conflicts
                             self._global_wandb_step = 0
-                            log.warning("Could not determine wandb step from run. Starting from 0. "
-                                      "If this is a resumed run, step ordering warnings may occur.")
+                            log.warning(
+                                "Could not determine wandb step from run. Starting from 0. "
+                                "If this is a resumed run, step ordering warnings may occur."
+                            )
                     except Exception as e:
                         self._global_wandb_step = 0
                         log.warning(f"Error getting wandb step: {e}, starting from 0")
                     else:
                         if self._global_wandb_step > 0:
-                            log.info(f"Initialized wandb step counter to {self._global_wandb_step} (resumed from training)")
+                            log.info(
+                                f"Initialized wandb step counter to {self._global_wandb_step} "
+                                "(resumed from training)"
+                            )
                 else:
                     self._global_wandb_step = 0
                     log.info("Initialized wandb step counter to 0 (wandb run not available)")
             except Exception as e:
-                # If anything goes wrong, start from 0
                 self._global_wandb_step = 0
                 log.warning(f"Could not get wandb step, starting from 0: {e}")
         else:
             self._global_wandb_step = 0
+
+    def _get_router_questions_for_batch(
+        self,
+        dataset: Dataset,
+        batch_start: int,
+        batch_end: int,
+    ) -> List[str]:
+        """Return router questions for eval, optionally concatenating model-specific prompts."""
+        base_questions = dataset.x[batch_start:batch_end]
+        if not self.use_concatenated_prompt_context:
+            return base_questions
+
+        dataset_cache_key = id(dataset)
+        if dataset_cache_key not in self._router_concatenated_prompt_cache:
+            self._router_concatenated_prompt_cache[dataset_cache_key] = get_concatenated_router_prompts(
+                dataset,
+                num_models=len(self.models),
+            )
+
+        concat_prompts = self._router_concatenated_prompt_cache[dataset_cache_key]
+        if len(concat_prompts) != len(dataset.x):
+            return base_questions
+
+        return concat_prompts[batch_start:batch_end]
 
     def _get_wandb_run_step(self) -> Optional[int]:
         """Return current wandb run step if available and parseable."""
@@ -179,6 +205,35 @@ class WageringEvaluator:
             self.wandb_logger.run.log(payload, step=log_step, commit=True)
         else:
             self.wandb_logger.log(payload, step=log_step, commit=True)
+
+    @staticmethod
+    def _compute_option_distribution_perplexities(model_logits: np.ndarray) -> np.ndarray:
+        """
+        Compute entropy-based perplexity proxies from option logits.
+
+        Args:
+            model_logits: Array with shape [batch_size, num_models, num_options].
+
+        Returns:
+            np.ndarray with shape [batch_size, num_models]. Lower values indicate
+            more confident option distributions.
+        """
+        if model_logits.ndim != 3:
+            raise ValueError(
+                f"Expected model_logits with shape [batch_size, num_models, num_options], got {model_logits.shape}"
+            )
+
+        logits = np.asarray(model_logits, dtype=np.float64)
+        max_logits = np.max(logits, axis=2, keepdims=True)
+        stabilized = logits - max_logits
+        exp_logits = np.exp(stabilized)
+        denom = np.clip(np.sum(exp_logits, axis=2, keepdims=True), 1e-20, None)
+        probs = exp_logits / denom
+        log_probs = stabilized - np.log(denom)
+
+        entropy = -np.sum(probs * log_probs, axis=2)
+        perplexities = np.exp(entropy)
+        return perplexities.astype(np.float32, copy=False)
     
     def evaluate(
         self,
@@ -202,12 +257,9 @@ class WageringEvaluator:
         """
         log.info(f"Evaluating on {dataset_name} ({len(dataset.x)} examples)")
         
-        # Check if wagering method requires hidden states (CentralizedWagers, DecentralizedWagers, or WeightedScoreWagers, etc.)
-        wagering_method_name = type(self.wagering_method).__name__
-        needs_hidden_states = (
-            wagering_method_name not in ["EqualWagers", "ZeroOneWagers", "OneZeroWagers"]
-            or self.logit_calibrator is not None
-        )
+        # Check if wagering method requires LLM hidden states for routing.
+        method_requires_hidden_states = bool(getattr(self.wagering_method, "requires_hidden_states", True))
+        needs_hidden_states = method_requires_hidden_states or self.logit_calibrator is not None
         
         # Check cache per model and collect if needed
         all_model_logits_list = []
@@ -218,6 +270,12 @@ class WageringEvaluator:
         for i, model in enumerate(self.models):
             # Try to load from cache for this model
             model_path = model if isinstance(model, str) else model.model_path
+            model_hidden_layers = resolve_hidden_state_layers_for_model(
+                self.hidden_state_layers,
+                self.hidden_state_layers_per_model,
+                model_index=i,
+                num_models=len(self.models),
+            )
             prompt_variant = get_model_prompt_variant(dataset, model_index=i)
             cached_logits, cached_hidden_states, cached_labels = get_cached_logits_and_hidden_states_for_model(
                 model_path,
@@ -225,7 +283,7 @@ class WageringEvaluator:
                 self.option_tokens,
                 prompt_variant=prompt_variant,
                 model_index=i,
-                hidden_state_layers=self.hidden_state_layers,
+                hidden_state_layers=model_hidden_layers,
             )
             
             if cached_logits is not None:
@@ -263,7 +321,7 @@ class WageringEvaluator:
                             self.option_tokens,
                             model_identifier=str(model_path),
                             model_index=i,
-                            hidden_state_layers=self.hidden_state_layers,
+                            hidden_state_layers=model_hidden_layers,
                         )
                         # Update cache with hidden states
                         set_cached_logits_and_hidden_states_for_model(
@@ -275,11 +333,11 @@ class WageringEvaluator:
                             model_labels,
                             prompt_variant=prompt_variant,
                             model_index=i,
-                            hidden_state_layers=self.hidden_state_layers,
+                            hidden_state_layers=model_hidden_layers,
                         )
                         model_hidden_states = extract_hidden_state_features(
                             model_hidden_states_all_layers,
-                            self.hidden_state_layers,
+                            model_hidden_layers,
                         )
                         if model_hidden_states is None:
                             raise RuntimeError(
@@ -303,8 +361,8 @@ class WageringEvaluator:
                 if labels is None:
                     labels = cached_labels
             else:
-                # Cache miss - collect both logits and hidden states
-                log.info(f"Model {i+1}/{len(self.models)}: Cache miss - collecting logits and hidden states")
+                # Cache miss - collect logits (and hidden states only when needed)
+                log.info(f"Model {i+1}/{len(self.models)}: Cache miss - collecting logits")
                 if isinstance(model, str):
                     raise RuntimeError(
                         f"Cache miss for model path {model}. Model must be loaded to collect logits."
@@ -315,7 +373,8 @@ class WageringEvaluator:
                     self.option_tokens,
                     model_identifier=str(model_path),
                     model_index=i,
-                    hidden_state_layers=self.hidden_state_layers,
+                    hidden_state_layers=model_hidden_layers,
+                    collect_hidden_states=needs_hidden_states,
                 )
                 
                 # Cache the results for this model
@@ -328,17 +387,20 @@ class WageringEvaluator:
                     model_labels,
                     prompt_variant=prompt_variant,
                     model_index=i,
-                    hidden_state_layers=self.hidden_state_layers,
+                    hidden_state_layers=model_hidden_layers,
                 )
 
-                model_hidden_states = extract_hidden_state_features(
-                    model_hidden_states_all_layers,
-                    self.hidden_state_layers,
-                )
-                if model_hidden_states is None:
-                    raise RuntimeError(
-                        "Hidden-state cache is in legacy format and cannot satisfy hidden_state_layers; recache is required"
+                if needs_hidden_states:
+                    model_hidden_states = extract_hidden_state_features(
+                        model_hidden_states_all_layers,
+                        model_hidden_layers,
                     )
+                    if model_hidden_states is None:
+                        raise RuntimeError(
+                            "Hidden-state cache is in legacy format and cannot satisfy hidden_state_layers; recache is required"
+                        )
+                else:
+                    model_hidden_states = None
                 
                 all_model_logits_list.append(model_logits)
                 if needs_hidden_states:
@@ -414,7 +476,7 @@ class WageringEvaluator:
             batch_labels = labels[batch_start:batch_end]  # [batch_size]
             
             # Get questions for batch (for wagering methods that need them)
-            batch_questions = dataset.x[batch_start:batch_end]  # List of question strings
+            batch_questions = self._get_router_questions_for_batch(dataset, batch_start, batch_end)
             
             # Prepare hidden states for batch if available
             batch_hidden_states = None
@@ -432,12 +494,18 @@ class WageringEvaluator:
                     batch_hidden_states = [batch_hidden_states_array[i, :, :] for i in range(batch_hidden_states_array.shape[0])]
             
             # Compute wagers for batch
-            res_dict = self.wagering_method.compute_wagers(
-                model_logits=batch_logits_transposed,
-                gold_label=batch_labels,
-                hidden_states_list=batch_hidden_states,
-                questions=batch_questions
-            )  # [batch_size, num_models]
+            wagering_kwargs = {
+                "model_logits": batch_logits_transposed,
+                "gold_label": batch_labels,
+                "hidden_states_list": batch_hidden_states,
+                "questions": batch_questions,
+            }
+            if self.method_requires_model_perplexities:
+                wagering_kwargs["model_perplexities"] = self._compute_option_distribution_perplexities(
+                    batch_logits_transposed
+                )
+
+            res_dict = self.wagering_method.compute_wagers(**wagering_kwargs)  # [batch_size, num_models]
             batch_wagers = res_dict["wagers"]
             # Aggregate predictions for batch
             batch_aggregated_log_probs, batch_aggregated_probs = self.aggregation_function.aggregate(
@@ -522,9 +590,8 @@ class WageringEvaluator:
         # Compute ECE
         ece = None
         try:
-            ece_metric = ECE(normalize=True, n_bins=20)
-            # ECE expects confidence (inverted uncertainty) and target (quality metric)
-            # For classification, we use max probability as confidence and correctness as target
+            ece_metric = ECE(n_bins=20)
+            # For classification, use max probability as confidence and correctness as target.
             confidences = all_aggregated_probs.max(axis=1)
             correctness = (all_predictions == labels).astype(float)
             ece = ece_metric(confidences.tolist(), correctness.tolist())
@@ -538,6 +605,8 @@ class WageringEvaluator:
         meta_acc = None
         meta_nll = None
         meta_auc = None
+        kendall_tau = None
+        best_model_mrr = None
         try:
             # Get model logits in the right format [num_examples, num_models, num_options]
             model_logits = np.transpose(all_model_logits, (1, 0, 2))
@@ -547,10 +616,18 @@ class WageringEvaluator:
             brier_d_regret = compute_brier_dynamic_regret(
                 model_logits, all_aggregated_probs, labels
             )
-            meta_metrics = compute_meta_metrics(wagers_history, best_expert_ids)
+            model_brier_scores = _compute_model_brier_scores(model_logits, labels)
+
+            meta_metrics = compute_meta_metrics(
+                wagers_history,
+                best_expert_ids,
+                model_brier_scores,
+            )
             meta_acc = meta_metrics["meta_acc"]
             meta_nll = meta_metrics["meta_nll"]
             meta_auc = meta_metrics["meta_auc"]
+            kendall_tau = meta_metrics["kendall_tau"]
+            best_model_mrr = meta_metrics["best_model_mrr"]
         except Exception as e:
             log.warning(f"Could not compute d_regret/meta metrics: {e}")
         
@@ -571,6 +648,8 @@ class WageringEvaluator:
             "meta_acc": meta_acc,
             "meta_nll": meta_nll,
             "meta_auc": meta_auc,
+            "kendall_tau": kendall_tau,
+            "best_model_mrr": best_model_mrr,
         }
         
         brier_str = f"{brier:.4f}" if brier is not None and not np.isnan(brier) else "N/A"
@@ -579,8 +658,11 @@ class WageringEvaluator:
         d_regret_str = f"{d_regret:.4f}" if d_regret is not None and not np.isnan(d_regret) else "N/A"
         brier_d_regret_str = f"{brier_d_regret:.4f}" if brier_d_regret is not None and not np.isnan(brier_d_regret) else "N/A"
         meta_acc_str = f"{meta_acc:.4f}" if meta_acc is not None and not np.isnan(meta_acc) else "N/A"
+        kendall_tau_str = f"{kendall_tau:.4f}" if kendall_tau is not None and not np.isnan(kendall_tau) else "N/A"
+        best_model_mrr_str = f"{best_model_mrr:.4f}" if best_model_mrr is not None and not np.isnan(best_model_mrr) else "N/A"
         log.info(f"{dataset_name} - Accuracy: {accuracy:.4f}, NLL: {nll:.4f}, Brier: {brier_str}, AUC: {auc_str}, ECE: {ece_str}, "
-             f"DRegret: {d_regret_str}, BrierDRegret: {brier_d_regret_str}, MetaAcc: {meta_acc_str}")
+               f"DRegret: {d_regret_str}, BrierDRegret: {brier_d_regret_str}, MetaAcc: {meta_acc_str}, "
+               f"KendallTau: {kendall_tau_str}, BestModelMRR: {best_model_mrr_str}")
         
         # Log average wagers per model
         avg_wagers = np.mean(wagers_history, axis=0)
@@ -633,6 +715,8 @@ class WageringEvaluator:
                 "meta_acc": meta_acc if meta_acc is not None and not np.isnan(meta_acc) else None,
                 "meta_nll": meta_nll if meta_nll is not None and not np.isnan(meta_nll) else None,
                 "meta_auc": meta_auc if meta_auc is not None and not np.isnan(meta_auc) else None,
+                "kendall_tau": kendall_tau if kendall_tau is not None and not np.isnan(kendall_tau) else None,
+                "best_model_mrr": best_model_mrr if best_model_mrr is not None and not np.isnan(best_model_mrr) else None,
             }
 
             primary_final_prefix = f"{log_prefix}/{dataset_name}/final"

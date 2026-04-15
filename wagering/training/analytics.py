@@ -40,6 +40,7 @@ class WageringAnalytics:
         checkpoint_dir: Optional[Path] = None,
         dataset_size: Optional[int] = None,
         early_stopping_criterion: str = "validation",
+        use_brier_d_regret_for_early_stopping: bool = True,
     ) -> pd.DataFrame:
         """
         Create analytics dataframe for training results.
@@ -53,6 +54,8 @@ class WageringAnalytics:
             shuffle_seed: Seed for data shuffling
             early_stopping_patience: Early stopping patience
             early_stopping_criterion: Early stopping strategy name
+            use_brier_d_regret_for_early_stopping: Whether Brier dynamic regret is used
+                as the monitored early stopping metric.
             save_every: Save frequency
             results: Training results dictionary
             metadata: Optional metadata dict with model_names, dataset_names
@@ -104,6 +107,7 @@ class WageringAnalytics:
         row["shuffle_seed"] = shuffle_seed
         row["early_stopping_patience"] = early_stopping_patience
         row["early_stopping_criterion"] = early_stopping_criterion
+        row["use_brier_d_regret_for_early_stopping"] = bool(use_brier_d_regret_for_early_stopping)
         row["save_every"] = save_every
         
         # Dataset size (included in settings_hash to distinguish different settings)
@@ -246,11 +250,15 @@ class WageringAnalytics:
             row["brier"] = results.get("brier") if results.get("brier") is not None and not np.isnan(results.get("brier", np.nan)) else None
             row["auc"] = results.get("auc") if results.get("auc") is not None and not np.isnan(results.get("auc", np.nan)) else None
             row["ece"] = results.get("ece") if results.get("ece") is not None and not np.isnan(results.get("ece", np.nan)) else None
+            row["tv_distance"] = results.get("tv_distance") if results.get("tv_distance") is not None and not np.isnan(results.get("tv_distance", np.nan)) else None
+            row["kl_divergence"] = results.get("kl_divergence") if results.get("kl_divergence") is not None and not np.isnan(results.get("kl_divergence", np.nan)) else None
             row["d_regret"] = results.get("d_regret") if results.get("d_regret") is not None and not np.isnan(results.get("d_regret", np.nan)) else None
             row["brier_d_regret"] = results.get("brier_d_regret") if results.get("brier_d_regret") is not None and not np.isnan(results.get("brier_d_regret", np.nan)) else None
             row["meta_acc"] = results.get("meta_acc") if results.get("meta_acc") is not None and not np.isnan(results.get("meta_acc", np.nan)) else None
             row["meta_nll"] = results.get("meta_nll") if results.get("meta_nll") is not None and not np.isnan(results.get("meta_nll", np.nan)) else None
             row["meta_auc"] = results.get("meta_auc") if results.get("meta_auc") is not None and not np.isnan(results.get("meta_auc", np.nan)) else None
+            row["kendall_tau"] = results.get("kendall_tau") if results.get("kendall_tau") is not None and not np.isnan(results.get("kendall_tau", np.nan)) else None
+            row["best_model_mrr"] = results.get("best_model_mrr") if results.get("best_model_mrr") is not None and not np.isnan(results.get("best_model_mrr", np.nan)) else None
             row["num_examples"] = results.get("num_examples")
         
         # Mark as evaluation results
@@ -304,7 +312,11 @@ class WageringAnalytics:
             ]
             result_columns = [
                 col for col in combined_df.columns
-                if (col.startswith('final_') or col in ['accuracy', 'nll', 'brier', 'auc', 'ece', 'num_examples', 'd_regret', 'brier_d_regret', 'meta_acc', 'meta_nll', 'meta_auc'])
+                if (col.startswith('final_') or col in [
+                    'accuracy', 'nll', 'brier', 'auc', 'ece', 'tv_distance', 'kl_divergence', 'num_examples',
+                    'd_regret', 'brier_d_regret', 'meta_acc', 'meta_nll', 'meta_auc',
+                    'kendall_tau', 'best_model_mrr',
+                ])
                 or (col not in settings_columns and pd.api.types.is_numeric_dtype(combined_df[col]))
             ]
         

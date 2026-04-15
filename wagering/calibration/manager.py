@@ -627,6 +627,7 @@ def _collect_calibration_arrays(
                     list(option_tokens),
                     model_identifier=str(model_path),
                     model_index=model_idx,
+                    hidden_state_layers=[-1],
                 )
                 set_cached_logits_and_hidden_states_for_model(
                     model,
@@ -637,6 +638,7 @@ def _collect_calibration_arrays(
                     model_labels,
                     prompt_variant=prompt_variant,
                     model_index=model_idx,
+                    hidden_state_layers=[-1],
                 )
                 model_hidden_states = extract_hidden_state_features(model_hidden_states_all_layers, [-1])
                 if model_hidden_states is None:
@@ -829,14 +831,24 @@ def fit_or_load_logit_calibrator(
     )
     artifact_file = artifact_dir / AdaptiveTemperatureCalibrator.artifact_name
     reuse_existing = bool(calibration_config.get("reuse_existing", True))
+    ensemble_paths = [model_cfg["path"] for model_cfg in args["models"]]
+    all_slots_share_model = len(set(ensemble_paths)) == 1
     if artifact_file.exists() and reuse_existing and not force_refit:
         calibrator = AdaptiveTemperatureCalibrator.load_pretrained(
             artifact_dir,
             device=str(calibration_config.get("device", "cpu")),
-            slot_model_paths=None,
+            slot_model_paths=ensemble_paths,
         )
-        log.info("Loaded existing temperature calibrator from %s", artifact_dir)
-        return calibrator, str(artifact_dir), False
+        if all_slots_share_model and not getattr(calibrator, "_canonical_unique_heads", False):
+            log.warning(
+                "Existing calibrator at %s uses per-slot heads even though all ensemble slots share model path %s. "
+                "Refitting canonical shared-head calibrator.",
+                artifact_dir,
+                ensemble_paths[0],
+            )
+        else:
+            log.info("Loaded existing temperature calibrator from %s", artifact_dir)
+            return calibrator, str(artifact_dir), False
 
     dataset_split_seed = int(args.get("dataset_split_seed", 42))
     datasets, dataset_names = load_datasets_from_config(
@@ -847,10 +859,17 @@ def fit_or_load_logit_calibrator(
     log.info("Loaded %d calibration datasets: %s", len(datasets), dataset_names)
 
     pubmedqa_context_seed = dataset_split_seed
+    pubmedqa_context_policy = str(
+        calibration_config.get(
+            "pubmedqa_context_policy",
+            args.get("pubmedqa_context_policy", "single_with_context"),
+        )
+    )
     pubmedqa_assignments = assign_pubmedqa_context_models(
         datasets,
         [model_cfg["path"] for model_cfg in args["models"]],
         random_seed=pubmedqa_context_seed,
+        context_policy=pubmedqa_context_policy,
     )
     for dataset_idx, assignment_info in pubmedqa_assignments.items():
         dataset_name = dataset_names[dataset_idx] if dataset_idx < len(dataset_names) else f"dataset_{dataset_idx}"
@@ -892,19 +911,49 @@ def fit_or_load_logit_calibrator(
         shuffle_seed=int(calibration_config.get("shuffle_seed", 42)),
     )
 
-    ensemble_paths = [model_cfg["path"] for model_cfg in args["models"]]
-    calibrator = AdaptiveTemperatureCalibrator(
-        model_paths=ensemble_paths,
-        input_dims=[hidden_state.shape[1] for hidden_state in all_hidden_states],
-        config=calibration_config,
-        slot_model_paths=None,
-        canonical_unique_heads=False,
-    )
-    metrics = calibrator.fit(
-        all_model_logits=all_model_logits,
-        all_hidden_states=all_hidden_states,
-        labels=labels,
-    )
+    if all_slots_share_model:
+        # When all ensemble entries point to the same HF model path, calibrating
+        # separate per-slot heads introduces artificial slot-specific differences.
+        # Train one shared canonical head and map every slot to it.
+        shared_path = ensemble_paths[0]
+        shared_logits = np.concatenate(
+            [all_model_logits[slot_idx] for slot_idx in range(all_model_logits.shape[0])],
+            axis=0,
+        )
+        shared_hidden = np.concatenate(
+            [all_hidden_states[slot_idx] for slot_idx in range(len(all_hidden_states))],
+            axis=0,
+        )
+        shared_labels = np.concatenate(
+            [labels for _ in range(all_model_logits.shape[0])],
+            axis=0,
+        )
+
+        calibrator = AdaptiveTemperatureCalibrator(
+            model_paths=[shared_path],
+            input_dims=[shared_hidden.shape[1]],
+            config=calibration_config,
+            slot_model_paths=ensemble_paths,
+            canonical_unique_heads=True,
+        )
+        metrics = calibrator.fit(
+            all_model_logits=shared_logits[np.newaxis, :, :],
+            all_hidden_states=[shared_hidden],
+            labels=shared_labels,
+        )
+    else:
+        calibrator = AdaptiveTemperatureCalibrator(
+            model_paths=ensemble_paths,
+            input_dims=[hidden_state.shape[1] for hidden_state in all_hidden_states],
+            config=calibration_config,
+            slot_model_paths=None,
+            canonical_unique_heads=False,
+        )
+        metrics = calibrator.fit(
+            all_model_logits=all_model_logits,
+            all_hidden_states=all_hidden_states,
+            labels=labels,
+        )
     calibrator.save_pretrained(artifact_dir)
     log.info("Saved temperature calibrator to %s", artifact_dir)
     log.info("Calibration metrics: %s", metrics)

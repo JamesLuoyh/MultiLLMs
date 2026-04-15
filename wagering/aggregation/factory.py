@@ -8,6 +8,7 @@ from typing import Dict, Any, Optional
 from .base import AggregationFunction
 from .linear_pooling import LinearPooling
 from .logarithmic_pooling import LogarithmicPooling
+from .majority_vote import MajorityVote
 
 log = logging.getLogger("wagering")
 
@@ -37,6 +38,9 @@ def load_aggregation_function(
         "logarithmic_pooling": LogarithmicPooling,
         "weighted_log_pooling": LogarithmicPooling,
         "log_pooling": LogarithmicPooling,
+        "majority_vote": MajorityVote,
+        "majority_voting": MajorityVote,
+        "argmax_vote": MajorityVote,
     }
     
     if method_name in methods:

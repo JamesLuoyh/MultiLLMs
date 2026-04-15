@@ -59,6 +59,8 @@ class DecentralizedWagers(WageringMethod):
         self.normalize_hidden_states = config.get("normalize_hidden_states", True)  # L2 normalize hidden states
         self.device_str = str(config.get("device", "cuda" if torch.cuda.is_available() else "cpu"))
         self.device = torch.device(self.device_str)
+        self.hidden_state_layers = config.get("hidden_state_layers", [-1])
+        self.hidden_state_layers_per_model = config.get("hidden_state_layers_per_model")
         
         # Build per-model projection layers to handle variable hidden dimensions
         # These will be created dynamically when we first see the hidden states

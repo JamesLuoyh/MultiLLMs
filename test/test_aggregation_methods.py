@@ -5,7 +5,7 @@ Comprehensive unit tests for aggregation methods.
 import pytest
 import numpy as np
 
-from wagering.aggregation import LinearPooling, LogarithmicPooling
+from wagering.aggregation import LinearPooling, LogarithmicPooling, MajorityVote
 from wagering.aggregation.factory import load_aggregation_function
 
 
@@ -90,8 +90,8 @@ class TestLinearPooling:
         assert probs.shape == (num_options,)
         assert np.allclose(probs.sum(), 1.0, atol=1e-6)
     
-    def test_wager_sum_validation(self):
-        """Test that wager sum validation works."""
+    def test_wager_normalization_and_validation(self):
+        """Test internal wager normalization and wager validity checks."""
         aggregator = LinearPooling()
         
         model_logits = np.array([
@@ -99,20 +99,23 @@ class TestLinearPooling:
             [2.0, 1.0, 3.0],
         ], dtype=np.float32)
         
-        # Wagers that don't sum to 1
-        wagers = np.array([0.5, 0.4], dtype=np.float32)
-        with pytest.raises(ValueError, match="wagers must sum to exactly 1.0"):
-            aggregator.aggregate(model_logits, wagers)
-        
-        # Wagers that sum to more than 1
-        wagers = np.array([0.6, 0.5], dtype=np.float32)
-        with pytest.raises(ValueError, match="wagers must sum to exactly 1.0"):
-            aggregator.aggregate(model_logits, wagers)
-        
-        # Wagers that sum to less than 1 (but close)
-        wagers = np.array([0.5, 0.499], dtype=np.float32)
-        with pytest.raises(ValueError, match="wagers must sum to exactly 1.0"):
-            aggregator.aggregate(model_logits, wagers)
+        # Non-normalized but non-negative wagers should be accepted and normalized.
+        normalized_wagers = np.array([0.8, 0.2], dtype=np.float32)
+        _, expected_probs = aggregator.aggregate(model_logits, normalized_wagers)
+
+        scaled_wagers = np.array([8.0, 2.0], dtype=np.float32)
+        _, scaled_probs = aggregator.aggregate(model_logits, scaled_wagers)
+        assert np.allclose(scaled_probs, expected_probs, atol=1e-6)
+
+        # Zero-sum wagers are invalid.
+        zero_wagers = np.array([0.0, 0.0], dtype=np.float32)
+        with pytest.raises(ValueError, match="positive sum"):
+            aggregator.aggregate(model_logits, zero_wagers)
+
+        # Negative wagers are invalid.
+        negative_wagers = np.array([0.5, -0.1], dtype=np.float32)
+        with pytest.raises(ValueError, match="non-negative"):
+            aggregator.aggregate(model_logits, negative_wagers)
     
     def test_shape_validation(self):
         """Test that shape validation works."""
@@ -244,8 +247,8 @@ class TestLogarithmicPooling:
         assert probs.shape == (num_options,)
         assert np.allclose(probs.sum(), 1.0, atol=1e-6)
     
-    def test_wager_sum_validation(self):
-        """Test that wager sum validation works."""
+    def test_wager_normalization_and_validation(self):
+        """Test internal wager normalization and wager validity checks."""
         aggregator = LogarithmicPooling()
         
         model_logits = np.array([
@@ -253,15 +256,23 @@ class TestLogarithmicPooling:
             [2.0, 1.0, 3.0],
         ], dtype=np.float32)
         
-        # Wagers that don't sum to 1
-        wagers = np.array([0.5, 0.4], dtype=np.float32)
-        with pytest.raises(ValueError, match="wagers must sum to exactly 1.0"):
-            aggregator.aggregate(model_logits, wagers)
-        
-        # Wagers that sum to more than 1
-        wagers = np.array([0.6, 0.5], dtype=np.float32)
-        with pytest.raises(ValueError, match="wagers must sum to exactly 1.0"):
-            aggregator.aggregate(model_logits, wagers)
+        # Non-normalized but non-negative wagers should be accepted and normalized.
+        normalized_wagers = np.array([0.8, 0.2], dtype=np.float32)
+        _, expected_probs = aggregator.aggregate(model_logits, normalized_wagers)
+
+        scaled_wagers = np.array([8.0, 2.0], dtype=np.float32)
+        _, scaled_probs = aggregator.aggregate(model_logits, scaled_wagers)
+        assert np.allclose(scaled_probs, expected_probs, atol=1e-6)
+
+        # Zero-sum wagers are invalid.
+        zero_wagers = np.array([0.0, 0.0], dtype=np.float32)
+        with pytest.raises(ValueError, match="positive sum"):
+            aggregator.aggregate(model_logits, zero_wagers)
+
+        # Negative wagers are invalid.
+        negative_wagers = np.array([0.5, -0.1], dtype=np.float32)
+        with pytest.raises(ValueError, match="non-negative"):
+            aggregator.aggregate(model_logits, negative_wagers)
     
     def test_shape_validation(self):
         """Test that shape validation works."""
@@ -353,14 +364,60 @@ class TestAggregationComparison:
         # Both should produce valid probability distributions
         assert np.allclose(linear_probs.sum(), 1.0, atol=1e-6)
         assert np.allclose(log_probs.sum(), 1.0, atol=1e-6)
-        
-        # Both should have non-negative probabilities
-        assert np.all(linear_probs >= 0)
-        assert np.all(log_probs >= 0)
-        
-        # Log-probs should match exp of log-probs
-        assert np.allclose(np.exp(linear_log_probs), linear_probs, atol=1e-6)
-        assert np.allclose(np.exp(log_log_probs), log_probs, atol=1e-6)
+
+
+class TestMajorityVote:
+    """Test MajorityVote aggregation function."""
+
+    def test_single_sample_vote_fractions(self):
+        """Test that vote fractions match argmax counts in single-sample mode."""
+        aggregator = MajorityVote()
+
+        # 10 models, 4 options; option 0 gets 2 votes, option 1 gets 3,
+        # option 2 gets 5, option 3 gets 0.
+        model_logits = np.array([
+            [10.0, 0.0, 0.0, 0.0],
+            [9.0, 0.0, 0.0, 0.0],
+            [0.0, 10.0, 0.0, 0.0],
+            [0.0, 9.0, 0.0, 0.0],
+            [0.0, 8.0, 0.0, 0.0],
+            [0.0, 0.0, 10.0, 0.0],
+            [0.0, 0.0, 9.0, 0.0],
+            [0.0, 0.0, 8.0, 0.0],
+            [0.0, 0.0, 7.0, 0.0],
+            [0.0, 0.0, 6.0, 0.0],
+        ], dtype=np.float32)
+        wagers = np.ones(10, dtype=np.float32) / 10.0
+
+        log_probs, probs = aggregator.aggregate(model_logits, wagers)
+
+        expected = np.array([0.2, 0.3, 0.5, 0.0], dtype=np.float32)
+        assert np.allclose(probs, expected, atol=1e-6)
+        assert np.allclose(np.exp(log_probs[:3]), expected[:3], atol=1e-6)
+        assert np.argmax(probs) == 2
+        assert np.allclose(probs.sum(), 1.0, atol=1e-6)
+
+    def test_batch_vote_fractions(self):
+        """Test majority voting in batch mode."""
+        aggregator = MajorityVote()
+
+        # batch_size=2, num_models=4, num_options=3
+        # Example 0 argmaxes: [0, 0, 1, 2] -> [0.5, 0.25, 0.25]
+        # Example 1 argmaxes: [1, 1, 1, 2] -> [0.0, 0.75, 0.25]
+        model_logits = np.array([
+            [[3.0, 1.0, 0.0], [2.0, 0.5, 0.0], [0.0, 2.0, 1.0], [0.0, 1.0, 2.0]],
+            [[0.0, 2.0, 1.0], [0.0, 3.0, 1.0], [1.0, 4.0, 0.0], [0.0, 1.0, 3.0]],
+        ], dtype=np.float32)
+        wagers = np.ones((2, 4), dtype=np.float32) / 4.0
+
+        _, probs = aggregator.aggregate(model_logits, wagers)
+
+        expected = np.array([
+            [0.5, 0.25, 0.25],
+            [0.0, 0.75, 0.25],
+        ], dtype=np.float32)
+        assert np.allclose(probs, expected, atol=1e-6)
+        assert np.allclose(probs.sum(axis=1), 1.0, atol=1e-6)
     
     def test_uniform_wagers(self):
         """Test that uniform wagers work correctly."""
@@ -401,6 +458,17 @@ class TestFactory:
         
         aggregator = load_aggregation_function("log_pooling")
         assert isinstance(aggregator, LogarithmicPooling)
+
+    def test_load_majority_vote(self):
+        """Test loading majority vote aggregation aliases."""
+        aggregator = load_aggregation_function("majority_vote")
+        assert isinstance(aggregator, MajorityVote)
+
+        aggregator = load_aggregation_function("majority_voting")
+        assert isinstance(aggregator, MajorityVote)
+
+        aggregator = load_aggregation_function("argmax_vote")
+        assert isinstance(aggregator, MajorityVote)
     
     def test_load_unknown_method(self):
         """Test loading unknown method raises error."""

@@ -56,7 +56,7 @@ save_every: 1  # Save after each batch
 # Training options
 auto_resume: true  # Automatically resume from latest checkpoint if available
 shuffle_data: true  # Shuffle training data across datasets
-shuffle_seed: 999  # Random seed for shuffling
+shuffle_seed: 18 #18 #999  # Random seed for shuffling
 early_stopping_patience: 100  # Stop training if no improvement for N steps (0 to disable)
 
 # Wandb logging (optional)

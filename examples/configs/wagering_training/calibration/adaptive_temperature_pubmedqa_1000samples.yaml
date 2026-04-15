@@ -23,5 +23,5 @@ max_temperature: 10.0
 init_temperature: 1.0
 balance_datasets: false
 reuse_existing: true
-shuffle_seed: 42
+shuffle_seed: 18 #18 #18 #42
 device: cuda:0

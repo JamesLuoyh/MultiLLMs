@@ -14,7 +14,7 @@ class LinearPooling(AggregationFunction):
     Linear pooling: weighted average of probabilities from each model.
     
     Linear pooling aggregates probabilities directly: A = sum_i w_i * P_i(H|E_i)
-    where sum_i w_i = 1.
+    where w_i >= 0 and wagers are normalized internally.
     """
     
     def aggregate(
@@ -36,9 +36,6 @@ class LinearPooling(AggregationFunction):
         model_logits = np.asarray(model_logits, dtype=np.float32)
         wagers = np.asarray(wagers, dtype=np.float32)
         
-        if not np.allclose(np.sum(wagers, axis=-1), 1.0):
-            raise ValueError("Wagers must sum to 1")
-        
         # Batch mode
         if model_logits.ndim == 3 and wagers.ndim == 2:
             batch_size, num_models, num_options = model_logits.shape
@@ -48,6 +45,15 @@ class LinearPooling(AggregationFunction):
                     f"Wagers shape mismatch: expected [{batch_size}, {num_models}], "
                     f"got {wagers.shape}"
                 )
+
+            if np.any(wagers < 0):
+                raise ValueError("Wagers must be non-negative")
+
+            wager_sums = np.sum(wagers, axis=1, keepdims=True)
+            if np.any(wager_sums <= 1e-10):
+                raise ValueError("Wagers must have positive sum")
+
+            normalized_wagers = wagers / wager_sums
             
             # Softmax to get probabilities
             max_logits = np.max(model_logits, axis=2, keepdims=True)
@@ -56,7 +62,7 @@ class LinearPooling(AggregationFunction):
             probs = exp_stabilized / exp_stabilized.sum(axis=2, keepdims=True)
             
             # Weighted average
-            aggregated_probs = (wagers[:, :, None] * probs).sum(axis=1)
+            aggregated_probs = (normalized_wagers[:, :, None] * probs).sum(axis=1)
             
             if np.any(np.isnan(aggregated_probs)) or np.any(np.isinf(aggregated_probs)):
                 raise ValueError("Invalid aggregated probabilities (NaN or inf detected)")
@@ -86,9 +92,15 @@ class LinearPooling(AggregationFunction):
         elif model_logits.ndim == 2 and wagers.ndim == 1:
             if wagers.shape[0] != model_logits.shape[0]:
                 raise ValueError("Wagers shape must match number of models")
-            
-            if not np.isclose(np.sum(wagers), 1.0, atol=1e-6):
-                raise ValueError(f"Wagers must sum to 1.0, got {np.sum(wagers)}")
+
+            if np.any(wagers < 0):
+                raise ValueError("Wagers must be non-negative")
+
+            wager_sum = np.sum(wagers)
+            if wager_sum <= 1e-10:
+                raise ValueError("Wagers must have positive sum")
+
+            normalized_wagers = wagers / wager_sum
             
             # Softmax to get probabilities
             max_logits = np.max(model_logits, axis=1, keepdims=True)
@@ -97,7 +109,7 @@ class LinearPooling(AggregationFunction):
             probs = exp_stabilized / exp_stabilized.sum(axis=1, keepdims=True)
             
             # Weighted average
-            pooled_probs = (wagers[:, None] * probs).sum(axis=0)
+            pooled_probs = (normalized_wagers[:, None] * probs).sum(axis=0)
             pooled_probs = pooled_probs / pooled_probs.sum()
             
             # Validate
@@ -134,15 +146,31 @@ class LinearPooling(AggregationFunction):
         """
         # Batch mode
         if model_logits.ndim == 3 and wagers.ndim == 2:
+            if torch.any(wagers < 0):
+                raise ValueError("Wagers must be non-negative")
+
+            wager_sums = wagers.sum(dim=1, keepdim=True)
+            if torch.any(wager_sums <= 1e-10):
+                raise ValueError("Wagers must have positive sum")
+
+            normalized_wagers = wagers / wager_sums
             model_probs = torch.softmax(model_logits, dim=2)
-            aggregated_probs = (wagers.unsqueeze(2) * model_probs).sum(dim=1)
+            aggregated_probs = (normalized_wagers.unsqueeze(2) * model_probs).sum(dim=1)
             aggregated_probs = aggregated_probs / aggregated_probs.sum(dim=1, keepdim=True)
             return aggregated_probs
         
         # Single sample mode
         elif model_logits.ndim == 2 and wagers.ndim == 1:
+            if torch.any(wagers < 0):
+                raise ValueError("Wagers must be non-negative")
+
+            wager_sum = wagers.sum()
+            if wager_sum <= 1e-10:
+                raise ValueError("Wagers must have positive sum")
+
+            normalized_wagers = wagers / wager_sum
             model_probs = torch.softmax(model_logits, dim=1)
-            aggregated_probs = (wagers.unsqueeze(1) * model_probs).sum(dim=0)
+            aggregated_probs = (normalized_wagers.unsqueeze(1) * model_probs).sum(dim=0)
             aggregated_probs = aggregated_probs / aggregated_probs.sum()
             return aggregated_probs
         

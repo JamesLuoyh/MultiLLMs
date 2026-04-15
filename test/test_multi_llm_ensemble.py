@@ -2,6 +2,7 @@ import numpy as np
 
 from wagering.utils.multi_llm_ensemble import (
     aggregate_logits_log_pooling,
+    resolve_hidden_state_layers_for_model,
     run_online_ensemble,
 )
 
@@ -67,6 +68,25 @@ def test_run_online_ensemble_wagers_history_shape_and_update():
         np.ones(num_models, dtype=np.float32) / float(num_models),
         atol=1e-6,
     )
+
+
+def test_resolve_hidden_state_layers_for_model_shared_layers():
+    assert resolve_hidden_state_layers_for_model([-1], None, model_index=0, num_models=4) == [-1]
+    assert resolve_hidden_state_layers_for_model([0, -2], None, model_index=3, num_models=4) == [0, -2]
+
+
+def test_resolve_hidden_state_layers_for_model_per_model_list():
+    cfg = [-4, -3, -2, -1]
+    assert resolve_hidden_state_layers_for_model(None, cfg, model_index=0, num_models=4) == [-4]
+    assert resolve_hidden_state_layers_for_model(None, cfg, model_index=1, num_models=4) == [-3]
+    assert resolve_hidden_state_layers_for_model(None, cfg, model_index=2, num_models=4) == [-2]
+    assert resolve_hidden_state_layers_for_model(None, cfg, model_index=3, num_models=4) == [-1]
+
+
+def test_resolve_hidden_state_layers_for_model_per_model_dict():
+    cfg = {"0": -4, 1: [-2, -1]}
+    assert resolve_hidden_state_layers_for_model(None, cfg, model_index=0, num_models=2) == [-4]
+    assert resolve_hidden_state_layers_for_model(None, cfg, model_index=1, num_models=2) == [-2, -1]
 
 
 

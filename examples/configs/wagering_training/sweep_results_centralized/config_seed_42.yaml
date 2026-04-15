@@ -33,7 +33,7 @@ save_every: 100
 training_batch_size: 100
 auto_resume: true
 shuffle_data: true
-shuffle_seed: 42
+shuffle_seed: 18 #42
 early_stopping_patience: 10
 report_to_wandb: true
 wandb_project: multi-llm-wagering

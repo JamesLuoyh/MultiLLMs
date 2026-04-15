@@ -134,8 +134,8 @@ class TestLinearPooling:
         with pytest.raises(ValueError):
             aggregator.aggregate(model_logits, wagers)
     
-    def test_aggregate_wager_sum_validation(self):
-        """Test that wager sum validation works."""
+    def test_aggregate_wager_normalization_and_validation(self):
+        """Test internal wager normalization and wager validity checks."""
         aggregator = LinearPooling()
         
         model_logits = np.array([
@@ -143,15 +143,18 @@ class TestLinearPooling:
             [2.0, 1.0, 3.0],
         ])
         
-        # Wagers that don't sum to 1
-        wagers = np.array([0.5, 0.4])
-        with pytest.raises(ValueError, match="wagers must sum to exactly 1.0"):
-            aggregator.aggregate(model_logits, wagers)
-        
-        # Wagers that sum to more than 1
-        wagers = np.array([0.6, 0.5])
-        with pytest.raises(ValueError, match="wagers must sum to exactly 1.0"):
-            aggregator.aggregate(model_logits, wagers)
+        # Non-normalized but non-negative wagers should be accepted and normalized.
+        _, probs_normalized = aggregator.aggregate(model_logits, np.array([0.6, 0.4]))
+        _, probs_scaled = aggregator.aggregate(model_logits, np.array([6.0, 4.0]))
+        assert np.allclose(probs_normalized, probs_scaled, atol=1e-6)
+
+        # Negative wagers are invalid.
+        with pytest.raises(ValueError, match="non-negative"):
+            aggregator.aggregate(model_logits, np.array([0.6, -0.1]))
+
+        # Zero-sum wagers are invalid.
+        with pytest.raises(ValueError, match="positive sum"):
+            aggregator.aggregate(model_logits, np.array([0.0, 0.0]))
 
 
 class TestWageringFactory:

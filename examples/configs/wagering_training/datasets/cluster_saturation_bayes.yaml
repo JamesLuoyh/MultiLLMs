@@ -1,0 +1,19 @@
+# Synthetic Bayesian cluster-saturation forecasting dataset.
+# Generate first with:
+# python scripts/generate_cluster_saturation_bayes_dataset.py --output-path workdir/datasets/cluster_saturation_bayes.csv
+name: workdir/datasets/cluster_saturation_bayes.csv
+display_name: cluster_saturation_bayes
+text_column: prior_prob
+label_column: binary_label
+probability_label_column: posterior_prob
+positive_label: "1"
+batch_size: 5
+instruct: false
+mixed_context_routing: pubmedqa
+balanced_binary_split: true
+balanced_split_ratios: [0.8, 0.1, 0.1]
+balanced_train_target_split: train_val
+balanced_eval_target_split: test
+split_seed: 18
+prompt: "A central load-balancing mechanism must forecast compute cluster saturation. Let the state space be Omega = {{0, 1}}. Let S in Omega be the random variable indicating whether the primary compute cluster will become saturated (>95% capacity) within the next 10 minutes, where S=1 denotes saturation. Based on current time-of-day traffic models, the prior probability of saturation is P(S=1) = {prior_prob:.4f}.\n\nUpdate Rule: To improve forecasting, the mechanism queries a lightweight, predictive monitoring agent. Let W in Omega be the random variable representing the agent's output warning. The agent possesses the following conditional probabilities: True Positive Rate (Probability of a warning given imminent saturation): P(W=1|S=1) = {tpr:.4f}. False Positive Rate (Probability of a warning given normal loads): P(W=1|S=0) = {fpr:.4f}.\n\nEvidence: The monitoring agent analyzes the telemetry and outputs W={evidence}.\n\nQuestion: Determine if it is more likely than not (with probability > 0.5) that the cluster will saturate. Output exactly one character: 1 if P(S=1|W=evidence) > 0.5, or 0 otherwise. Provide no other text."
+prompt_without_context: "A central load-balancing mechanism must forecast compute cluster saturation. Let the state space be Omega = {{0, 1}}. Let S in Omega be the random variable indicating whether the primary compute cluster will become saturated (>95% capacity) within the next 10 minutes, where S=1 denotes saturation. Based on current time-of-day traffic models, the prior probability of saturation is P(S=1) = {prior_prob:.4f}.\n\nUpdate Rule: To improve forecasting, the mechanism queries a lightweight, predictive monitoring agent. Let W in Omega be the random variable representing the agent's output warning. The agent possesses the following conditional probabilities: True Positive Rate (Probability of a warning given imminent saturation): P(W=1|S=1) = {tpr:.4f}. False Positive Rate (Probability of a warning given normal loads): P(W=1|S=0) = {fpr:.4f}.\n\nEvidence: The monitoring agent's output W is withheld for this participant.\n\nQuestion: Determine if it is more likely than not (with probability > 0.5) that the cluster will saturate. Output exactly one character: 1 if P(S=1|W=evidence) > 0.5, or 0 otherwise. Provide no other text."

@@ -4,11 +4,14 @@ Model loading utilities.
 Simplified version with strict error handling.
 """
 
+import json
 import logging
 import os
 import sys
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
+
+import torch
 
 # Ensure local project modules are importable
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -21,6 +24,64 @@ from wagering.core.common import load_external_module
 from wagering.core.generation_parameters import GenerationParametersFactory
 
 log = logging.getLogger(__name__)
+
+
+def _resolve_device_map_for_model(
+    model_cfg: Dict[str, Any],
+    model_index: int,
+    total_models: int,
+) -> Any:
+    """
+    Resolve a model's device map.
+
+    For multi-model runs, default `device_map: auto` can place every model on the
+    same GPU. To avoid this, distribute models round-robin across visible GPUs.
+    """
+    load_model_args = model_cfg.get("load_model_args", {}) or {}
+    requested_device_map = load_model_args.get("device_map", "auto")
+
+    if (
+        requested_device_map == "auto"
+        and total_models > 1
+        and torch.cuda.is_available()
+        and torch.cuda.device_count() > 0
+    ):
+        return f"cuda:{model_index % torch.cuda.device_count()}"
+
+    return requested_device_map
+
+
+def _align_max_memory_with_device_map(load_model_args: Dict[str, Any], device_map: Any) -> Dict[str, Any]:
+    """Align max_memory keys with explicit single-device CUDA mapping."""
+    if not isinstance(device_map, str) or not device_map.startswith("cuda:"):
+        return load_model_args
+
+    max_memory = load_model_args.get("max_memory")
+    if not isinstance(max_memory, dict) or not max_memory:
+        return load_model_args
+
+    try:
+        target_gpu = int(device_map.split(":", 1)[1])
+    except (TypeError, ValueError, IndexError):
+        return load_model_args
+
+    # Accept both int and string keys from YAML parsing.
+    if target_gpu in max_memory:
+        return load_model_args
+    if str(target_gpu) in max_memory:
+        return load_model_args
+
+    if 0 in max_memory:
+        source_value = max_memory[0]
+    elif "0" in max_memory:
+        source_value = max_memory["0"]
+    else:
+        # If no GPU-0 entry exists, use first entry as fallback.
+        source_value = next(iter(max_memory.values()))
+
+    load_model_args = dict(load_model_args)
+    load_model_args["max_memory"] = {target_gpu: source_value}
+    return load_model_args
 
 
 def load_api_keys() -> Dict[str, str]:
@@ -58,6 +119,7 @@ def load_api_keys() -> Dict[str, str]:
 def load_models_from_config(
     model_configs: List[Dict[str, Any]],
     cache_kwargs: Optional[Dict[str, Any]] = None,
+    share_identical_models: bool = True,
 ) -> Tuple[List[WhiteboxModel], List[str]]:
     """
     Load multiple whitebox models from configuration.
@@ -71,6 +133,8 @@ def load_models_from_config(
             - instruct: Whether model is instruction-tuned (optional, default False)
             - generation_params: Generation parameters (optional)
         cache_kwargs: Optional cache kwargs for model loading
+        share_identical_models: If True, identical model configs are loaded once
+            and the same WhiteboxModel instance is reused across ensemble slots
         
     Returns:
         Tuple of (list of WhiteboxModel instances, list of model names)
@@ -85,6 +149,8 @@ def load_models_from_config(
     cache_kwargs = cache_kwargs or {}
     models = []
     model_names = []
+    shared_model_cache: Dict[str, WhiteboxModel] = {}
+    shared_model_first_slot: Dict[str, int] = {}
     
     # Load API keys for HF token
     api_keys = load_api_keys()
@@ -92,13 +158,40 @@ def load_models_from_config(
     if hf_token is None:
         hf_token = api_keys.get("hf_token") or api_keys.get("huggingface_token")
     
+    total_models = len(model_configs)
+
     for i, model_cfg in enumerate(model_configs):
         if "path" not in model_cfg:
             raise ValueError(f"Model config {i} missing required 'path' field: {model_cfg}")
         
         model_path = model_cfg["path"]
         model_names.append(model_path.replace("/", "_"))
+
+        shared_model_key: Optional[str] = None
+        if share_identical_models:
+            try:
+                shared_model_key = json.dumps(model_cfg, sort_keys=True, default=str)
+            except TypeError:
+                shared_model_key = repr(model_cfg)
+
+            if shared_model_key in shared_model_cache:
+                models.append(shared_model_cache[shared_model_key])
+                first_slot = shared_model_first_slot[shared_model_key]
+                log.info(
+                    "Reusing loaded model for slot %s/%s: %s (shared with slot %s)",
+                    i + 1,
+                    total_models,
+                    model_path,
+                    first_slot + 1,
+                )
+                continue
         
+        resolved_device_map = _resolve_device_map_for_model(
+            model_cfg=model_cfg,
+            model_index=i,
+            total_models=total_models,
+        )
+
         # Use custom load script if provided
         if model_cfg.get("path_to_load_script"):
             load_script_path = model_cfg["path_to_load_script"]
@@ -124,6 +217,8 @@ def load_models_from_config(
             # Load model
             load_model_args = {"model_path": model_path}
             load_model_args.update(model_cfg.get("load_model_args", {}))
+            load_model_args["device_map"] = resolved_device_map
+            load_model_args = _align_max_memory_with_device_map(load_model_args, resolved_device_map)
             if hf_token is not None:
                 load_model_args["token"] = hf_token
             
@@ -163,18 +258,26 @@ def load_models_from_config(
         else:
             # Use default loading
             instruct = model_cfg.get("instruct", False)
-            device_map = model_cfg.get("load_model_args", {}).get("device_map", "auto")
             
             model = WhiteboxModel.from_pretrained(
                 model_path,
                 generation_params=model_cfg.get("generation_params", {}),
-                device_map=device_map,
+                device_map=resolved_device_map,
                 add_bos_token=model_cfg.get("add_bos_token", True),
                 instruct=instruct,
                 **cache_kwargs,
             )
         
         models.append(model)
-        log.info(f"Loaded model {i+1}/{len(model_configs)}: {model_path}")
+        if shared_model_key is not None:
+            shared_model_cache[shared_model_key] = model
+            shared_model_first_slot[shared_model_key] = i
+        log.info(
+            "Loaded model %s/%s: %s (device_map=%s)",
+            i + 1,
+            total_models,
+            model_path,
+            resolved_device_map,
+        )
     
     return models, model_names

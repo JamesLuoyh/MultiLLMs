@@ -48,7 +48,7 @@ training_batch_size: 100  # Batch size for training loop (different from batch s
 # Training options
 auto_resume: false  # Automatically resume from latest checkpoint if available
 shuffle_data: true  # Shuffle training data across datasets
-shuffle_seed: 42  # Random seed for shuffling (will be overridden by sweep)
+shuffle_seed: 18 #18 #42  # Random seed for shuffling (will be overridden by sweep)
 early_stopping_patience: 10  # Stop training if no improvement for 10 epochs (default: 10)
 validation_split_ratio: 0.1  # 10% of data for validation set (for early stopping)
 

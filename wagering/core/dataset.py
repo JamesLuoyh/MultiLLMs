@@ -8,12 +8,71 @@ import requests
 import io
 
 from sklearn.model_selection import train_test_split
-from datasets import load_dataset, Dataset as hf_dataset
+
+
+def _configure_default_hf_cache_env_early() -> None:
+    """Configure default HF cache env vars before importing datasets/huggingface_hub."""
+    if (
+        os.environ.get("HF_HOME")
+        or os.environ.get("HF_HUB_CACHE")
+        or os.environ.get("HUGGINGFACE_HUB_CACHE")
+        or os.environ.get("HF_DATASETS_CACHE")
+    ):
+        return
+
+    user = os.environ.get("USER", "").strip()
+    if not user:
+        return
+
+    shared_cache_root = f"/common/users/{user}/.cache"
+    if not os.path.isdir(shared_cache_root):
+        return
+
+    shared_hf_home = os.path.join(shared_cache_root, "huggingface")
+    if not os.path.isdir(shared_hf_home):
+        return
+
+    os.environ["HF_HOME"] = shared_hf_home
+    os.environ["HF_HUB_CACHE"] = os.path.join(shared_hf_home, "hub")
+    os.environ["HF_DATASETS_CACHE"] = os.path.join(shared_hf_home, "datasets")
+
+
+_configure_default_hf_cache_env_early()
+
+from datasets import DownloadConfig, load_dataset, Dataset as hf_dataset
 
 from typing import Iterable, Tuple, List, Union, Optional
 from PIL import Image
 
 log = logging.getLogger("wagering")
+
+
+def _configure_hf_cache_home_if_needed() -> None:
+    """Point HF cache env vars to a shared cache when the default home cache is missing."""
+    if (
+        os.environ.get("HF_HOME")
+        or os.environ.get("HF_HUB_CACHE")
+        or os.environ.get("HUGGINGFACE_HUB_CACHE")
+        or os.environ.get("HF_DATASETS_CACHE")
+    ):
+        return
+
+    default_hf_home = os.path.expanduser("~/.cache/huggingface")
+    if os.path.isdir(default_hf_home):
+        return
+
+    user = os.environ.get("USER", "").strip()
+    if not user:
+        return
+
+    shared_hf_home = f"/common/users/{user}/.cache/huggingface"
+    if not os.path.isdir(shared_hf_home):
+        return
+
+    os.environ["HF_HOME"] = shared_hf_home
+    os.environ["HF_HUB_CACHE"] = os.path.join(shared_hf_home, "hub")
+    os.environ["HF_DATASETS_CACHE"] = os.path.join(shared_hf_home, "datasets")
+    log.info("Using shared Hugging Face cache directory: %s", shared_hf_home)
 
 
 def _normalize_pubmedqa_label(label: object) -> Optional[str]:
@@ -85,6 +144,18 @@ def _build_pubmedqa_prompt(
         f"Question:\n{question}\n"
         f"Long Answer:\n{long_answer}\n"
         "Is the long answer provided correct or incorrect? "
+        "Answer with YES or NO. Answer:"
+    )
+
+
+def _build_pubmedqa_context_only_prompt(
+    question: str,
+    context_text: str,
+) -> str:
+    return (
+        f"Question:\n{question}\n"
+        f"Context:\n{context_text}\n"
+        "Based only on the context, is the answer to the question YES or NO? "
         "Answer with YES or NO. Answer:"
     )
 
@@ -256,13 +327,99 @@ class Dataset:
             batch_size (int): the size of the texts batch.
         """
         csv = pd.read_csv(csv_path)
-        x = csv[x_column].tolist()
+
+        if x_column in csv.columns:
+            raw_x = csv[x_column].tolist()
+        elif len(prompt):
+            # Prompt templates can be rendered from arbitrary CSV columns,
+            # so the text column can be omitted for compact variable-only datasets.
+            raw_x = [""] * len(csv)
+        else:
+            raise ValueError(
+                f"x_column='{x_column}' not found in CSV columns and no prompt template was provided"
+            )
+
+        x = raw_x
         y = csv[y_column].tolist()
 
-        if len(prompt):
-            x = [prompt.format(text=text) for text in x]
+        prompt_without_context = str(kwargs.get("prompt_without_context", "") or "")
+        mixed_context_routing = str(kwargs.get("mixed_context_routing", "") or "").strip().lower()
 
-        return Dataset(x, y, batch_size)
+        with_context_prompts = None
+        without_context_prompts = None
+
+        if len(prompt):
+            formatted_x = []
+            for text_value, row in zip(raw_x, csv.to_dict(orient="records")):
+                format_kwargs = dict(row)
+                format_kwargs.setdefault("text", text_value)
+                try:
+                    formatted_x.append(prompt.format(**format_kwargs))
+                except KeyError as exc:
+                    missing_key = str(exc).strip("'")
+                    raise ValueError(
+                        f"Prompt references missing CSV column '{{{missing_key}}}' in {csv_path}"
+                    ) from exc
+            with_context_prompts = formatted_x
+            x = formatted_x
+
+        if len(prompt_without_context):
+            formatted_without_context = []
+            for text_value, row in zip(raw_x, csv.to_dict(orient="records")):
+                format_kwargs = dict(row)
+                format_kwargs.setdefault("text", text_value)
+                try:
+                    formatted_without_context.append(prompt_without_context.format(**format_kwargs))
+                except KeyError as exc:
+                    missing_key = str(exc).strip("'")
+                    raise ValueError(
+                        f"prompt_without_context references missing CSV column '{{{missing_key}}}' in {csv_path}"
+                    ) from exc
+            without_context_prompts = formatted_without_context
+
+        if mixed_context_routing == "pubmedqa":
+            if not len(prompt):
+                raise ValueError(
+                    "mixed_context_routing='pubmedqa' requires a populated 'prompt' template"
+                )
+            if not len(prompt_without_context):
+                raise ValueError(
+                    "mixed_context_routing='pubmedqa' requires 'prompt_without_context'"
+                )
+            # PubMedQA-style mixed-context routing uses reduced prompts by default and
+            # swaps in evidence-bearing prompts only for the assigned model per example.
+            x = without_context_prompts
+
+        formatted_dataset = Dataset(x, y, batch_size)
+
+        if mixed_context_routing == "pubmedqa":
+            formatted_dataset.pubmedqa_with_context_x = list(with_context_prompts)
+            formatted_dataset.pubmedqa_without_context_x = list(without_context_prompts)
+            formatted_dataset.pubmedqa_prompt_strategy = "mixed_context"
+
+        probability_label_column = kwargs.get("probability_label_column", None)
+        if probability_label_column is not None:
+            if probability_label_column not in csv.columns:
+                raise ValueError(
+                    f"probability_label_column='{probability_label_column}' not found in CSV columns"
+                )
+            prob_values = pd.to_numeric(csv[probability_label_column], errors="coerce")
+            if prob_values.isna().any():
+                raise ValueError(
+                    f"Column '{probability_label_column}' contains non-numeric probabilistic labels"
+                )
+            prob_array = prob_values.to_numpy(dtype=np.float64)
+            if np.any(prob_array < 0.0) or np.any(prob_array > 1.0):
+                raise ValueError(
+                    f"Column '{probability_label_column}' must contain values in [0, 1]"
+                )
+            formatted_dataset.probabilistic_labels = prob_array.astype(np.float32).tolist()
+
+        positive_label = kwargs.get("positive_label", None)
+        if positive_label is not None:
+            formatted_dataset.positive_label = str(positive_label)
+
+        return formatted_dataset
 
     @staticmethod
     def load_hf_dataset(
@@ -270,16 +427,83 @@ class Dataset:
         split: str,
         **kwargs,
     ):
+        _configure_hf_cache_home_if_needed()
+
+        log.info(
+            "HF dataset loader env: HF_HOME=%s HF_HUB_CACHE=%s HF_DATASETS_CACHE=%s",
+            os.environ.get("HF_HOME", "<unset>"),
+            os.environ.get("HF_HUB_CACHE", "<unset>"),
+            os.environ.get("HF_DATASETS_CACHE", "<unset>"),
+        )
+
+        # Always try local cache first; only fallback to remote if local lookup fails.
+        requested_local_files_only = kwargs.pop("local_files_only", True)
+        allow_remote_fallback = bool(kwargs.pop("allow_remote_fallback", True))
+        if requested_local_files_only is not True:
+            log.warning(
+                "Ignoring local_files_only=%r and enforcing local-first dataset loading.",
+                requested_local_files_only,
+            )
+
+        base_download_config = kwargs.pop("download_config", None)
+
+        def _set_offline_env(enabled: bool):
+            """Temporarily control HF offline flags for deterministic local-vs-remote behavior."""
+            keys = ("HF_HUB_OFFLINE", "HF_DATASETS_OFFLINE")
+            previous = {k: os.environ.get(k) for k in keys}
+            for key in keys:
+                if enabled:
+                    os.environ[key] = "1"
+                else:
+                    # Keep explicit user-configured values if present; otherwise unset.
+                    if previous[key] is None:
+                        os.environ.pop(key, None)
+                    else:
+                        os.environ[key] = previous[key]
+            return previous
+
+        def _restore_env(previous: dict):
+            for key, value in previous.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+        def _load_with_local_setting(local_only: bool):
+            previous_offline = _set_offline_env(enabled=local_only)
+            if base_download_config is None:
+                effective_download_config = DownloadConfig(local_files_only=local_only)
+            else:
+                # Preserve caller-provided config while controlling local/remote behavior.
+                base_download_config.local_files_only = local_only
+                effective_download_config = base_download_config
+            try:
+                if isinstance(path, str):
+                    return path, load_dataset(path, split=split, download_config=effective_download_config, **kwargs)
+                return path[0], load_dataset(*path, split=split, download_config=effective_download_config, **kwargs)
+            finally:
+                _restore_env(previous_offline)
+
         load_from_disk = kwargs.pop("load_from_disk", False)
         if load_from_disk:
             dataset_name = path
             dataset = hf_dataset.load_from_disk(path)
-        elif isinstance(path, str):
-            dataset_name = path
-            dataset = load_dataset(path, split=split, **kwargs)
+            log.info("HF dataset source: load_from_disk path=%s split=%s", path, split)
         else:
-            dataset_name = path[0]
-            dataset = load_dataset(*path, split=split, **kwargs)
+            try:
+                dataset_name, dataset = _load_with_local_setting(local_only=True)
+                log.info("HF dataset source: local_cache path=%s split=%s", path, split)
+            except Exception as local_error:
+                if not allow_remote_fallback:
+                    raise
+                log.warning(
+                    "Local-only dataset load failed for path=%s split=%s (%s). Falling back to remote download.",
+                    path,
+                    split,
+                    local_error,
+                )
+                dataset_name, dataset = _load_with_local_setting(local_only=False)
+                log.info("HF dataset source: remote_fallback path=%s split=%s", path, split)
 
         return dataset_name, dataset
 
@@ -317,12 +541,14 @@ class Dataset:
         # Internal formatting-only keys should never be forwarded to Hugging Face loader kwargs.
         prompt_without_context = kwargs.pop("prompt_without_context", "")
         pubmedqa_context_model_path = kwargs.pop("pubmedqa_context_model_path", None)
+        dataset_format = str(kwargs.pop("dataset_format", "")).strip().lower()
 
         dataset_name, dataset = Dataset.load_hf_dataset(dataset_path, split, **kwargs)
         log.debug(f"Loaded HF dataset '{dataset_name}' split '{split}': {len(dataset)} samples")
 
         pubmedqa_with_context_prompts = None
         pubmedqa_without_context_prompts = None
+        pubmedqa_context_only_prompts = None
         race_with_context_prompts = None
         race_without_context_prompts = None
 
@@ -442,6 +668,95 @@ class Dataset:
                     y.append(inst.get("Answer", inst.get("answer", "")))
             
             log.debug(f"Formatted {len(x)} GSM8K-MC samples")
+        elif (
+            dataset_format == "forecastqa"
+            or "forecastqa" in dataset_name.lower()
+            or (isinstance(dataset_path, str) and "forecastqa" in dataset_path.lower())
+            or (isinstance(dataset_path, list) and any("forecastqa" in str(p).lower() for p in dataset_path))
+        ):
+            # Special handling for ForecastQA multichoice subset.
+            # Format: question + choices[{label, choice}] with answer labels in 1-4.
+            log.debug("Detected ForecastQA dataset format, formatting question and options")
+            x, y = [], []
+            skipped_count = 0
+
+            for inst in dataset:
+                question = str(inst.get("question", "")).strip()
+                answer_raw = inst.get("answer", inst.get(y_column, None))
+
+                choices = inst.get("choices", [])
+                label_to_text = {}
+                if isinstance(choices, list):
+                    for choice in choices:
+                        if not isinstance(choice, dict):
+                            continue
+                        raw_label = str(choice.get("label", "")).strip().upper()
+                        raw_text = str(choice.get("choice", choice.get("text", ""))).strip()
+                        if raw_label and raw_text:
+                            label_to_text[raw_label] = raw_text
+
+                option_a = label_to_text.get("1", label_to_text.get("A", ""))
+                option_b = label_to_text.get("2", label_to_text.get("B", ""))
+                option_c = label_to_text.get("3", label_to_text.get("C", ""))
+                option_d = label_to_text.get("4", label_to_text.get("D", ""))
+
+                answer_letter = None
+                if isinstance(answer_raw, str) and answer_raw.strip() in {"1", "2", "3", "4"}:
+                    answer_letter = {"1": "A", "2": "B", "3": "C", "4": "D"}[answer_raw.strip()]
+                elif isinstance(answer_raw, int) and answer_raw in {1, 2, 3, 4}:
+                    answer_letter = {1: "A", 2: "B", 3: "C", 4: "D"}[answer_raw]
+                else:
+                    answer_letter = _normalize_multiple_choice_answer(answer_raw)
+                if answer_letter is None or not question:
+                    skipped_count += 1
+                    continue
+
+                choices_str = _format_choices_block(option_a, option_b, option_c, option_d)
+                if not choices_str:
+                    skipped_count += 1
+                    continue
+
+                if prompt:
+                    if "{choices}" in prompt:
+                        formatted_input = prompt.format(
+                            question=question,
+                            choices=choices_str,
+                            option_a=option_a,
+                            option_b=option_b,
+                            option_c=option_c,
+                            option_d=option_d,
+                            text=question,
+                        )
+                    else:
+                        formatted_input = prompt.format(
+                            question=question,
+                            option_a=option_a,
+                            option_b=option_b,
+                            option_c=option_c,
+                            option_d=option_d,
+                            text=question,
+                        )
+                else:
+                    formatted_input = (
+                        "Return the label of the correct answer for the question below.\n\n"
+                        f"Question: {question}\n"
+                        f"Choices:\n{choices_str}\n"
+                        "Answer:"
+                    )
+
+                if description:
+                    formatted_input = description + "\n\n" + formatted_input
+
+                x.append(formatted_input)
+                y.append(answer_letter)
+
+            if len(x) == 0:
+                raise ValueError(
+                    "No valid ForecastQA samples found after processing. "
+                    f"Skipped {skipped_count} samples."
+                )
+
+            log.debug(f"Formatted {len(x)} ForecastQA samples (skipped {skipped_count} invalid samples)")
         elif "ai2_arc" in dataset_name.lower() or (isinstance(dataset_path, str) and "ai2_arc" in dataset_path.lower()) or (isinstance(dataset_path, list) and any("ai2_arc" in str(p).lower() for p in dataset_path)):
             # Special handling for ARC dataset format
             # Format: question, choices (dict with A, B, C, D, etc.), answerKey
@@ -897,6 +1212,7 @@ class Dataset:
             x, y = [], []
             pubmedqa_with_context_prompts = []
             pubmedqa_without_context_prompts = []
+            pubmedqa_context_only_prompts = []
             skipped_count = 0
 
             for inst in dataset:
@@ -948,6 +1264,7 @@ class Dataset:
                     try:
                         without_context_prompt = prompt_without_context.format(
                             question=question,
+                            context=context_text,
                             long_answer=long_answer,
                             text=question,
                             answer=long_answer,
@@ -970,9 +1287,15 @@ class Dataset:
                         include_context=False,
                     )
 
+                context_only_prompt = _build_pubmedqa_context_only_prompt(
+                    question=question,
+                    context_text=context_text,
+                )
+
                 if description:
                     with_context_prompt = description + "\n\n" + with_context_prompt if with_context_prompt else with_context_prompt
                     without_context_prompt = description + "\n\n" + without_context_prompt
+                    context_only_prompt = description + "\n\n" + context_only_prompt
 
                 # Use reduced prompt by default; caller can switch to full prompt per model.
                 x.append(without_context_prompt)
@@ -981,6 +1304,7 @@ class Dataset:
                 if not is_pubmedqa_no_context:
                     pubmedqa_with_context_prompts.append(with_context_prompt)
                     pubmedqa_without_context_prompts.append(without_context_prompt)
+                    pubmedqa_context_only_prompts.append(context_only_prompt)
 
             if len(x) == 0:
                 raise ValueError(
@@ -1123,6 +1447,7 @@ class Dataset:
             # Store both prompt variants to support model-specific prompt selection.
             formatted_dataset.pubmedqa_with_context_x = pubmedqa_with_context_prompts
             formatted_dataset.pubmedqa_without_context_x = pubmedqa_without_context_prompts
+            formatted_dataset.pubmedqa_context_only_x = pubmedqa_context_only_prompts
             formatted_dataset.pubmedqa_prompt_strategy = "mixed_context"
             formatted_dataset.pubmedqa_context_model_path = pubmedqa_context_model_path
 

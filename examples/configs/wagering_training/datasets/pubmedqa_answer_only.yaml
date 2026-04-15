@@ -9,15 +9,13 @@ name: qiaojin/PubMedQA
 # balanced split over YES/NO labels with 8:1:1 train:val:test ratios.
 train_config_name: pqa_artificial
 eval_config_name: pqa_artificial
-# PubMedQA-specific split controls used by wagering/utils/dataset_utils.py
-pubmedqa_source_config_name: pqa_artificial
-pubmedqa_source_split: train
-pubmedqa_train_target_split: train_val
-pubmedqa_eval_target_split: test
-pubmedqa_split_ratios: [0.8, 0.1, 0.1]
-train_split: train
-eval_split: train
-display_name: pubmedqa_no_context
+# Generic split controls used by wagering/utils/dataset_utils.py
+source_config_name: pqa_artificial
+source_split: train
+train_target_split: train_val
+eval_target_split: test
+split_ratios: [0.8, 0.1, 0.1]
+display_name: pubmedqa_answer_only
 text_column: question
 label_column: final_decision
 batch_size: 5
@@ -26,8 +24,8 @@ load_from_disk: false
 trust_remote_code: false
 instruct: false
 # NO CONTEXT - only question and long answer (no mixed-context strategy used)
-prompt: "Question:\n{question}\nLong Answer:\n{long_answer}\nIs the long answer provided correct or incorrect? Answer with YES or NO. Answer:"
-prompt_without_context: "Question:\n{question}\nLong Answer:\n{long_answer}\nIs the long answer provided correct or incorrect? Answer with YES or NO. Answer:"
+prompt: "Question:\n{question}\nLong Answer:\n{long_answer}\n Answer with YES or NO. Answer:"
+prompt_without_context: "Question:\n{question}\nLong Answer:\n{long_answer}\nAnswer with YES or NO. Answer:"
 description: ""
 # Set option_tokens to [\"YES\", \"NO\"] in your top-level training/eval config when using this dataset.
 # Note: PubMedQA "maybe" labels are automatically filtered out.

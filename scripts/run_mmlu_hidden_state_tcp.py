@@ -165,7 +165,7 @@ def load_dataset(
     batch_size: int,
     size: int | None = None,
     shuffle: bool = True,
-    shuffle_seed: int = 0,
+    shuffle_seed: 18 #int = 0,
 ) -> Dataset:
     """
     Load a multiple-choice dataset using Dataset.load.
@@ -177,7 +177,7 @@ def load_dataset(
         batch_size: Batch size for dataset iteration
         size: Optional limit on number of examples
         shuffle: Whether to shuffle the dataset
-        shuffle_seed: Random seed for shuffling
+        shuffle_seed: 18 #Random seed for shuffling
 
     Returns:
         Dataset instance with loaded data

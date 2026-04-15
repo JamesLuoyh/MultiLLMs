@@ -32,7 +32,7 @@ checkpoint_base_dir: /common/users/yl2310/MultiLLMs/checkpoints
 save_every: 1
 auto_resume: true
 shuffle_data: true
-shuffle_seed: 999
+shuffle_seed: 18 #18 #999
 early_stopping_patience: 100
 report_to_wandb: true
 wandb_project: multi-llm-wagering

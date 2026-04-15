@@ -244,7 +244,10 @@ def _wagering_logits_cache_key(
     else:
         base_key = (model_key, dataset_key, option_key, pv)
 
-    # hidden_state_layers is intentionally ignored in cache key: cache stores all layers.
+    # Cache key intentionally ignores hidden_state_layers. Layer compatibility
+    # is validated at load-time using metadata saved with the cache artifact so
+    # subset requests (e.g. cache built with [0,-2,-1], request [0,-1]) can
+    # reuse existing cache files without recollection.
     _ = hidden_state_layers
     return base_key
 
@@ -270,6 +273,66 @@ def _normalize_hidden_state_layers(hidden_state_layers: Optional[Sequence[int]])
         seen.add(layer_idx)
         normalized.append(layer_idx)
     return tuple(normalized)
+
+
+def resolve_hidden_state_layers_for_model(
+    hidden_state_layers: Optional[Sequence[int]],
+    hidden_state_layers_per_model: Optional[Any],
+    model_index: int,
+    num_models: Optional[int] = None,
+) -> Optional[List[int]]:
+    """Resolve hidden-state layer selection for a specific model index.
+
+    Supports two config styles:
+      - shared layers for all models: hidden_state_layers=[...]
+      - per-model layers: hidden_state_layers_per_model=[..., ...] or {idx: ...}
+
+    Per-model entries may be either a single int (one layer) or a list/tuple of ints.
+    """
+    selected: Any
+    if hidden_state_layers_per_model is None:
+        selected = hidden_state_layers
+    elif isinstance(hidden_state_layers_per_model, dict):
+        if model_index in hidden_state_layers_per_model:
+            selected = hidden_state_layers_per_model[model_index]
+        elif str(model_index) in hidden_state_layers_per_model:
+            selected = hidden_state_layers_per_model[str(model_index)]
+        else:
+            raise ValueError(
+                "hidden_state_layers_per_model is missing an entry for model index "
+                f"{model_index}"
+            )
+    elif isinstance(hidden_state_layers_per_model, (list, tuple)):
+        if num_models is not None and len(hidden_state_layers_per_model) != int(num_models):
+            raise ValueError(
+                "hidden_state_layers_per_model length must match number of models: "
+                f"expected {int(num_models)}, got {len(hidden_state_layers_per_model)}"
+            )
+        if model_index < 0 or model_index >= len(hidden_state_layers_per_model):
+            raise ValueError(
+                "hidden_state_layers_per_model index out of range for model index "
+                f"{model_index}"
+            )
+        selected = hidden_state_layers_per_model[model_index]
+    else:
+        raise ValueError(
+            "hidden_state_layers_per_model must be a dict or list/tuple, "
+            f"got {type(hidden_state_layers_per_model).__name__}"
+        )
+
+    if selected is None:
+        return None
+    if isinstance(selected, (int, np.integer)):
+        return [int(selected)]
+    if isinstance(selected, (list, tuple)):
+        if len(selected) == 0:
+            raise ValueError("Per-model hidden_state_layers entry cannot be empty")
+        return [int(value) for value in selected]
+
+    raise ValueError(
+        "Per-model hidden_state_layers entry must be an int or list/tuple of ints, "
+        f"got {type(selected).__name__} for model index {model_index}"
+    )
 
 
 def _resolve_transformer_layer_indices(
@@ -307,6 +370,7 @@ def _resolve_transformer_layer_indices(
 def extract_hidden_state_features(
     hidden_states: Optional[np.ndarray],
     hidden_state_layers: Optional[Sequence[int]] = None,
+    cached_requested_hidden_state_layers: Optional[Sequence[int]] = None,
 ) -> Optional[np.ndarray]:
     """Extract selected layer features from cached hidden states.
 
@@ -319,6 +383,28 @@ def extract_hidden_state_features(
 
     hidden_states_array = np.asarray(hidden_states)
     if hidden_states_array.ndim == 3:
+        cached_requested = _normalize_hidden_state_layers(cached_requested_hidden_state_layers)
+        if cached_requested is not None and len(cached_requested) == hidden_states_array.shape[1]:
+            requested = _normalize_hidden_state_layers(hidden_state_layers)
+            if requested is None:
+                # Preserve prior default behavior: use the last available cached layer.
+                selected = hidden_states_array[:, -1:, :]
+            else:
+                layer_to_cached_pos = {layer: pos for pos, layer in enumerate(cached_requested)}
+                missing = [layer for layer in requested if layer not in layer_to_cached_pos]
+                if missing:
+                    raise RuntimeError(
+                        "Cached hidden states do not include requested layers. "
+                        f"requested={list(requested)}, cached={list(cached_requested)}"
+                    )
+                selected_positions = [layer_to_cached_pos[layer] for layer in requested]
+                selected = hidden_states_array[:, selected_positions, :]
+
+            if selected.shape[1] == 1:
+                return selected[:, 0, :].astype(np.float32, copy=False)
+            batch_size = selected.shape[0]
+            return selected.reshape(batch_size, -1).astype(np.float32, copy=False)
+
         selected_layers = _resolve_transformer_layer_indices(
             hidden_state_layers,
             hidden_states_array.shape[1],
@@ -380,6 +466,7 @@ def assign_pubmedqa_context_model(
     model_paths: Sequence[str],
     random_seed: Optional[int] = None,
     dataset_index: Optional[int] = None,
+    context_policy: str = "single_with_context",
 ) -> Optional[Dict[str, object]]:
     """
     Assign mixed-context prompts (PubMedQA/RACE) per-example via balanced randomized routing.
@@ -404,6 +491,7 @@ def assign_pubmedqa_context_model(
     counts_attr = f"{dataset_type}_context_assignment_counts"
     hash_attr = f"{dataset_type}_context_assignment_hash"
     run_seed_attr = f"{dataset_type}_context_run_seed"
+    policy_attr = f"{dataset_type}_context_policy"
 
     assignments: Optional[np.ndarray] = None
     existing = getattr(dataset, assignment_attr, None)
@@ -421,6 +509,7 @@ def assign_pubmedqa_context_model(
             f"{dataset_type}_balanced_context",
             str(dataset_signature),
             "||".join(paths),
+            f"policy={str(context_policy)}",
         ]
         if dataset_index is not None:
             seed_components.append(f"dataset_index={int(dataset_index)}")
@@ -432,13 +521,61 @@ def assign_pubmedqa_context_model(
             seed=seed,
         )
 
-    assignment_hash = hashlib.md5(assignments.tobytes()).hexdigest()[:12]
+    context_only_assignments: Optional[np.ndarray] = None
+    if dataset_type == "pubmedqa" and str(context_policy) == "dual_context_and_long_answer":
+        if not isinstance(getattr(dataset, "pubmedqa_context_only_x", None), list):
+            raise ValueError(
+                "PubMedQA dual context policy requires dataset.pubmedqa_context_only_x prompt variants"
+            )
+
+        dataset_signature = _get_dataset_signature(dataset)
+        secondary_seed_components = [
+            "pubmedqa_balanced_context_only",
+            str(dataset_signature),
+            "||".join(paths),
+        ]
+        if dataset_index is not None:
+            secondary_seed_components.append(f"dataset_index={int(dataset_index)}")
+        secondary_seed = int(
+            hashlib.md5("::".join(secondary_seed_components).encode("utf-8")).hexdigest()[:8],
+            16,
+        )
+        context_only_assignments = _build_pubmedqa_balanced_assignments(
+            num_examples=num_examples,
+            num_models=num_models,
+            seed=secondary_seed,
+        )
+
+        # Enforce distinct privileged models per example.
+        collision_mask = context_only_assignments == assignments
+        if np.any(collision_mask):
+            rng = np.random.RandomState(secondary_seed + 17)
+            collision_indices = np.flatnonzero(collision_mask)
+            for idx in collision_indices:
+                candidates = np.arange(num_models, dtype=np.int32)
+                candidates = candidates[candidates != assignments[idx]]
+                context_only_assignments[idx] = int(rng.choice(candidates))
+
+    assignment_hash_source = assignments.tobytes()
+    if context_only_assignments is not None:
+        assignment_hash_source = assignment_hash_source + b"::" + context_only_assignments.tobytes()
+    assignment_hash = hashlib.md5(assignment_hash_source).hexdigest()[:12]
     context_counts = np.bincount(assignments, minlength=num_models).astype(np.int32).tolist()
 
     setattr(dataset, assignment_attr, assignments.tolist())
     setattr(dataset, counts_attr, context_counts)
     setattr(dataset, hash_attr, assignment_hash)
     setattr(dataset, run_seed_attr, normalized_seed)
+    setattr(dataset, policy_attr, str(context_policy))
+
+    if context_only_assignments is not None:
+        dataset.pubmedqa_context_plus_long_answer_assignment_by_example = assignments.tolist()
+        dataset.pubmedqa_context_only_assignment_by_example = context_only_assignments.tolist()
+        dataset.pubmedqa_context_plus_long_answer_assignment_counts = context_counts
+        dataset.pubmedqa_context_only_assignment_counts = np.bincount(
+            context_only_assignments,
+            minlength=num_models,
+        ).astype(np.int32).tolist()
 
     # Preserve existing PubMedQA fields for backwards compatibility.
     if dataset_type == "pubmedqa":
@@ -450,6 +587,7 @@ def assign_pubmedqa_context_model(
         "assignment_hash": assignment_hash,
         "num_examples": int(num_examples),
         "model_context_counts": context_counts,
+        "context_policy": str(context_policy),
         "routing_seed": normalized_seed,
     }
 
@@ -458,6 +596,7 @@ def assign_pubmedqa_context_models(
     datasets: Sequence[Dataset],
     model_paths: Sequence[str],
     random_seed: Optional[int] = None,
+    context_policy: str = "single_with_context",
 ) -> Dict[int, Dict[str, object]]:
     """Assign PubMedQA context routing metadata for all datasets that need it."""
     assignments: Dict[int, Dict[str, object]] = {}
@@ -467,6 +606,7 @@ def assign_pubmedqa_context_models(
             model_paths,
             random_seed=random_seed,
             dataset_index=idx,
+            context_policy=context_policy,
         )
         if selected is not None:
             assignments[idx] = selected
@@ -510,7 +650,8 @@ def get_model_prompt_variant(
         setattr(dataset, f"{dataset_type}_context_assignment_hash", assignment_hash)
 
     if dataset_type == "pubmedqa":
-        return f"balanced_random_context_m{model_index}_{assignment_hash}"
+        policy = str(getattr(dataset, "pubmedqa_context_policy", "single_with_context"))
+        return f"balanced_random_context_{policy}_m{model_index}_{assignment_hash}"
     return f"article_random_context_m{model_index}_{assignment_hash}"
 
 
@@ -526,6 +667,34 @@ def get_model_specific_prompts(
         with_context_prompts = getattr(dataset, with_context_attr, None)
         without_context_prompts = getattr(dataset, without_context_attr, None)
         assignments = _get_pubmedqa_context_assignments(dataset)
+        context_policy = str(getattr(dataset, "pubmedqa_context_policy", "single_with_context"))
+
+        if (
+            dataset_type == "pubmedqa"
+            and context_policy == "dual_context_and_long_answer"
+            and isinstance(with_context_prompts, list)
+            and isinstance(without_context_prompts, list)
+            and isinstance(getattr(dataset, "pubmedqa_context_only_x", None), list)
+        ):
+            context_only_prompts = getattr(dataset, "pubmedqa_context_only_x")
+            full_assignments = getattr(dataset, "pubmedqa_context_plus_long_answer_assignment_by_example", None)
+            context_only_assignments = getattr(dataset, "pubmedqa_context_only_assignment_by_example", None)
+            if (
+                isinstance(full_assignments, list)
+                and isinstance(context_only_assignments, list)
+                and len(full_assignments) == len(with_context_prompts)
+                and len(context_only_assignments) == len(with_context_prompts)
+                and len(context_only_prompts) == len(with_context_prompts)
+            ):
+                prompts: List[str] = []
+                for idx in range(len(with_context_prompts)):
+                    if int(full_assignments[idx]) == model_index:
+                        prompts.append(with_context_prompts[idx])
+                    elif int(context_only_assignments[idx]) == model_index:
+                        prompts.append(context_only_prompts[idx])
+                    else:
+                        prompts.append(without_context_prompts[idx])
+                return prompts
 
         if (
             isinstance(with_context_prompts, list)
@@ -550,6 +719,56 @@ def get_model_specific_prompts(
             ]
 
     return dataset.x
+
+
+def get_concatenated_router_prompts(
+    dataset: Dataset,
+    num_models: int,
+    *,
+    deduplicate: bool = True,
+) -> List[str]:
+    """
+    Build router inputs by concatenating model-specific prompts for each example.
+
+    For mixed-context datasets (PubMedQA/RACE), this exposes all prompt/context
+    variants observed by the ensemble to the router while preserving per-model
+    inference prompts for logit collection.
+    """
+    if num_models <= 0:
+        return list(dataset.x)
+
+    per_model_prompts: List[List[str]] = [
+        get_model_specific_prompts(dataset, model_index=model_idx)
+        for model_idx in range(num_models)
+    ]
+
+    if not per_model_prompts:
+        return list(dataset.x)
+
+    num_examples = len(per_model_prompts[0])
+    for model_idx, prompts in enumerate(per_model_prompts):
+        if len(prompts) != num_examples:
+            raise ValueError(
+                "Model-specific prompt length mismatch while building router prompts: "
+                f"model_index={model_idx}, len={len(prompts)}, expected={num_examples}"
+            )
+
+    router_prompts: List[str] = []
+    for example_idx in range(num_examples):
+        pieces = [per_model_prompts[model_idx][example_idx] for model_idx in range(num_models)]
+        if deduplicate:
+            unique_pieces: List[str] = []
+            seen = set()
+            for piece in pieces:
+                piece_text = str(piece)
+                if piece_text in seen:
+                    continue
+                seen.add(piece_text)
+                unique_pieces.append(piece_text)
+            pieces = unique_pieces
+        router_prompts.append("\n\n".join(str(piece) for piece in pieces))
+
+    return router_prompts
 
 
 def _resolve_label_to_index(
@@ -615,37 +834,70 @@ def get_cached_logits_and_hidden_states_for_model(
                 "Mixed-context cache lookups require model_index to disambiguate repeated model paths"
             )
         model_key = f"{model_path}::idx={int(model_index)}"
-    cache_key = _wagering_logits_cache_key(
-        model_key,
-        dataset,
-        option_tokens,
-        prompt_variant,
-        hidden_state_layers=hidden_state_layers,
-    )
-    cache_path = _get_cache_path(cache_key)
+    prompt_variants_to_try: List[Optional[str]] = [prompt_variant]
+    # Backward-compatible fallback: older PubMedQA cache files did not include
+    # the explicit context-policy token in prompt_variant.
+    if isinstance(prompt_variant, str):
+        legacy_marker = "balanced_random_context_single_with_context_m"
+        if legacy_marker in prompt_variant:
+            prompt_variants_to_try.append(
+                prompt_variant.replace(legacy_marker, "balanced_random_context_m")
+            )
 
-    if cache_path.exists():
+    for prompt_variant_candidate in prompt_variants_to_try:
+        cache_key = _wagering_logits_cache_key(
+            model_key,
+            dataset,
+            option_tokens,
+            prompt_variant_candidate,
+            hidden_state_layers=hidden_state_layers,
+        )
+        cache_path = _get_cache_path(cache_key)
+        if not cache_path.exists():
+            continue
+
         try:
             data = np.load(cache_path, allow_pickle=True)
             logits = data["logits"] if "logits" in data else None
             hidden_states = data["hidden_states"] if "hidden_states" in data else None
             labels = data["labels"] if "labels" in data else None
+            cached_requested_hidden_state_layers = (
+                data["requested_hidden_state_layers"].astype(np.int32).tolist()
+                if "requested_hidden_state_layers" in data
+                else None
+            )
 
             # Handle hidden_states if it was pickled
             if "hidden_states_pickle" in data:
                 hidden_states = pickle.loads(data["hidden_states_pickle"].item())
 
-            hidden_states = extract_hidden_state_features(hidden_states, hidden_state_layers)
+            try:
+                hidden_states = extract_hidden_state_features(
+                    hidden_states,
+                    hidden_state_layers,
+                    cached_requested_hidden_state_layers=cached_requested_hidden_state_layers,
+                )
+            except RuntimeError as layer_err:
+                log.debug(
+                    "Cache layer mismatch for model %s (prompt_variant=%s): %s",
+                    model_key,
+                    prompt_variant or "default",
+                    layer_err,
+                )
+                # Keep logits/labels cache usable even when hidden-state layer
+                # selection is incompatible with this cache artifact.
+                return logits, None, labels
 
             log.debug(
                 "Cache hit for model %s and dataset size %d (prompt_variant=%s)",
                 model_key,
                 len(dataset.x),
-                prompt_variant or "default",
+                prompt_variant_candidate or "default",
             )
             return logits, hidden_states, labels
         except Exception as e:
             raise Exception(f"Error loading cache from {cache_path}: {e}")
+
     return None, None, None
 
 
@@ -737,6 +989,17 @@ def set_cached_logits_and_hidden_states_for_model(
                 save_dict["hidden_states_pickle"] = np.void(pickle.dumps(cache_dict["hidden_states"]))
             else:
                 save_dict["hidden_states"] = cache_dict["hidden_states"].astype(np.float32) if isinstance(cache_dict["hidden_states"], np.ndarray) else cache_dict["hidden_states"]
+        normalized_requested_layers = _normalize_hidden_state_layers(hidden_state_layers)
+        # Only persist requested-layer metadata when cache actually stores a
+        # selected subset. For full-layer caches, omit this metadata so reads use
+        # positional layer resolution against the cached layer axis.
+        if (
+            normalized_requested_layers is not None
+            and isinstance(cache_dict.get("hidden_states"), np.ndarray)
+            and cache_dict["hidden_states"].ndim == 3
+            and cache_dict["hidden_states"].shape[1] == len(normalized_requested_layers)
+        ):
+            save_dict["requested_hidden_state_layers"] = np.asarray(normalized_requested_layers, dtype=np.int32)
         
         np.savez_compressed(cache_path, **save_dict)
         
@@ -945,7 +1208,8 @@ def collect_option_logits_and_hidden_states_for_model(
     model_identifier: Optional[str] = None,
     model_index: int = 0,
     hidden_state_layers: Optional[Sequence[int]] = None,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    collect_hidden_states: bool = True,
+) -> Tuple[np.ndarray, Optional[np.ndarray], np.ndarray]:
     """
     Collect per-option log-probabilities AND hidden states for a model in a single forward pass.
     
@@ -957,7 +1221,7 @@ def collect_option_logits_and_hidden_states_for_model(
         
     Returns:
         logits: np.ndarray, shape [num_examples, num_options]
-        hidden_states: np.ndarray, shape [num_examples, num_transformer_layers, hidden_dim]
+        hidden_states: np.ndarray, shape [num_examples, num_cached_layers, hidden_dim] or None
         labels: np.ndarray, shape [num_examples]
     """
     model_device = model.device()
@@ -1003,7 +1267,7 @@ def collect_option_logits_and_hidden_states_for_model(
             **batch,
             max_new_tokens=max_new_tokens,
             return_dict_in_generate=True,
-            output_hidden_states=True,
+            output_hidden_states=collect_hidden_states,
         )
         
         scores: List[torch.Tensor] = generation.scores
@@ -1017,16 +1281,34 @@ def collect_option_logits_and_hidden_states_for_model(
                 dim=-1,
             )
         
-        # Extract hidden states
-        if hasattr(generation, 'hidden_states') and generation.hidden_states is not None:
+        # Extract hidden states when requested.
+        if collect_hidden_states and hasattr(generation, 'hidden_states') and generation.hidden_states is not None:
             try:
-                if len(generation.hidden_states) > 1:
-                    selected_step_hidden = generation.hidden_states[1]
-                else:
-                    selected_step_hidden = generation.hidden_states[0]
+                hidden_state_steps = generation.hidden_states
+                selected_step_idx = 1 if len(hidden_state_steps) > len(scores) else 0
+                selected_step_hidden = hidden_state_steps[selected_step_idx]
+
+                if len(hidden_state_steps) > 1:
+                    # Some model backends expose richer per-layer tuples on a
+                    # different generation step. Prefer the requested step, but
+                    # if another step has more layer entries, use that one.
+                    def _layer_tuple_len(step_hidden):
+                        return len(step_hidden) if isinstance(step_hidden, tuple) else 1
+
+                    richest_step_hidden = max(hidden_state_steps, key=_layer_tuple_len)
+                    if _layer_tuple_len(richest_step_hidden) > _layer_tuple_len(selected_step_hidden):
+                        log.warning(
+                            "Model %s returned fewer layers at step %d than another step; "
+                            "using richer hidden-state tuple for caching.",
+                            model.model_path,
+                            selected_step_idx,
+                        )
+                        selected_step_hidden = richest_step_hidden
 
                 if isinstance(selected_step_hidden, tuple):
-                    # Store all transformer layers in cache, excluding the embedding slot.
+                    # Exclude embedding slot and cache all returned transformer
+                    # layers so later runs can reuse cache for different layer
+                    # selections without recollection.
                     transformer_hidden_states = selected_step_hidden[1:] if len(selected_step_hidden) > 1 else selected_step_hidden
                     if len(transformer_hidden_states) == 0:
                         raise ValueError("Model returned an empty transformer hidden-state tuple")
@@ -1055,7 +1337,7 @@ def collect_option_logits_and_hidden_states_for_model(
                 raise RuntimeError(
                     f"Could not extract hidden states from model {model.model_path}: {e}"
                 ) from e
-        else:
+        elif collect_hidden_states:
             raise RuntimeError(
                 f"Model {model.model_path} did not return hidden_states."
             )
@@ -1077,13 +1359,15 @@ def collect_option_logits_and_hidden_states_for_model(
         
         # NumPy cannot materialize bfloat16 tensors directly; normalize to float32 first.
         all_log_probs.append(batch_log_probs.detach().to(dtype=torch.float32).cpu().numpy())
-        all_hidden_states.append(all_layers_last_token_hidden.detach().to(dtype=torch.float32).cpu().numpy())
+        if collect_hidden_states:
+            all_hidden_states.append(all_layers_last_token_hidden.detach().to(dtype=torch.float32).cpu().numpy())
         
         del generation
         del scores
         del first_step_scores
         del batch_log_probs
-        del all_layers_last_token_hidden
+        if collect_hidden_states:
+            del all_layers_last_token_hidden
         
         if len(all_log_probs) % 10 == 0 and torch.cuda.is_available():
             try:
@@ -1104,7 +1388,7 @@ def collect_option_logits_and_hidden_states_for_model(
         raise ValueError("No batches were processed.")
     
     logits = np.concatenate(all_log_probs, axis=0)
-    hidden_states = np.concatenate(all_hidden_states, axis=0)
+    hidden_states = np.concatenate(all_hidden_states, axis=0) if collect_hidden_states else None
     labels = np.asarray(all_labels, dtype=np.int32)
     return logits, hidden_states, labels
 

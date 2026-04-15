@@ -27,7 +27,7 @@ wagering_method:
     hidden_dim: 4096  # Dimension of hidden states (adjust based on model)
     hidden_layers: [512, 256]  # MLP hidden layer sizes
     learning_rate: 5e-5  # Learning rate for router optimizer (lowered from 1e-4 to prevent wager collapse)
-    lr_decay_factor: 0.95  # Decay learning rate by this factor every lr_decay_steps (1.0 = no decay)
+    lr_decay_factor: 1  # Decay learning rate by this factor every lr_decay_steps (1.0 = no decay)
     lr_decay_steps: 100  # Number of optimizer steps between decay applications
     temperature: 2.0  # Temperature for softmax (higher = softer, prevents one model from dominating)
     grad_clip_norm: 1.0  # Gradient clipping norm (prevents gradient explosion)
@@ -67,7 +67,7 @@ training_batch_size: 10  # Batch size for training loop (different from batch si
 auto_resume: false  # Automatically resume from latest checkpoint if available
 balance_training_datasets: true  # If true, randomly subsample each dataset to min dataset size
 shuffle_data: true  # Shuffle training data across datasets
-shuffle_seed: 42  # Random seed for shuffling (will be overridden by sweep)
+shuffle_seed: 18 #18 #42  # Random seed for shuffling (will be overridden by sweep)
 early_stopping_patience: 10000  # Stop training if no improvement for 20 epochs (default: 10)
 early_stopping_criterion: online_learning  # Use validation performance for early stopping (default: "validation")
 # Wandb logging

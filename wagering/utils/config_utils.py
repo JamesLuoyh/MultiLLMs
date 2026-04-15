@@ -10,6 +10,22 @@ from pathlib import Path
 from typing import Dict, Any, Optional
 
 
+def _normalize_option_tokens(config: Dict[str, Any]) -> None:
+    """Normalize option_tokens so YAML booleans like YES/NO don't break downstream code."""
+    raw_tokens = config.get("option_tokens")
+    if not isinstance(raw_tokens, list):
+        return
+
+    normalized = []
+    for token in raw_tokens:
+        if isinstance(token, bool):
+            normalized.append("YES" if token else "NO")
+        else:
+            normalized.append(str(token))
+
+    config["option_tokens"] = normalized
+
+
 def load_yaml_file(file_path: Path) -> Dict[str, Any]:
     """
     Load a YAML file and return its contents as a dictionary.
@@ -179,9 +195,16 @@ def load_and_merge_configs(
     # Validate required keys
     if "models" not in config or not config["models"]:
         raise ValueError("Config must specify models")
-    if "wagering_method" not in config:
-        raise ValueError("Config must specify wagering_method")
+    has_single_method = "wagering_method" in config
+    phase_shift_cfg = config.get("phase_shift")
+    has_phase_methods = isinstance(phase_shift_cfg, dict) and bool(phase_shift_cfg.get("methods"))
+    if not has_single_method and not has_phase_methods:
+        raise ValueError(
+            "Config must specify wagering_method or phase_shift.methods"
+        )
     if "aggregation" not in config:
         raise ValueError("Config must specify aggregation")
+
+    _normalize_option_tokens(config)
     
     return config

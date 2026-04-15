@@ -31,6 +31,7 @@ from wagering.utils.multi_llm_ensemble import (
     assign_pubmedqa_context_models,
     get_cached_logits_and_hidden_states_for_model,
     get_model_prompt_variant,
+    resolve_hidden_state_layers_for_model,
 )
 from wagering.methods.factory import load_wagering_method
 from wagering.inference import WageringEvaluator
@@ -165,10 +166,12 @@ def main(
         eval_dataset_objects.append(ood_dataset[0])
         eval_dataset_names.append(ood_dataset[1])
     pubmedqa_context_seed = dataset_split_seed
+    pubmedqa_context_policy = str(args.get("pubmedqa_context_policy", "single_with_context"))
     pubmedqa_assignments = assign_pubmedqa_context_models(
         eval_dataset_objects,
         [model_cfg["path"] for model_cfg in args["models"]],
         random_seed=pubmedqa_context_seed,
+        context_policy=pubmedqa_context_policy,
     )
     for dataset_idx, assignment_info in pubmedqa_assignments.items():
         dataset_name = eval_dataset_names[dataset_idx] if dataset_idx < len(eval_dataset_names) else f"dataset_{dataset_idx}"
@@ -202,7 +205,23 @@ def main(
         num_models=num_models,
         config=wagering_config.get("config", {}),
     )
-    hidden_state_layers = wagering_config.get("config", {}).get("hidden_state_layers")
+    method_requires_hidden_states = bool(getattr(wagering_method, "requires_hidden_states", True))
+    hidden_state_layers = None
+    hidden_state_layers_per_model = None
+    if method_requires_hidden_states:
+        hidden_state_layers = getattr(
+            wagering_method,
+            "hidden_state_layers",
+            wagering_config.get("config", {}).get("hidden_state_layers"),
+        )
+        hidden_state_layers_per_model = getattr(
+            wagering_method,
+            "hidden_state_layers_per_model",
+            wagering_config.get("config", {}).get("hidden_state_layers_per_model"),
+        )
+        # Keep cache checks and evaluator runtime on the same layer selection.
+        setattr(wagering_method, "hidden_state_layers", hidden_state_layers)
+        setattr(wagering_method, "hidden_state_layers_per_model", hidden_state_layers_per_model)
 
     requires_checkpoint = len(wagering_method.get_trainable_parameters()) > 0
 
@@ -215,11 +234,7 @@ def main(
     checkpoint_path = Path(checkpoint_path) if checkpoint_path is not None else None
 
     # Determine if hidden states are required
-    wagering_method_name = type(wagering_method).__name__
-    needs_hidden_states = (
-        wagering_method_name not in ["EqualWagers", "ZeroOneWagers", "OneZeroWagers"]
-        or logit_calibrator is not None
-    )
+    needs_hidden_states = method_requires_hidden_states or logit_calibrator is not None
 
     # Check cache per model across all eval datasets
     option_tokens = args.get("option_tokens", ["A", "B", "C", "D"])
@@ -235,6 +250,12 @@ def main(
     for idx, model_cfg in enumerate(model_cfgs):
         model_path = model_cfg["path"]
         model_cached = True
+        model_hidden_layers = resolve_hidden_state_layers_for_model(
+            hidden_state_layers,
+            hidden_state_layers_per_model,
+            model_index=idx,
+            num_models=num_models,
+        )
         for ds in eval_datasets:
             prompt_variant = get_model_prompt_variant(ds, model_index=idx)
             cached_logits, cached_hidden_states, _ = get_cached_logits_and_hidden_states_for_model(
@@ -243,7 +264,7 @@ def main(
                 option_tokens,
                 prompt_variant=prompt_variant,
                 model_index=idx,
-                hidden_state_layers=hidden_state_layers,
+                hidden_state_layers=model_hidden_layers,
             )
             if cached_logits is None or (needs_hidden_states and cached_hidden_states is None):
                 model_cached = False
@@ -506,6 +527,8 @@ def main(
         "meta_acc": [],
         "meta_nll": [],
         "meta_auc": [],
+        "kendall_tau": [],
+        "best_model_mrr": [],
     }
     
     for dataset_name, result in results.items():
@@ -539,6 +562,8 @@ def main(
         meta_acc_val = get_metric_float(result, "meta_acc")
         meta_nll_val = get_metric_float(result, "meta_nll")
         meta_auc_val = get_metric_float(result, "meta_auc")
+        kendall_tau_val = get_metric_float(result, "kendall_tau")
+        best_model_mrr_val = get_metric_float(result, "best_model_mrr")
 
         if accuracy_val is not None:
             aggregate_metrics["accuracy"].append(accuracy_val)
@@ -560,6 +585,10 @@ def main(
             aggregate_metrics["meta_nll"].append(meta_nll_val)
         if meta_auc_val is not None:
             aggregate_metrics["meta_auc"].append(meta_auc_val)
+        if kendall_tau_val is not None:
+            aggregate_metrics["kendall_tau"].append(kendall_tau_val)
+        if best_model_mrr_val is not None:
+            aggregate_metrics["best_model_mrr"].append(best_model_mrr_val)
 
         accuracy_str = get_metric_str(result, "accuracy")
         nll_str = get_metric_str(result, "nll")
@@ -571,14 +600,17 @@ def main(
         meta_acc_str = get_metric_str(result, "meta_acc")
         meta_nll_str = get_metric_str(result, "meta_nll")
         meta_auc_str = get_metric_str(result, "meta_auc")
+        kendall_tau_str = get_metric_str(result, "kendall_tau")
+        best_model_mrr_str = get_metric_str(result, "best_model_mrr")
         
         log.info(
             f"{dataset_name}: Accuracy={accuracy_str}, "
             f"NLL={nll_str}, Brier={brier_str}, AUC={auc_str}, ECE={ece_str}, "
-            f"DRegret={d_regret_str}, BrierDRegret={brier_d_regret_str}, MetaAcc={meta_acc_str}, MetaNLL={meta_nll_str}, MetaAUC={meta_auc_str}"
+            f"DRegret={d_regret_str}, BrierDRegret={brier_d_regret_str}, MetaAcc={meta_acc_str}, MetaNLL={meta_nll_str}, MetaAUC={meta_auc_str}, "
+            f"KendallTau={kendall_tau_str}, BestModelMRR={best_model_mrr_str}"
         )
         
-        results_summary[dataset_name] = f"Accuracy={accuracy_str}, AUC={auc_str}, ECE={ece_str}, NLL={nll_str}, Brier={brier_str}, DRegret={d_regret_str}, BrierDRegret={brier_d_regret_str}, MetaAcc={meta_acc_str}, MetaAuc={meta_auc_str}, MetaNLL={meta_nll_str}"
+        results_summary[dataset_name] = f"Accuracy={accuracy_str}, AUC={auc_str}, ECE={ece_str}, NLL={nll_str}, Brier={brier_str}, DRegret={d_regret_str}, BrierDRegret={brier_d_regret_str}, MetaAcc={meta_acc_str}, MetaAuc={meta_auc_str}, MetaNLL={meta_nll_str}, KendallTau={kendall_tau_str}, BestModelMRR={best_model_mrr_str}"
 
     def aggregate_metric_str(values):
         if not values:
@@ -596,11 +628,13 @@ def main(
     overall_meta_acc = aggregate_metric_str(aggregate_metrics["meta_acc"])
     overall_meta_nll = aggregate_metric_str(aggregate_metrics["meta_nll"])
     overall_meta_auc = aggregate_metric_str(aggregate_metrics["meta_auc"])
+    overall_kendall_tau = aggregate_metric_str(aggregate_metrics["kendall_tau"])
+    overall_best_model_mrr = aggregate_metric_str(aggregate_metrics["best_model_mrr"])
 
     results_summary["overall"] = (
         f"Accuracy={overall_accuracy}, AUC={overall_auc}, ECE={overall_ece}, "
         f"NLL={overall_nll}, Brier={overall_brier}, DRegret={overall_d_regret}, BrierDRegret={overall_brier_d_regret}, MetaAcc={overall_meta_acc}, "
-        f"MetaAuc={overall_meta_auc}, MetaNLL={overall_meta_nll}"
+        f"MetaAuc={overall_meta_auc}, MetaNLL={overall_meta_nll}, KendallTau={overall_kendall_tau}, BestModelMRR={overall_best_model_mrr}"
     )
     
     # Log summary to wandb

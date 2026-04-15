@@ -4,7 +4,6 @@ Wagers are normalized via softmax to sum to 1.
 """
 
 import numpy as np
-from pytest import raises
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -64,11 +63,23 @@ class MSEBrWagersV2(WageringMethod):
         self.score_function_name = str(config.get("score_function", "normalized_linear"))  # Scoring function: 'linear', 'log', or 'brier'
         self.device_str = str(config.get("device", "cuda" if torch.cuda.is_available() else "cpu"))
         self.device = torch.device(self.device_str)
+        self.frozen_model_indices = {
+            int(idx) for idx in config.get("frozen_model_indices", [])
+        }
+        self.inactive_model_indices = {
+            int(idx) for idx in config.get("inactive_model_indices", [])
+        }
+        for idx in self.frozen_model_indices.union(self.inactive_model_indices):
+            if idx < 0 or idx >= num_models:
+                raise ValueError(
+                    f"Model index {idx} is out of range for num_models={num_models}"
+                )
         self.lr_decay_factor = float(config.get("lr_decay_factor", 1.0))  # Factor to multiply LR by (1.0 = no decay)
         self.lr_decay_steps = int(config.get("lr_decay_steps", 1))  # Decay every N optimizer steps
         hidden_state_layers_cfg = config.get("hidden_state_layers")
         if hidden_state_layers_cfg is None:
-            self.hidden_state_layers = None
+            # Default to first, second-last, and last transformer layers.
+            self.hidden_state_layers = [0, -2, -1]
         else:
             if not isinstance(hidden_state_layers_cfg, (list, tuple)):
                 raise ValueError(
@@ -100,6 +111,12 @@ class MSEBrWagersV2(WageringMethod):
         self._cached_wagers: Optional[torch.Tensor] = None
         self._cached_projected_states: Optional[List[torch.Tensor]] = None
         self._cached_hidden_states_list: Optional[List[torch.Tensor]] = None
+
+    def _is_model_trainable(self, model_idx: int) -> bool:
+        return (
+            model_idx not in self.frozen_model_indices
+            and model_idx not in self.inactive_model_indices
+        )
     
     def _build_router(self) -> nn.Module:
         """
@@ -163,7 +180,7 @@ class MSEBrWagersV2(WageringMethod):
                 if self._training:
                     # Create optimizer for this model (router i + projection i)
                     params = list(self.routers[i].parameters()) + list(projection.parameters())
-                    optimizer = torch.optim.Adam(params, lr=self.learning_rate)
+                    optimizer = torch.optim.Adam(params, lr=self.learning_rate) # betas=(0.0, 0.9),
                     scheduler = torch.optim.lr_scheduler.StepLR(
                         optimizer,
                         step_size=self.lr_decay_steps,
@@ -197,6 +214,9 @@ class MSEBrWagersV2(WageringMethod):
         raw_wagers_tensor = torch.cat(raw_wagers_list, dim=1)
         sigmoid_wagers = torch.sigmoid(raw_wagers_tensor/self.temperature)
         sigmoid_wagers = torch.clamp(sigmoid_wagers, min=1e-16, max=1.0-1e-16)  # Prevent zero wagers for stability
+        if len(self.inactive_model_indices) > 0:
+            inactive_list = sorted(self.inactive_model_indices)
+            sigmoid_wagers[:, inactive_list] = 0.0
 
         # Compute sum for normalization
         sigmoid_sum = torch.sum(sigmoid_wagers, dim=1, keepdim=True)
@@ -225,11 +245,12 @@ class MSEBrWagersV2(WageringMethod):
         
         model_logits_tensor = torch.as_tensor(model_logits, dtype=torch.float32).to(self.device)
         gold_label_tensor = torch.as_tensor(gold_label, dtype=torch.long).to(self.device)
-        brs, nash_gap, score_diff = self.extract_wagers_brs_and_nash_gap(sigmoid_wagers, model_logits_tensor, gold_label_tensor)  # This will populate the cache with BRs and Nash gaps for the current wagers
+        brs, nash_gap, score_diff, total_payout = self.extract_wagers_brs_and_nash_gap(sigmoid_wagers, model_logits_tensor, gold_label_tensor)  # This will populate the cache with BRs and Nash gaps for the current wagers
         # Convert to numpy and validate
         wagers_np = wagers.detach().cpu().numpy()
         nash_gap = nash_gap.detach().cpu().numpy()
         score_diff = score_diff.detach().cpu().numpy()
+        total_payout = total_payout.detach().cpu().numpy()
         # Check for NaN or inf
         if np.any(np.isnan(wagers_np)) or np.any(np.isinf(wagers_np)):
             import sys
@@ -237,7 +258,13 @@ class MSEBrWagersV2(WageringMethod):
             # Fallback to uniform wagers
             raise ValueError("Invalid wagers detected (NaN or inf).")
         
-        return {"wagers": wagers_np, "sigmoid_wagers": sigmoid_wagers.detach().cpu().numpy(), "nash_gap": nash_gap, "score_diff": score_diff}
+        return {
+            "wagers": wagers_np,
+            "sigmoid_wagers": sigmoid_wagers.detach().cpu().numpy(),
+            "nash_gap": nash_gap,
+            "score_diff": score_diff,
+            "total_payout": total_payout,
+        }
     
     def extract_wagers_brs_and_nash_gap(self, sigmoid_wagers, model_logits_tensor, gold_label_tensor):
         
@@ -273,9 +300,10 @@ class MSEBrWagersV2(WageringMethod):
         # brs = 0.5 * (2 - brier_scores) - average_scores
         brs = scores - average_scores
         brs = torch.clamp(brs, min=1e-16, max=1.0-1e-16)  # Prevent negative or zero BRs for stability
-        nash_gap = brs * (scores - average_scores - 0.5 * brs) - sigmoid_wagers * (scores - average_scores - 0.5 * sigmoid_wagers)
+        total_payout = sigmoid_wagers * (scores - average_scores - 0.5 * sigmoid_wagers)
+        nash_gap = brs * (scores - average_scores - 0.5 * brs) - total_payout
         score_diff = scores - average_scores
-        return brs, nash_gap, score_diff
+        return brs, nash_gap, score_diff, total_payout
 
     def update(
         self,
@@ -374,6 +402,9 @@ class MSEBrWagersV2(WageringMethod):
             raw_wagers_tensor = torch.cat(raw_wagers_list, dim=1)
             sigmoid_wagers = torch.sigmoid(raw_wagers_tensor / self.temperature) # [batch_size, num_models]
             sigmoid_wagers = torch.clamp(sigmoid_wagers, min=1e-16, max=1.0-1e-16)  # Prevent zero wagers for stability
+            if len(self.inactive_model_indices) > 0:
+                inactive_list = sorted(self.inactive_model_indices)
+                sigmoid_wagers[:, inactive_list] = 0.0
 
             
 
@@ -389,7 +420,7 @@ class MSEBrWagersV2(WageringMethod):
             # aggregated_probs_torch = LinearPooling.aggregate_torch(
             #     model_logits_tensor, wagers_all
             # )  # [batch_size, num_options]
-            brs, nash_gap, score_diff = self.extract_wagers_brs_and_nash_gap(sigmoid_wagers, model_logits_tensor, gold_label_tensor)
+            brs, nash_gap, score_diff, _ = self.extract_wagers_brs_and_nash_gap(sigmoid_wagers, model_logits_tensor, gold_label_tensor)
             # losses = -torch.log(aggregated_probs_torch[torch.arange(batch_size), gold_label_tensor] + 1e-10) # [batch_size]
             mseloss = F.mse_loss(sigmoid_wagers, brs, reduction='none')#.mean(dim=1)
             # Compute all N losses from the same forward pass tensors
@@ -404,7 +435,11 @@ class MSEBrWagersV2(WageringMethod):
             # PHASE 2: Update each router independently using manual gradient computation
             # This avoids in-place operation conflicts with retain_graph=True
             total_loss = 0.0
+            num_updated_models = 0
             for i in range(self.num_models):
+                if not self._is_model_trainable(i):
+                    continue
+
                 # Find optimizer for model i
                 optimizer_i = None
                 scheduler_i = None
@@ -462,9 +497,15 @@ class MSEBrWagersV2(WageringMethod):
                     scheduler_i.step()  # Update learning rate
                 
                 total_loss += float(all_losses[i].detach().cpu().numpy())
+                num_updated_models += 1
+
+            if num_updated_models == 0:
+                raise RuntimeError(
+                    "No trainable models are active. Check frozen_model_indices/inactive_model_indices configuration."
+                )
 
         # Return average loss across all routers
-        return {"loss": total_loss / self.num_models}
+        return {"loss": total_loss / num_updated_models}
 
     
     def get_trainable_parameters(self) -> List[torch.nn.Parameter]:
@@ -513,6 +554,8 @@ class MSEBrWagersV2(WageringMethod):
                 "hidden_state_layers": self.hidden_state_layers,
                 "score_function": self.score_function_name,
                 "device": self.device_str,
+                "frozen_model_indices": sorted(self.frozen_model_indices),
+                "inactive_model_indices": sorted(self.inactive_model_indices),
             },
         }
     

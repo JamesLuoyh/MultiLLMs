@@ -1,0 +1,19 @@
+---
+description: Use the project virtual environment (.venv) for all Python execution
+alwaysApply: true
+---
+
+# Python via `.venv`
+
+This repo’s Python tooling must run inside the project virtual environment at **`MultiLLMs/.venv`** (path relative to repository root: `.venv`).
+
+## Commands
+
+- **Interpreter**: use `.venv/bin/python` (from repo root), not bare `python` or `python3`, unless you have confirmed they resolve to this venv.
+- **Install / upgrade deps**: `.venv/bin/pip install …`
+- **Pytest**: `.venv/bin/python -m pytest …`
+- **Scripts**: `.venv/bin/python scripts/foo.py …` or `.venv/bin/python -m module …`
+
+If `.venv` is missing, create it from the repo root (e.g. `python3 -m venv .venv` then `.venv/bin/pip install -r requirements.txt` or the project’s documented setup) before running project commands.
+
+Do not assume a global or user-level Python when executing tooling for this workspace.
