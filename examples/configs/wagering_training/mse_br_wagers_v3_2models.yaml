@@ -25,7 +25,7 @@ wagering_method:
     hidden_dim: 4096  # Dimension of hidden states (adjust based on model)
     hidden_layers: [512, 256]  # MLP hidden layer sizes
     hidden_state_layers: [-1]
-    learning_rate: 5e-7  # Learning rate for router optimizer (lowered from 1e-4 to prevent wager collapse)
+    learning_rate: 1e-7  # Learning rate for router optimizer (lowered from 1e-4 to prevent wager collapse)
     lr_decay_factor: 1.0  # Decay learning rate by this factor every lr_decay_steps (1.0 = no decay)
     lr_decay_steps: 100  # Number of optimizer steps between decay applications
     temperature: 2.0  # Temperature for softmax (higher = softer, prevents one model from dominating)
@@ -39,7 +39,6 @@ aggregation:
 
 # Common options
 option_tokens: ["A", "B", "C", "D"]
-cache_path: /common/users/yl2310/MultiLLMs/cache
 
 # ============================================================================
 # TRAINING CONFIGURATION
@@ -76,7 +75,7 @@ use_brier_d_regret_for_early_stopping: true
 report_to_wandb: true
 wandb_project: multi-llm-wagering
 wandb_entity: null
-wandb_name: new_mse_br_wagers_v3_2models
+wandb_name: new_mse_br_wagers_v3_4models
 
 # ============================================================================
 # EVALUATION CONFIGURATION
@@ -99,10 +98,14 @@ test_datasets:
     eval_split: validation  # MedMCQA test split has no labels, use validation
 
 # OOD dataset
-_include_ood_dataset: datasets/arc_challenge.yaml
-
+# Include OOD dataset config
+_include_ood_datasets:
+  - datasets/arc_challenge.yaml
+  - datasets/forecastqa.yaml
 # Override OOD dataset-specific settings
-ood_dataset:
-  display_name: arc_challenge_ood
-  eval_split: test
+ood_datasets:
+  - display_name: arc_challenge_ood
+    eval_split: test
+  - display_name: forecastqa_ood
+    eval_split: test
 

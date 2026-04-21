@@ -37,14 +37,14 @@ def verify_token_alignment(config_path: str, model_path: str = None):
     config = load_and_merge_configs(config_path_obj)
     
     # Load OOD dataset (ARC-Easy)
-    # The config loader processes _include_ood_dataset, but we need to check if ood_dataset exists
-    # If not, we need to load it manually from the original config file
+    # The config loader processes _include_ood_dataset/_include_ood_datasets, but this
+    # utility expects one ARC dataset for token-id verification.
     
     base_dir = config_path_obj.parent
     
-    if "ood_dataset" in config:
-        # Config loader already processed it, but we need the base config
-        # Load the original config to get _include_ood_dataset
+    if "ood_dataset" in config or "ood_datasets" in config:
+        # Config loader already processed includes, but we need the base config for the
+        # legacy single include flow used by older configs.
         import yaml
         with open(config_path_obj, 'r') as f:
             raw_config = yaml.safe_load(f)
@@ -60,6 +60,9 @@ def verify_token_alignment(config_path: str, model_path: str = None):
             
             # Merge with any overrides from main config
             ood_dataset_cfg.update(config["ood_dataset"])
+        elif "ood_datasets" in config and isinstance(config["ood_datasets"], list) and config["ood_datasets"]:
+            # Multi-OOD config: verify token alignment using the first OOD dataset.
+            ood_dataset_cfg = config["ood_datasets"][0]
         else:
             # Use ood_dataset directly
             ood_dataset_cfg = config["ood_dataset"]

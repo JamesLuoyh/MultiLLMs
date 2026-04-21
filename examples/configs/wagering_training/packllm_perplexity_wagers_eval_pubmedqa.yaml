@@ -7,10 +7,6 @@ _include_models:
   - models/llama3_aloe_8b_alpha.yaml
   - models/llama3_aloe_8b_alpha.yaml
   - models/llama3_aloe_8b_alpha.yaml
-  - models/llama3_aloe_8b_alpha.yaml
-  - models/llama3_aloe_8b_alpha.yaml
-  - models/llama3_aloe_8b_alpha.yaml
-  - models/llama3_aloe_8b_alpha.yaml
 
 # Checkpoint path (inference-only method; checkpoint can be a dummy path)
 checkpoint_path: /common/users/yl2310/MultiLLMs/checkpoints/dummy_packllm_perplexity_wagers

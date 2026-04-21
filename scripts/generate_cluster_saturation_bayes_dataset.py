@@ -11,8 +11,9 @@ Labels:
 - binary_label: 1 if posterior_prob > 0.5 else 0
 - posterior_prob: Bayes posterior P(S=1 | W=evidence)
 
-The script also emits participant-specific prompts where update/evidence are revealed
-for exactly one randomly assigned participant per example.
+Optionally, rendered prompt variants can be included in CSV:
+- input: full prompt with update rule and evidence
+- prompt_without_context: redacted variant with evidence withheld
 """
 
 from __future__ import annotations
@@ -59,19 +60,15 @@ def _format_full_prompt(prior: float, tpr: float, fpr: float, evidence: int) -> 
     )
 
 
-def _format_partial_prompt(prior: float, tpr: float, fpr: float, evidence: int, reveal_update_and_evidence: bool) -> str:
-    if reveal_update_and_evidence:
-        update_block = (
-            "Update Rule: To improve forecasting, the mechanism queries a lightweight, predictive monitoring agent. "
-            "Let W in Omega be the random variable representing the agent's output warning. "
-            "The agent possesses the following conditional probabilities: "
-            f"True Positive Rate (Probability of a warning given imminent saturation): P(W=1|S=1) = {tpr:.4f}. "
-            f"False Positive Rate (Probability of a warning given normal loads): P(W=1|S=0) = {fpr:.4f}."
-        )
-        evidence_block = f"Evidence: The monitoring agent analyzes the telemetry and outputs W={evidence}."
-    else:
-        update_block = "Update Rule: [REDACTED FOR THIS PARTICIPANT]"
-        evidence_block = "Evidence: [REDACTED FOR THIS PARTICIPANT]"
+def _format_prompt_without_context(prior: float, tpr: float, fpr: float, evidence: int) -> str:
+    update_block = (
+        "Update Rule: To improve forecasting, the mechanism queries a lightweight, predictive monitoring agent. "
+        "Let W in Omega be the random variable representing the agent's output warning. "
+        "The agent possesses the following conditional probabilities: "
+        f"True Positive Rate (Probability of a warning given imminent saturation): P(W=1|S=1) = {tpr:.4f}. "
+        f"False Positive Rate (Probability of a warning given normal loads): P(W=1|S=0) = {fpr:.4f}."
+    )
+    evidence_block = "Evidence: The monitoring agent's output W is withheld for this participant."
 
     return (
         "A central load-balancing mechanism must forecast compute cluster saturation. "
@@ -86,7 +83,7 @@ def _format_partial_prompt(prior: float, tpr: float, fpr: float, evidence: int, 
     )
 
 
-def _build_row(example_id: int, rng: random.Random, num_participants: int) -> Dict[str, object]:
+def _build_row(example_id: int, rng: random.Random) -> Dict[str, object]:
     prior = _sample_float(rng, 0.10, 0.90)
     tpr = _sample_float(rng, 0.75, 0.99)
     fpr = _sample_float(rng, 0.05, 0.30)
@@ -95,7 +92,6 @@ def _build_row(example_id: int, rng: random.Random, num_participants: int) -> Di
     posterior = _posterior(prior=prior, tpr=tpr, fpr=fpr, evidence=evidence)
     binary_label = 1 if posterior > 0.5 else 0
 
-    assigned_participant = int(rng.randrange(num_participants))
     row: Dict[str, object] = {
         "id": example_id,
         "binary_label": binary_label,
@@ -104,28 +100,24 @@ def _build_row(example_id: int, rng: random.Random, num_participants: int) -> Di
         "tpr": tpr,
         "fpr": fpr,
         "evidence": evidence,
-        "assigned_participant": assigned_participant,
     }
 
     return row
 
 
-def _add_rendered_prompts(row: Dict[str, object], num_participants: int) -> Dict[str, object]:
+def _add_rendered_prompts(row: Dict[str, object]) -> Dict[str, object]:
     prior = float(row["prior_prob"])
     tpr = float(row["tpr"])
     fpr = float(row["fpr"])
     evidence = int(row["evidence"])
-    assigned_participant = int(row["assigned_participant"])
 
     row["input"] = _format_full_prompt(prior=prior, tpr=tpr, fpr=fpr, evidence=evidence)
-    for participant_idx in range(num_participants):
-        row[f"participant_prompt_{participant_idx}"] = _format_partial_prompt(
-            prior=prior,
-            tpr=tpr,
-            fpr=fpr,
-            evidence=evidence,
-            reveal_update_and_evidence=(participant_idx == assigned_participant),
-        )
+    row["prompt_without_context"] = _format_prompt_without_context(
+        prior=prior,
+        tpr=tpr,
+        fpr=fpr,
+        evidence=evidence,
+    )
     return row
 
 
@@ -150,12 +142,11 @@ def parse_args() -> argparse.Namespace:
         help="Path to output CSV file",
     )
     parser.add_argument("--num-samples", type=int, default=1000, help="Number of examples to generate")
-    parser.add_argument("--num-participants", type=int, default=4, help="Number of participants/prompts per example")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument(
         "--include-rendered-prompts",
         action="store_true",
-        help="Also materialize full text prompts in CSV (input + participant_prompt_* columns)",
+        help="Also materialize full text prompts in CSV (input + prompt_without_context columns)",
     )
     return parser.parse_args()
 
@@ -164,13 +155,11 @@ def main() -> None:
     args = parse_args()
     if args.num_samples <= 0:
         raise ValueError("--num-samples must be > 0")
-    if args.num_participants <= 0:
-        raise ValueError("--num-participants must be > 0")
 
     rng = random.Random(args.seed)
-    rows = [_build_row(example_id=i, rng=rng, num_participants=args.num_participants) for i in range(args.num_samples)]
+    rows = [_build_row(example_id=i, rng=rng) for i in range(args.num_samples)]
     if args.include_rendered_prompts:
-        rows = [_add_rendered_prompts(row=row, num_participants=args.num_participants) for row in rows]
+        rows = [_add_rendered_prompts(row=row) for row in rows]
     _write_csv(rows=rows, output_path=args.output_path)
 
     print(f"Wrote {len(rows)} rows to {args.output_path}")

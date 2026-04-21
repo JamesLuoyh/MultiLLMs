@@ -4,11 +4,13 @@ Inference/evaluation pipeline for multi-LLM wagering methods.
 
 import logging
 import pickle
+import re
 import sys
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
 import numpy as np
 import pandas as pd
+import torch
 
 # Ensure local project modules are importable
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -18,13 +20,16 @@ if str(SRC_PATH) not in sys.path:
 
 from wagering.core.model import WhiteboxModel
 from wagering.core.dataset import Dataset
-from wagering.core.metrics import ECE
+from wagering.core.metrics import ECE, bernoulli_kl_divergence, bernoulli_tv_distance
 
 # Local wagering imports
 from wagering.methods.base import WageringMethod
 from wagering.training.analytics import WageringAnalytics
 from wagering.training.trainer import (
+    _compute_model_bernoulli_kl_to_gt_scores,
     _compute_model_brier_scores,
+    _is_cluster_saturation_dataset_name,
+    _resolve_positive_option_index,
     compute_brier_dynamic_regret,
     compute_dynamic_regret,
     compute_meta_metrics,
@@ -34,6 +39,7 @@ from wagering.utils.multi_llm_ensemble import (
     collect_option_logits_and_hidden_states_for_model,
     extract_hidden_state_features,
     get_concatenated_router_prompts,
+    get_model_specific_prompts,
     get_model_prompt_variant,
     get_cached_logits_and_hidden_states_for_model,
     resolve_hidden_state_layers_for_model,
@@ -43,6 +49,9 @@ from wagering.utils.multi_llm_ensemble import (
 log = logging.getLogger("wagering")
 
 from sklearn.metrics import roc_auc_score
+
+
+_CLUSTER_PRIOR_REGEX = re.compile(r"P\(S=1\)\s*=\s*([0-9]*\.?[0-9]+)")
 
 
 class WageringEvaluator:
@@ -207,33 +216,359 @@ class WageringEvaluator:
             self.wandb_logger.log(payload, step=log_step, commit=True)
 
     @staticmethod
-    def _compute_option_distribution_perplexities(model_logits: np.ndarray) -> np.ndarray:
+    def _compute_prompt_perplexities_for_model(
+        model: WhiteboxModel,
+        prompts: List[str],
+        batch_size: int,
+    ) -> np.ndarray:
         """
-        Compute entropy-based perplexity proxies from option logits.
-
-        Args:
-            model_logits: Array with shape [batch_size, num_models, num_options].
+        Compute true prompt perplexity per example using teacher-forced next-token loss.
 
         Returns:
-            np.ndarray with shape [batch_size, num_models]. Lower values indicate
-            more confident option distributions.
+            np.ndarray of shape [num_examples], where lower values indicate better
+            prompt modeling by this model.
         """
-        if model_logits.ndim != 3:
-            raise ValueError(
-                f"Expected model_logits with shape [batch_size, num_models, num_options], got {model_logits.shape}"
+        if len(prompts) == 0:
+            return np.empty((0,), dtype=np.float32)
+
+        model_device = model.device()
+        ppl_batches: List[np.ndarray] = []
+        pad_token_id = getattr(model.tokenizer, "pad_token_id", None)
+
+        for batch_start in range(0, len(prompts), batch_size):
+            batch_end = min(batch_start + batch_size, len(prompts))
+            batch_prompts = prompts[batch_start:batch_end]
+
+            batch = model.tokenize(batch_prompts)
+            input_ids = batch["input_ids"].to(model_device)
+            attention_mask = batch.get("attention_mask", None)
+            if attention_mask is not None:
+                attention_mask = attention_mask.to(model_device)
+
+            with torch.no_grad():
+                outputs = model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    return_dict=True,
+                    use_cache=False,
+                )
+                logits = outputs.logits
+
+            if logits.size(1) < 2:
+                # Degenerate short prompt; assign neutral perplexity.
+                ppl_batches.append(np.ones((input_ids.size(0),), dtype=np.float32))
+                continue
+
+            shift_logits = logits[:, :-1, :]
+            shift_labels = input_ids[:, 1:]
+            token_log_probs = torch.log_softmax(shift_logits, dim=-1)
+            token_nll = -torch.gather(token_log_probs, dim=-1, index=shift_labels.unsqueeze(-1)).squeeze(-1)
+
+            if attention_mask is not None:
+                token_mask = attention_mask[:, 1:].to(dtype=token_nll.dtype)
+            else:
+                token_mask = torch.ones_like(token_nll, dtype=token_nll.dtype)
+
+            if pad_token_id is not None:
+                token_mask = token_mask * (shift_labels != pad_token_id).to(dtype=token_nll.dtype)
+
+            token_count = torch.clamp(token_mask.sum(dim=1), min=1.0)
+            mean_nll = (token_nll * token_mask).sum(dim=1) / token_count
+            perplexity = torch.exp(mean_nll)
+            ppl_batches.append(perplexity.detach().to(dtype=torch.float32).cpu().numpy())
+
+        return np.concatenate(ppl_batches, axis=0).astype(np.float32, copy=False)
+
+    def _compute_prompt_perplexities(self, dataset: Dataset) -> np.ndarray:
+        """
+        Compute prompt perplexities for all models.
+
+        Returns:
+            np.ndarray with shape [num_examples, num_models].
+        """
+        num_examples = len(dataset.x)
+        num_models = len(self.models)
+        all_perplexities = np.empty((num_examples, num_models), dtype=np.float32)
+
+        for model_index, model in enumerate(self.models):
+            if isinstance(model, str):
+                raise RuntimeError(
+                    "PackLLM prompt-perplexity wagering requires loaded model objects, "
+                    f"but model at index {model_index} is a string path: {model}"
+                )
+
+            model_prompts = get_model_specific_prompts(dataset, model_index=model_index)
+            if len(model_prompts) != num_examples:
+                raise ValueError(
+                    "Prompt/label length mismatch while computing prompt perplexities. "
+                    f"prompts={len(model_prompts)}, examples={num_examples}"
+                )
+
+            all_perplexities[:, model_index] = self._compute_prompt_perplexities_for_model(
+                model=model,
+                prompts=model_prompts,
+                batch_size=max(1, int(dataset.batch_size)),
             )
 
-        logits = np.asarray(model_logits, dtype=np.float64)
-        max_logits = np.max(logits, axis=2, keepdims=True)
-        stabilized = logits - max_logits
-        exp_logits = np.exp(stabilized)
-        denom = np.clip(np.sum(exp_logits, axis=2, keepdims=True), 1e-20, None)
-        probs = exp_logits / denom
-        log_probs = stabilized - np.log(denom)
+        return all_perplexities
 
-        entropy = -np.sum(probs * log_probs, axis=2)
-        perplexities = np.exp(entropy)
-        return perplexities.astype(np.float32, copy=False)
+    def _compute_probabilistic_label_metrics(
+        self,
+        dataset: Dataset,
+        aggregated_probs: np.ndarray,
+    ) -> Tuple[Optional[float], Optional[float]]:
+        """Compute Bernoulli KL/TV against GT probabilistic labels when available."""
+        gt_probs = getattr(dataset, "probabilistic_labels", None)
+        if gt_probs is None:
+            return None, None
+
+        gt_probs_arr = np.asarray(gt_probs, dtype=np.float64)
+        if gt_probs_arr.ndim != 1:
+            log.warning("Skipping probabilistic metrics: probabilistic_labels must be 1D")
+            return None, None
+        if gt_probs_arr.shape[0] != aggregated_probs.shape[0]:
+            log.warning(
+                "Skipping probabilistic metrics: probabilistic_labels length mismatch "
+                "(labels=%d, predictions=%d)",
+                gt_probs_arr.shape[0],
+                aggregated_probs.shape[0],
+            )
+            return None, None
+
+        positive_label = getattr(dataset, "positive_label", None)
+        if positive_label is None:
+            positive_label = getattr(dataset, "binary_positive_label", None)
+        if positive_label is None:
+            log.warning(
+                "Skipping probabilistic metrics: dataset has probabilistic_labels but no positive_label"
+            )
+            return None, None
+
+        option_token_to_index = {
+            str(token): idx for idx, token in enumerate(self.option_tokens)
+        }
+        positive_index = option_token_to_index.get(str(positive_label))
+        if positive_index is None:
+            log.warning(
+                "Skipping probabilistic metrics: positive_label=%s not present in option_tokens=%s",
+                str(positive_label),
+                self.option_tokens,
+            )
+            return None, None
+
+        pred_probs = np.asarray(aggregated_probs[:, positive_index], dtype=np.float64)
+        try:
+            kl_div = bernoulli_kl_divergence(pred_probs=pred_probs.tolist(), target_probs=gt_probs_arr.tolist())
+            tv_dist = bernoulli_tv_distance(pred_probs=pred_probs.tolist(), target_probs=gt_probs_arr.tolist())
+        except ValueError as e:
+            log.warning(f"Skipping probabilistic metrics due to invalid values: {e}")
+            return None, None
+
+        return float(kl_div), float(tv_dist)
+
+    def _log_cluster_saturation_sample_distributions(
+        self,
+        dataset: Dataset,
+        dataset_name: str,
+        model_logits: np.ndarray,
+        aggregated_probs: np.ndarray,
+    ) -> None:
+        """Log per-sample GT, per-model, and aggregated distributions for cluster_saturation datasets."""
+        if not _is_cluster_saturation_dataset_name(dataset_name):
+            return
+
+        gt_probs = getattr(dataset, "probabilistic_labels", None)
+        if gt_probs is None:
+            log.warning(
+                "Skipping sample distribution logs for %s: dataset has no probabilistic_labels",
+                dataset_name,
+            )
+            return
+
+        gt_probs_arr = np.asarray(gt_probs, dtype=np.float64)
+        if gt_probs_arr.ndim != 1:
+            log.warning(
+                "Skipping sample distribution logs for %s: probabilistic_labels must be 1D",
+                dataset_name,
+            )
+            return
+        if gt_probs_arr.shape[0] != aggregated_probs.shape[0]:
+            log.warning(
+                "Skipping sample distribution logs for %s: length mismatch (labels=%d, predictions=%d)",
+                dataset_name,
+                gt_probs_arr.shape[0],
+                aggregated_probs.shape[0],
+            )
+            return
+
+        positive_option_index = _resolve_positive_option_index(
+            getattr(dataset, "positive_label", None),
+            self.option_tokens,
+            aggregated_probs.shape[1],
+        )
+        if positive_option_index is None:
+            log.warning(
+                "Skipping sample distribution logs for %s: could not resolve positive option index",
+                dataset_name,
+            )
+            return
+
+        model_logits_arr = np.asarray(model_logits, dtype=np.float64)
+        if model_logits_arr.ndim != 3:
+            log.warning(
+                "Skipping sample distribution logs for %s: model_logits must be 3D, got shape=%s",
+                dataset_name,
+                model_logits_arr.shape,
+            )
+            return
+        if model_logits_arr.shape[0] != aggregated_probs.shape[0]:
+            log.warning(
+                "Skipping sample distribution logs for %s: example count mismatch between model_logits=%d and aggregated=%d",
+                dataset_name,
+                model_logits_arr.shape[0],
+                aggregated_probs.shape[0],
+            )
+            return
+        if model_logits_arr.shape[2] != aggregated_probs.shape[1]:
+            log.warning(
+                "Skipping sample distribution logs for %s: option count mismatch between model_logits=%d and aggregated=%d",
+                dataset_name,
+                model_logits_arr.shape[2],
+                aggregated_probs.shape[1],
+            )
+            return
+
+        max_logits = np.max(model_logits_arr, axis=2, keepdims=True)
+        stabilized_logits = model_logits_arr - max_logits
+        exp_logits = np.exp(stabilized_logits)
+        model_prob_dists = exp_logits / np.clip(np.sum(exp_logits, axis=2, keepdims=True), 1e-20, None)
+
+        prior_probs_arr = self._extract_cluster_saturation_prior_probs(
+            dataset,
+            aggregated_probs.shape[0],
+        )
+        if prior_probs_arr is not None and prior_probs_arr.shape[0] != aggregated_probs.shape[0]:
+            log.warning(
+                "Skipping prior distribution logs for %s: length mismatch (priors=%d, predictions=%d)",
+                dataset_name,
+                prior_probs_arr.shape[0],
+                aggregated_probs.shape[0],
+            )
+            prior_probs_arr = None
+
+        evidence_assignments = getattr(dataset, "pubmedqa_context_assignment_by_example", None)
+        if isinstance(evidence_assignments, list) and len(evidence_assignments) == aggregated_probs.shape[0]:
+            evidence_assignments_arr = np.asarray(evidence_assignments, dtype=np.int32)
+        else:
+            evidence_assignments_arr = None
+
+        model_names = self.metadata.get("models", []) if isinstance(self.metadata, dict) else []
+        if not isinstance(model_names, list):
+            model_names = []
+
+        num_options = aggregated_probs.shape[1]
+        for sample_idx, (gt_positive_prob, model_dists, agg_dist, prior_positive_prob, evidence_model_idx) in enumerate(
+            zip(
+                gt_probs_arr.tolist(),
+                model_prob_dists,
+                aggregated_probs,
+                prior_probs_arr.tolist() if prior_probs_arr is not None else [None] * aggregated_probs.shape[0],
+                evidence_assignments_arr.tolist() if evidence_assignments_arr is not None else [None] * aggregated_probs.shape[0],
+            )
+        ):
+            gt_positive_prob = float(np.clip(gt_positive_prob, 0.0, 1.0))
+            if num_options == 1:
+                gt_dist = np.array([gt_positive_prob], dtype=np.float64)
+            else:
+                off_prob = (1.0 - gt_positive_prob) / float(num_options - 1)
+                gt_dist = np.full(num_options, off_prob, dtype=np.float64)
+                gt_dist[positive_option_index] = gt_positive_prob
+
+            prior_dist = None
+            if prior_positive_prob is not None:
+                prior_positive_prob = float(np.clip(float(prior_positive_prob), 0.0, 1.0))
+                if num_options == 1:
+                    prior_dist = np.array([prior_positive_prob], dtype=np.float64)
+                else:
+                    prior_off_prob = (1.0 - prior_positive_prob) / float(num_options - 1)
+                    prior_dist = np.full(num_options, prior_off_prob, dtype=np.float64)
+                    prior_dist[positive_option_index] = prior_positive_prob
+
+            per_model_parts = []
+            for model_idx, model_dist in enumerate(model_dists):
+                per_model_parts.append(
+                    f"model_{model_idx}_predicted_distribution="
+                    f"{np.array2string(np.asarray(model_dist, dtype=np.float64), precision=6, separator=', ')}"
+                )
+
+            if evidence_model_idx is not None:
+                evidence_part = f"evidence_model_index={int(evidence_model_idx)}"
+                if 0 <= int(evidence_model_idx) < len(model_names):
+                    evidence_part += f",evidence_model_name={str(model_names[int(evidence_model_idx)])}"
+                per_model_parts.append(evidence_part)
+
+            per_model_log = "; ".join(per_model_parts)
+
+            if prior_dist is None:
+                log.info(
+                    "%s - sample=%d gt_distribution=%s aggregated_predicted_distribution=%s %s",
+                    dataset_name,
+                    sample_idx,
+                    np.array2string(gt_dist, precision=6, separator=", "),
+                    np.array2string(np.asarray(agg_dist, dtype=np.float64), precision=6, separator=", "),
+                    per_model_log,
+                )
+            else:
+                log.info(
+                    "%s - sample=%d prior_distribution=%s gt_distribution=%s aggregated_predicted_distribution=%s %s",
+                    dataset_name,
+                    sample_idx,
+                    np.array2string(prior_dist, precision=6, separator=", "),
+                    np.array2string(gt_dist, precision=6, separator=", "),
+                    np.array2string(np.asarray(agg_dist, dtype=np.float64), precision=6, separator=", "),
+                    per_model_log,
+                )
+
+    def _extract_cluster_saturation_prior_probs(
+        self,
+        dataset: Dataset,
+        expected_len: int,
+    ) -> Optional[np.ndarray]:
+        """Extract prior P(S=1) values for cluster_saturation samples when available."""
+        for attr_name in ("prior_probabilities", "prior_probs", "prior_prob"):
+            candidate = getattr(dataset, attr_name, None)
+            if candidate is None:
+                continue
+            try:
+                arr = np.asarray(candidate, dtype=np.float64)
+            except Exception:
+                continue
+            if arr.ndim == 1 and arr.shape[0] == expected_len:
+                return np.clip(arr, 0.0, 1.0)
+
+        text_sources = []
+        if hasattr(dataset, "x") and isinstance(dataset.x, list):
+            text_sources.append(dataset.x)
+        if hasattr(dataset, "pubmedqa_with_context_x") and isinstance(dataset.pubmedqa_with_context_x, list):
+            text_sources.append(dataset.pubmedqa_with_context_x)
+        if hasattr(dataset, "pubmedqa_without_context_x") and isinstance(dataset.pubmedqa_without_context_x, list):
+            text_sources.append(dataset.pubmedqa_without_context_x)
+
+        for texts in text_sources:
+            if len(texts) != expected_len:
+                continue
+            extracted = []
+            parse_failed = False
+            for text in texts:
+                match = _CLUSTER_PRIOR_REGEX.search(str(text))
+                if not match:
+                    parse_failed = True
+                    break
+                extracted.append(float(match.group(1)))
+            if not parse_failed:
+                return np.clip(np.asarray(extracted, dtype=np.float64), 0.0, 1.0)
+
+        return None
     
     def evaluate(
         self,
@@ -453,6 +788,14 @@ class WageringEvaluator:
                 calibration_hidden_states,
             )
             log.info("Applied frozen temperature scaling to cached evaluation logits")
+
+        all_model_prompt_perplexities = None
+        if self.method_requires_model_perplexities:
+            all_model_prompt_perplexities = self._compute_prompt_perplexities(dataset)
+            log.info(
+                "Computed prompt perplexities for wagering method: shape=%s",
+                all_model_prompt_perplexities.shape,
+            )
         
         # Evaluate on all examples in batches for efficiency
         all_predictions = []
@@ -501,9 +844,9 @@ class WageringEvaluator:
                 "questions": batch_questions,
             }
             if self.method_requires_model_perplexities:
-                wagering_kwargs["model_perplexities"] = self._compute_option_distribution_perplexities(
-                    batch_logits_transposed
-                )
+                wagering_kwargs["model_perplexities"] = all_model_prompt_perplexities[
+                    batch_start:batch_end
+                ]
 
             res_dict = self.wagering_method.compute_wagers(**wagering_kwargs)  # [batch_size, num_models]
             batch_wagers = res_dict["wagers"]
@@ -610,19 +953,52 @@ class WageringEvaluator:
         try:
             # Get model logits in the right format [num_examples, num_models, num_options]
             model_logits = np.transpose(all_model_logits, (1, 0, 2))
+            is_cluster_saturation = _is_cluster_saturation_dataset_name(dataset_name)
             d_regret, best_expert_ids = compute_dynamic_regret(
                 model_logits, all_aggregated_probs, labels
             )
-            brier_d_regret = compute_brier_dynamic_regret(
-                model_logits, all_aggregated_probs, labels
-            )
-            model_brier_scores = _compute_model_brier_scores(model_logits, labels)
+            if is_cluster_saturation and hasattr(dataset, "probabilistic_labels"):
+                gt_probs = np.asarray(dataset.probabilistic_labels, dtype=np.float64)
+                positive_option_index = _resolve_positive_option_index(
+                    getattr(dataset, "positive_label", None),
+                    self.option_tokens,
+                    all_aggregated_probs.shape[1],
+                )
+                if positive_option_index is None:
+                    raise ValueError(
+                        "Could not resolve positive option index for cluster_saturation metrics"
+                    )
 
-            meta_metrics = compute_meta_metrics(
-                wagers_history,
-                best_expert_ids,
-                model_brier_scores,
-            )
+                brier_d_regret = compute_brier_dynamic_regret(
+                    model_logits,
+                    all_aggregated_probs,
+                    labels,
+                    gt_positive_probs=gt_probs,
+                    positive_option_index=positive_option_index,
+                )
+                d_regret = brier_d_regret
+                model_kl_scores = _compute_model_bernoulli_kl_to_gt_scores(
+                    model_logits,
+                    gt_probs,
+                    positive_option_index,
+                )
+                meta_metrics = compute_meta_metrics(
+                    wagers_history,
+                    best_expert_ids,
+                    model_rank_scores=-model_kl_scores,
+                    best_model_ids=np.argmin(model_kl_scores, axis=1),
+                )
+            else:
+                brier_d_regret = compute_brier_dynamic_regret(
+                    model_logits, all_aggregated_probs, labels
+                )
+                model_brier_scores = _compute_model_brier_scores(model_logits, labels)
+
+                meta_metrics = compute_meta_metrics(
+                    wagers_history,
+                    best_expert_ids,
+                    model_brier_scores,
+                )
             meta_acc = meta_metrics["meta_acc"]
             meta_nll = meta_metrics["meta_nll"]
             meta_auc = meta_metrics["meta_auc"]
@@ -630,6 +1006,23 @@ class WageringEvaluator:
             best_model_mrr = meta_metrics["best_model_mrr"]
         except Exception as e:
             log.warning(f"Could not compute d_regret/meta metrics: {e}")
+
+        kl_divergence = None
+        tv_distance = None
+        try:
+            kl_divergence, tv_distance = self._compute_probabilistic_label_metrics(
+                dataset,
+                all_aggregated_probs,
+            )
+        except Exception as e:
+            log.warning(f"Could not compute probabilistic-label KL/TV metrics: {e}")
+
+        self._log_cluster_saturation_sample_distributions(
+            dataset,
+            dataset_name,
+            np.transpose(all_model_logits, (1, 0, 2)),
+            all_aggregated_probs,
+        )
         
         results = {
             "dataset_name": dataset_name,
@@ -650,6 +1043,8 @@ class WageringEvaluator:
             "meta_auc": meta_auc,
             "kendall_tau": kendall_tau,
             "best_model_mrr": best_model_mrr,
+            "kl_divergence": kl_divergence,
+            "tv_distance": tv_distance,
         }
         
         brier_str = f"{brier:.4f}" if brier is not None and not np.isnan(brier) else "N/A"
@@ -660,9 +1055,12 @@ class WageringEvaluator:
         meta_acc_str = f"{meta_acc:.4f}" if meta_acc is not None and not np.isnan(meta_acc) else "N/A"
         kendall_tau_str = f"{kendall_tau:.4f}" if kendall_tau is not None and not np.isnan(kendall_tau) else "N/A"
         best_model_mrr_str = f"{best_model_mrr:.4f}" if best_model_mrr is not None and not np.isnan(best_model_mrr) else "N/A"
+        kl_divergence_str = f"{kl_divergence:.4f}" if kl_divergence is not None and not np.isnan(kl_divergence) else "N/A"
+        tv_distance_str = f"{tv_distance:.4f}" if tv_distance is not None and not np.isnan(tv_distance) else "N/A"
         log.info(f"{dataset_name} - Accuracy: {accuracy:.4f}, NLL: {nll:.4f}, Brier: {brier_str}, AUC: {auc_str}, ECE: {ece_str}, "
                f"DRegret: {d_regret_str}, BrierDRegret: {brier_d_regret_str}, MetaAcc: {meta_acc_str}, "
-               f"KendallTau: {kendall_tau_str}, BestModelMRR: {best_model_mrr_str}")
+             f"KendallTau: {kendall_tau_str}, BestModelMRR: {best_model_mrr_str}, "
+             f"KLDivergence: {kl_divergence_str}, TVDistance: {tv_distance_str}")
         
         # Log average wagers per model
         avg_wagers = np.mean(wagers_history, axis=0)
@@ -717,6 +1115,8 @@ class WageringEvaluator:
                 "meta_auc": meta_auc if meta_auc is not None and not np.isnan(meta_auc) else None,
                 "kendall_tau": kendall_tau if kendall_tau is not None and not np.isnan(kendall_tau) else None,
                 "best_model_mrr": best_model_mrr if best_model_mrr is not None and not np.isnan(best_model_mrr) else None,
+                "kl_divergence": kl_divergence if kl_divergence is not None and not np.isnan(kl_divergence) else None,
+                "tv_distance": tv_distance if tv_distance is not None and not np.isnan(tv_distance) else None,
             }
 
             primary_final_prefix = f"{log_prefix}/{dataset_name}/final"
@@ -1123,13 +1523,15 @@ class WageringEvaluator:
         test_datasets: List[Tuple[Dataset, str]],
         ood_dataset: Optional[Tuple[Dataset, str]] = None,
         resume: bool = True,
+        ood_datasets: Optional[List[Tuple[Dataset, str]]] = None,
     ) -> Dict[str, Any]:
         """
-        Evaluate on multiple test datasets and optionally an OOD dataset.
+        Evaluate on multiple test datasets and optionally one or more OOD datasets.
         
         Args:
             test_datasets: List of (dataset, name) tuples for test splits
-            ood_dataset: Optional (dataset, name) tuple for OOD evaluation
+            ood_dataset: Optional legacy single (dataset, name) tuple for OOD evaluation
+            ood_datasets: Optional list of (dataset, name) tuples for OOD evaluation
             resume: If True, attempt to resume from checkpoint if available (DISABLED - always evaluates from scratch)
             
         Returns:
@@ -1138,6 +1540,12 @@ class WageringEvaluator:
         all_results = {}
         completed_datasets = []
         all_analytics_dfs = []
+
+        resolved_ood_datasets: List[Tuple[Dataset, str]] = []
+        if ood_datasets is not None:
+            resolved_ood_datasets = list(ood_datasets)
+        elif ood_dataset is not None:
+            resolved_ood_datasets = [ood_dataset]
         
         # Evaluate on test splits
         for dataset, name in test_datasets:
@@ -1153,9 +1561,8 @@ class WageringEvaluator:
             # Save checkpoint after each dataset
             # self._save_checkpoint(all_results, completed_datasets)
         
-        # Evaluate on OOD dataset if provided
-        if ood_dataset is not None:
-            dataset, name = ood_dataset
+        # Evaluate on OOD dataset(s) if provided
+        for dataset, name in resolved_ood_datasets:
             ood_name = f"ood_{name}"
             
             log.info(f"Evaluating OOD dataset: {name} -> {ood_name}")
@@ -1189,7 +1596,7 @@ class WageringEvaluator:
         self._plot_average_wagers_across_datasets(all_results, "test")
         
         # Plot average wagers across OOD datasets if applicable
-        if ood_dataset is not None:
+        if resolved_ood_datasets:
             # Create filtered results dict with only OOD datasets
             ood_results = {k: v for k, v in all_results.items() if k.startswith("ood_")}
             if ood_results:

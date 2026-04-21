@@ -5,6 +5,7 @@ import math
 import pytest
 
 from wagering.core.metrics import bernoulli_kl_divergence, bernoulli_tv_distance
+from wagering.core.dataset import Dataset
 
 
 def test_bernoulli_tv_distance_basic() -> None:
@@ -37,3 +38,18 @@ def test_bernoulli_metrics_validate_ranges() -> None:
         bernoulli_tv_distance([1.2], [0.5])
     with pytest.raises(ValueError):
         bernoulli_kl_divergence([0.5], [-0.1])
+
+
+def test_dataset_select_keeps_probabilistic_labels_aligned() -> None:
+    dataset = Dataset(
+        x=["q0", "q1", "q2"],
+        y=["1", "0", "1"],
+        batch_size=2,
+    )
+    dataset.probabilistic_labels = [0.9, 0.2, 0.8]
+
+    dataset.select([2, 0])
+
+    assert dataset.x == ["q2", "q0"]
+    assert dataset.y == ["1", "1"]
+    assert dataset.probabilistic_labels == [0.8, 0.9]

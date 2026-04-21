@@ -42,7 +42,7 @@ aggregation:
 
 # Common options
 option_tokens: ["YES", "NO"]
-cache_path: /common/users/yl2310/MultiLLMs/cache
+
 
 # ============================================================================
 # TRAINING CONFIGURATION

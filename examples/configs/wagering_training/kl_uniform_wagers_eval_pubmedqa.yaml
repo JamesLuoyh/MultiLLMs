@@ -65,7 +65,7 @@ wandb_name: kl_uniform_wagers_pubmedqa_eval
 
 # Include test dataset configs
 _include_test_datasets:
-  - datasets/pubmedqa_context_only_perturb.yaml
+  - datasets/pubmedqa_context_only.yaml
 
 # Override dataset-specific settings for evaluation
 test_datasets:

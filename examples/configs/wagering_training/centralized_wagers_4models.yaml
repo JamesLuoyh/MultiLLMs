@@ -41,7 +41,6 @@ aggregation:
 
 # Common options
 option_tokens: ["A", "B", "C", "D"]
-cache_path: /common/users/yl2310/MultiLLMs/cache
 
 # ============================================================================
 # TRAINING CONFIGURATION
@@ -98,10 +97,12 @@ test_datasets:
     eval_split: validation  # MedMCQA test split has no labels, use validation
 
 # OOD dataset
-_include_ood_dataset: datasets/arc_challenge.yaml
-
+_include_ood_datasets:
+  - datasets/arc_challenge.yaml
+  - datasets/forecastqa.yaml
 # Override OOD dataset-specific settings
-ood_dataset:
-  display_name: arc_challenge_ood
-  eval_split: test
-
+ood_datasets:
+  - display_name: arc_challenge_ood
+    eval_split: test
+  - display_name: forecastqa_ood
+    eval_split: test

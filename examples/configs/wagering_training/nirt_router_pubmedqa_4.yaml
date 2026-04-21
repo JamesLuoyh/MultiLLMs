@@ -60,7 +60,7 @@ training_batch_size: 100
 auto_resume: false
 balance_training_datasets: true
 shuffle_data: true
-shuffle_seed: 18 #18 #18
+shuffle_seed: 18
 early_stopping_patience: 5
 early_stopping_criterion: validation
 

@@ -11,7 +11,7 @@ _include_models:
 checkpoint_path: /common/users/yl2310/MultiLLMs/checkpoints/dummy_kl_uniform_wagers
 
 # Apply adaptive temperature scaling to cached option logits before wagering.
-calibrated: false
+calibrated: true
 _include_calibration: calibration/adaptive_temperature_1000samples.yaml
 
 shuffle_data: true  # Shuffle training data across datasets
@@ -66,24 +66,24 @@ wandb_name: kl_uniform_wagers_mixed_data_4_eval
 _include_test_datasets:
   - datasets/mmlu_full.yaml
   - datasets/medmcqa.yaml
-  - datasets/forecastqa.yaml
 
 # Override dataset-specific settings for evaluation with 1000 samples each
 test_datasets:
   - display_name: mmlu_full_test
     eval_split: test
   - display_name: medmcqa_test
-    eval_split: validation  # MedMCQA test split has no labels, use validation
-  - display_name: forecastqa_test
+    eval_split: validation  
+# Include OOD dataset configs
+_include_ood_datasets:
+  - datasets/arc_challenge.yaml
+  - datasets/forecastqa.yaml
+# Override OOD dataset-specific settings
+ood_datasets:
+  - display_name: arc_challenge_ood
     eval_split: test
-# Include OOD dataset config
-_include_ood_dataset: datasets/arc_challenge.yaml
+  - display_name: forecastqa_ood
+    eval_split: test
 
-# Override OOD dataset-specific settings with 1000 samples
-ood_dataset:
-  display_name: arc_challenge_ood
-  eval_split: test
-  
 
 # Evaluation parameters
 
@@ -92,7 +92,6 @@ ood_dataset:
 resume_eval: false  # Set to true to resume from checkpoint
 
 # Paths
-cache_path: /common/users/yl2310/MultiLLMs/cache
 
 # Wandb logging
 report_to_wandb: true

@@ -11,6 +11,14 @@ _include_models:
   - models/llama3_aloe_8b_alpha.yaml
   - models/llama3_aloe_8b_alpha.yaml
   - models/llama3_aloe_8b_alpha.yaml
+  - models/llama3_aloe_8b_alpha.yaml
+  - models/llama3_aloe_8b_alpha.yaml
+  - models/llama3_aloe_8b_alpha.yaml
+  - models/llama3_aloe_8b_alpha.yaml
+  - models/llama3_aloe_8b_alpha.yaml
+  - models/llama3_aloe_8b_alpha.yaml
+  - models/llama3_aloe_8b_alpha.yaml
+  - models/llama3_aloe_8b_alpha.yaml
 
 
 # Apply adaptive temperature scaling to cached option logits before wagering.
@@ -21,12 +29,12 @@ _include_calibration: calibration/adaptive_temperature_pubmedqa_1000samples.yaml
 
 # Wagering method (must match between training and evaluation)
 wagering_method:
-  name: mse_br_wagers_v2
+  name: mse_br_wagers_v3
   config:
     hidden_dim: 4096  # Dimension of hidden states (adjust based on model)
     hidden_layers: [512, 256]  # MLP hidden layer sizes
-    hidden_state_layers_per_model: [-4, -3, -2, -1]  # Per-model layer picks, aligned with _include_models order
-    learning_rate: 5e-5  # Learning rate for router optimizer (lowered from 1e-4 to prevent wager collapse)
+    hidden_state_layers_per_model: [-12,-11,-10,-9,-8,-7,-6,-5,-4,-3,-2,-1]  # Per-model layer picks, aligned with _include_models order
+    learning_rate: 5e-06  # Learning rate for router optimizer (lowered from 1e-4 to prevent wager collapse)
     lr_decay_factor: 1  # Decay learning rate by this factor every lr_decay_steps (1.0 = no decay)
     lr_decay_steps: 100  # Number of optimizer steps between decay applications
     temperature: 2.0  # Temperature for softmax (higher = softer, prevents one model from dominating)
@@ -68,7 +76,7 @@ wager_score_plot_every: 200  # Plot wager score distributions every 100 batches 
 auto_resume: false  # Automatically resume from latest checkpoint if available
 balance_training_datasets: true  # If true, randomly subsample each dataset to min dataset size
 shuffle_data: true  # Shuffle training data across datasets
-shuffle_seed: 18 #18  # Random seed for shuffling (will be overridden by sweep)
+shuffle_seed: 18 #18 #18  # Random seed for shuffling (will be overridden by sweep)
 early_stopping_patience: 1500  # Stop training if no improvement for 20 epochs (default: 10)
 early_stopping_criterion: online_learning  # Use validation performance for early stopping (default: "validation")
 use_brier_d_regret_for_early_stopping: true
@@ -76,7 +84,7 @@ use_brier_d_regret_for_early_stopping: true
 report_to_wandb: true
 wandb_project: multi-llm-wagering
 wandb_entity: null
-wandb_name: mse_br_wagers_v2_pubmedqa_context_only_mixed_layers
+wandb_name: mse_br_wagers_v3_pubmedqa_context_only_mixed_layers
 
 # ============================================================================
 # EVALUATION CONFIGURATION

@@ -1,6 +1,8 @@
 import os
 import ast
 import json
+import inspect
+import importlib
 import pandas as pd
 import numpy as np
 import logging
@@ -242,6 +244,8 @@ class Dataset:
         self.y = [self.y[i] for i in indices]
         if self.images is not None:
             self.images = [self.images[i] for i in indices]
+        if hasattr(self, "probabilistic_labels") and isinstance(self.probabilistic_labels, list):
+            self.probabilistic_labels = [self.probabilistic_labels[i] for i in indices]
         return self
 
     def train_test_split(self, test_size: int, seed: int, split: str = "train"):
@@ -341,16 +345,96 @@ class Dataset:
 
         x = raw_x
         y = csv[y_column].tolist()
+        records = csv.to_dict(orient="records")
 
         prompt_without_context = str(kwargs.get("prompt_without_context", "") or "")
         mixed_context_routing = str(kwargs.get("mixed_context_routing", "") or "").strip().lower()
+        prompt_helper_spec = str(kwargs.get("prompt_helper", "") or "").strip()
+        prompt_without_context_helper_spec = str(
+            kwargs.get("prompt_without_context_helper", "") or ""
+        ).strip()
 
         with_context_prompts = None
         without_context_prompts = None
 
-        if len(prompt):
+        def _resolve_helper(helper_spec: str, key_name: str):
+            if not helper_spec:
+                return None
+
+            module_path, sep, function_name = helper_spec.partition(":")
+            if not sep or not module_path or not function_name:
+                raise ValueError(
+                    f"{key_name} must use 'module.path:function_name' format, got: {helper_spec}"
+                )
+
+            try:
+                module = importlib.import_module(module_path)
+            except Exception as exc:
+                raise ValueError(
+                    f"Failed to import module '{module_path}' for {key_name}: {exc}"
+                ) from exc
+
+            helper = getattr(module, function_name, None)
+            if helper is None or not callable(helper):
+                raise ValueError(
+                    f"{key_name} references missing or non-callable '{function_name}' in module '{module_path}'"
+                )
+            return helper
+
+        def _render_with_helper(helper, row: dict, key_name: str) -> str:
+            try:
+                signature = inspect.signature(helper)
+            except (TypeError, ValueError):
+                signature = None
+
+            try:
+                if signature is None:
+                    return str(helper(**row))
+
+                call_kwargs = {}
+                has_var_keyword = False
+                for param in signature.parameters.values():
+                    if param.kind == inspect.Parameter.VAR_KEYWORD:
+                        has_var_keyword = True
+                        break
+                    if param.kind in (
+                        inspect.Parameter.POSITIONAL_ONLY,
+                        inspect.Parameter.VAR_POSITIONAL,
+                    ):
+                        raise ValueError(
+                            f"{key_name} helper '{helper.__name__}' must use keyword-compatible params"
+                        )
+                    if param.name in row:
+                        call_kwargs[param.name] = row[param.name]
+                    elif param.default is inspect.Parameter.empty:
+                        raise ValueError(
+                            f"{key_name} helper '{helper.__name__}' requires CSV column '{param.name}'"
+                        )
+
+                if has_var_keyword:
+                    call_kwargs = dict(row)
+
+                return str(helper(**call_kwargs))
+            except Exception as exc:
+                raise ValueError(
+                    f"Failed to render {key_name} using helper '{helper.__module__}:{helper.__name__}' "
+                    f"for CSV row with id={row.get('id', '<missing>')}: {exc}"
+                ) from exc
+
+        prompt_helper = _resolve_helper(prompt_helper_spec, "prompt_helper")
+        prompt_without_context_helper = _resolve_helper(
+            prompt_without_context_helper_spec,
+            "prompt_without_context_helper",
+        )
+
+        if prompt_helper is not None:
+            with_context_prompts = [
+                _render_with_helper(prompt_helper, row, "prompt_helper") for row in records
+            ]
+            x = with_context_prompts
+        elif len(prompt):
             formatted_x = []
-            for text_value, row in zip(raw_x, csv.to_dict(orient="records")):
+            for text_value, row in zip(raw_x, records):
                 format_kwargs = dict(row)
                 format_kwargs.setdefault("text", text_value)
                 try:
@@ -363,9 +447,18 @@ class Dataset:
             with_context_prompts = formatted_x
             x = formatted_x
 
-        if len(prompt_without_context):
+        if prompt_without_context_helper is not None:
+            without_context_prompts = [
+                _render_with_helper(
+                    prompt_without_context_helper,
+                    row,
+                    "prompt_without_context_helper",
+                )
+                for row in records
+            ]
+        elif len(prompt_without_context):
             formatted_without_context = []
-            for text_value, row in zip(raw_x, csv.to_dict(orient="records")):
+            for text_value, row in zip(raw_x, records):
                 format_kwargs = dict(row)
                 format_kwargs.setdefault("text", text_value)
                 try:
@@ -378,13 +471,13 @@ class Dataset:
             without_context_prompts = formatted_without_context
 
         if mixed_context_routing == "pubmedqa":
-            if not len(prompt):
+            if with_context_prompts is None:
                 raise ValueError(
-                    "mixed_context_routing='pubmedqa' requires a populated 'prompt' template"
+                    "mixed_context_routing='pubmedqa' requires either 'prompt' or 'prompt_helper'"
                 )
-            if not len(prompt_without_context):
+            if without_context_prompts is None:
                 raise ValueError(
-                    "mixed_context_routing='pubmedqa' requires 'prompt_without_context'"
+                    "mixed_context_routing='pubmedqa' requires either 'prompt_without_context' or 'prompt_without_context_helper'"
                 )
             # PubMedQA-style mixed-context routing uses reduced prompts by default and
             # swaps in evidence-bearing prompts only for the assigned model per example.

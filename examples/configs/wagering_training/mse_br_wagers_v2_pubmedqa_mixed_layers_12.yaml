@@ -34,7 +34,7 @@ wagering_method:
     hidden_dim: 4096  # Dimension of hidden states (adjust based on model)
     hidden_layers: [512, 256]  # MLP hidden layer sizes
     hidden_state_layers_per_model: [-12,-11,-10,-9,-8,-7,-6,-5,-4,-3,-2,-1]  # Per-model layer picks, aligned with _include_models order
-    learning_rate: 5e-5  # Learning rate for router optimizer (lowered from 1e-4 to prevent wager collapse)
+    learning_rate: 5e-06  # Learning rate for router optimizer (lowered from 1e-4 to prevent wager collapse)
     lr_decay_factor: 1  # Decay learning rate by this factor every lr_decay_steps (1.0 = no decay)
     lr_decay_steps: 100  # Number of optimizer steps between decay applications
     temperature: 2.0  # Temperature for softmax (higher = softer, prevents one model from dominating)

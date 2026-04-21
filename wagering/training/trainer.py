@@ -94,6 +94,56 @@ def _compute_kendall_tau_from_scores(
     return float(np.mean(tau_per_example))
 
 
+def _is_cluster_saturation_dataset_name(dataset_name: Optional[str]) -> bool:
+    """Return True when dataset name refers to cluster_saturation_bayes."""
+    if not dataset_name:
+        return False
+    return "cluster_saturation" in str(dataset_name).strip().lower()
+
+
+def _resolve_positive_option_index(
+    positive_label: Optional[Any],
+    option_tokens: List[str],
+    num_options: int,
+) -> Optional[int]:
+    """Resolve positive class index for binary probabilistic metrics."""
+    option_token_to_index = {str(token): idx for idx, token in enumerate(option_tokens)}
+    if positive_label is not None:
+        resolved = option_token_to_index.get(str(positive_label))
+        if resolved is not None:
+            return int(resolved)
+    if num_options == 2:
+        # Binary fallback when positive label is not explicitly configured.
+        return 1
+    return None
+
+
+def _compute_model_bernoulli_kl_to_gt_scores(
+    model_logits: np.ndarray,
+    gt_positive_probs: np.ndarray,
+    positive_option_index: int,
+) -> np.ndarray:
+    """Compute per-example, per-model KL(gt || pred) for binary probabilities."""
+    model_probs = _compute_model_probs_from_logits(model_logits)
+    pred_positive_probs = np.clip(
+        model_probs[:, :, positive_option_index],
+        1e-10,
+        1.0 - 1e-10,
+    )
+    target_positive_probs = np.clip(
+        np.asarray(gt_positive_probs, dtype=np.float64)[:, np.newaxis],
+        1e-10,
+        1.0 - 1e-10,
+    )
+    target_negative_probs = 1.0 - target_positive_probs
+    pred_negative_probs = 1.0 - pred_positive_probs
+    kl_scores = (
+        target_positive_probs * np.log(target_positive_probs / pred_positive_probs)
+        + target_negative_probs * np.log(target_negative_probs / pred_negative_probs)
+    )
+    return kl_scores
+
+
 def compute_dynamic_regret(
     model_logits: np.ndarray,
     aggregated_probs: np.ndarray,
@@ -136,6 +186,8 @@ def compute_brier_dynamic_regret(
     model_logits: np.ndarray,
     aggregated_probs: np.ndarray,
     labels: np.ndarray,
+    gt_positive_probs: Optional[np.ndarray] = None,
+    positive_option_index: Optional[int] = None,
 ) -> float:
     """
     Compute Brier Dynamic Regret: aggregated_brier - best_expert_brier.
@@ -148,6 +200,29 @@ def compute_brier_dynamic_regret(
     Returns:
         Average Brier dynamic regret over examples.
     """
+    if gt_positive_probs is not None:
+        if positive_option_index is None:
+            raise ValueError("positive_option_index is required when gt_positive_probs is provided")
+        gt_positive_probs_arr = np.asarray(gt_positive_probs, dtype=np.float64)
+        if gt_positive_probs_arr.ndim != 1:
+            raise ValueError("gt_positive_probs must be a 1D array")
+        if gt_positive_probs_arr.shape[0] != aggregated_probs.shape[0]:
+            raise ValueError(
+                "gt_positive_probs length must match number of examples in aggregated_probs"
+            )
+
+        model_probs = _compute_model_probs_from_logits(model_logits)
+        model_positive_probs = model_probs[:, :, positive_option_index]
+        model_expected_brier = (model_positive_probs - gt_positive_probs_arr[:, np.newaxis]) ** 2
+        best_expert_expected_brier = np.min(model_expected_brier, axis=1)
+
+        aggregated_positive_probs = aggregated_probs[:, positive_option_index]
+        aggregated_expected_brier = (aggregated_positive_probs - gt_positive_probs_arr) ** 2
+        expected_brier_d_regret = np.mean(
+            aggregated_expected_brier - best_expert_expected_brier
+        )
+        return float(expected_brier_d_regret)
+
     labels_arr = np.asarray(labels, dtype=np.int64)
     num_options = aggregated_probs.shape[1]
     one_hot_labels = np.eye(num_options, dtype=np.float64)[labels_arr]
@@ -165,6 +240,8 @@ def compute_meta_metrics(
     wagers: np.ndarray,
     best_expert_ids: np.ndarray,
     model_brier_scores: Optional[np.ndarray] = None,
+    model_rank_scores: Optional[np.ndarray] = None,
+    best_model_ids: Optional[np.ndarray] = None,
 ) -> Dict[str, Optional[float]]:
     """
     Compute meta metrics treating wagers as predictions of best expert.
@@ -209,7 +286,20 @@ def compute_meta_metrics(
     
     kendall_tau = None
     best_model_mrr = None
-    if model_brier_scores is not None:
+    if model_rank_scores is not None and best_model_ids is not None:
+        try:
+            kendall_tau = _compute_kendall_tau_from_scores(model_rank_scores, wagers)
+
+            predicted_order = np.argsort(-wagers, axis=1, kind="stable")
+            best_model_ranks = np.argmax(
+                predicted_order == best_model_ids[:, np.newaxis], axis=1
+            ) + 1
+            best_model_mrr = float(np.mean(1.0 / best_model_ranks))
+        except Exception as e:
+            log.warning(f"Failed to compute kendall_tau/best_model_mrr from rank scores: {e}")
+            kendall_tau = None
+            best_model_mrr = None
+    elif model_brier_scores is not None:
         try:
             # Lower Brier is better, so negate scores to get higher-is-better ranking.
             kendall_tau = _compute_kendall_tau_from_scores(-model_brier_scores, wagers)
@@ -266,6 +356,7 @@ class WageringTrainer:
         logit_calibrator: Optional[Any] = None,
         save_epoch_checkpoints: bool = True,
         max_epoch_checkpoints: Optional[int] = None,
+        enable_artifact_outputs: bool = True,
     ):
         """
         Initialize the trainer.
@@ -296,6 +387,8 @@ class WageringTrainer:
                 Disable to reduce disk usage for large hyperparameter sweeps.
             max_epoch_checkpoints: Maximum number of transition checkpoints to keep.
                 If set, older transition checkpoints are removed after each save.
+            enable_artifact_outputs: If False, skip non-essential artifact writes
+                (analytics CSVs and plot files) to reduce I/O overhead.
         """
         self.models = models
         self.datasets = datasets
@@ -321,6 +414,7 @@ class WageringTrainer:
         self.validation_split_ratio = validation_split_ratio
         self.balance_training_datasets = balance_training_datasets
         self.save_epoch_checkpoints = bool(save_epoch_checkpoints)
+        self.enable_artifact_outputs = bool(enable_artifact_outputs)
         self.max_epoch_checkpoints = None
         if max_epoch_checkpoints is not None:
             try:
@@ -355,6 +449,8 @@ class WageringTrainer:
                     "Wager-vs-score_diff plotting is disabled.",
                     wager_score_plot_every,
                 )
+        if not self.enable_artifact_outputs:
+            self.wager_score_plot_every = None
         self.logit_calibrator = logit_calibrator
         self.requires_hidden_states = bool(getattr(self.wagering_method, "requires_hidden_states", True))
         self.use_concatenated_prompt_context = bool(
@@ -824,6 +920,7 @@ class WageringTrainer:
         probs: np.ndarray,
         labels: np.ndarray,
         dataset_indices: np.ndarray,
+        example_local_indices: Optional[np.ndarray] = None,
         wagers_history: Optional[np.ndarray] = None,
         model_logits: Optional[np.ndarray] = None,
     ) -> Dict[str, Dict[str, float]]:
@@ -835,6 +932,7 @@ class WageringTrainer:
             probs: Array of probability distributions
             labels: Array of true labels
             dataset_indices: Array indicating which dataset each example came from
+            example_local_indices: Optional local indices within each source dataset
             wagers_history: Optional array of wagers [num_examples, num_models]
             model_logits: Optional array of model logits [num_examples, num_models, num_options] for computing d_regret
             
@@ -895,20 +993,61 @@ class WageringTrainer:
                 try:
                     dataset_model_logits = model_logits[mask]
                     dataset_wagers = wagers_history[mask]
+                    dataset_obj = self.datasets[dataset_idx]
+                    dataset_name = getattr(dataset_obj, "cache_dataset_name", None)
+                    is_cluster_saturation = _is_cluster_saturation_dataset_name(dataset_name)
                     d_regret, best_expert_ids = compute_dynamic_regret(
                         dataset_model_logits, dataset_probs, dataset_labels
                     )
-                    brier_d_regret = compute_brier_dynamic_regret(
-                        dataset_model_logits, dataset_probs, dataset_labels
-                    )
-                    dataset_model_brier_scores = _compute_model_brier_scores(
-                        dataset_model_logits, dataset_labels
-                    )
-                    meta_metrics = compute_meta_metrics(
-                        dataset_wagers,
-                        best_expert_ids,
-                        dataset_model_brier_scores,
-                    )
+                    if is_cluster_saturation and hasattr(dataset_obj, "probabilistic_labels"):
+                        if example_local_indices is None:
+                            raise ValueError(
+                                "example_local_indices is required for cluster_saturation grouped metrics"
+                            )
+                        gt_probs_all = np.asarray(dataset_obj.probabilistic_labels, dtype=np.float64)
+                        dataset_local_indices = np.asarray(example_local_indices[mask], dtype=np.int64)
+                        dataset_gt_probs = gt_probs_all[dataset_local_indices]
+                        positive_option_index = _resolve_positive_option_index(
+                            getattr(dataset_obj, "positive_label", None),
+                            self.option_tokens,
+                            dataset_probs.shape[1],
+                        )
+                        if positive_option_index is None:
+                            raise ValueError(
+                                "Could not resolve positive option index for cluster_saturation metrics"
+                            )
+
+                        brier_d_regret = compute_brier_dynamic_regret(
+                            dataset_model_logits,
+                            dataset_probs,
+                            dataset_labels,
+                            gt_positive_probs=dataset_gt_probs,
+                            positive_option_index=positive_option_index,
+                        )
+                        d_regret = brier_d_regret
+                        model_kl_scores = _compute_model_bernoulli_kl_to_gt_scores(
+                            dataset_model_logits,
+                            dataset_gt_probs,
+                            positive_option_index,
+                        )
+                        meta_metrics = compute_meta_metrics(
+                            dataset_wagers,
+                            best_expert_ids,
+                            model_rank_scores=-model_kl_scores,
+                            best_model_ids=np.argmin(model_kl_scores, axis=1),
+                        )
+                    else:
+                        brier_d_regret = compute_brier_dynamic_regret(
+                            dataset_model_logits, dataset_probs, dataset_labels
+                        )
+                        dataset_model_brier_scores = _compute_model_brier_scores(
+                            dataset_model_logits, dataset_labels
+                        )
+                        meta_metrics = compute_meta_metrics(
+                            dataset_wagers,
+                            best_expert_ids,
+                            dataset_model_brier_scores,
+                        )
                     meta_acc = meta_metrics["meta_acc"]
                     meta_nll = meta_metrics["meta_nll"]
                     meta_auc = meta_metrics["meta_auc"]
@@ -1245,7 +1384,7 @@ class WageringTrainer:
         if not has_val_logits:
             raise RuntimeError("No all_model_val_logits set - cannot evaluate validation metrics. This may happen if no validation split was configured.")
         
-        log.info("Evaluating on validation set...")
+        # log.info("Evaluating on validation set...")
         
         # Set wagering method to eval mode (no gradient updates)
         self.wagering_method.eval_mode()
@@ -1425,30 +1564,37 @@ class WageringTrainer:
         meta_acc_str = f"{val_meta_acc:.4f}" if val_meta_acc is not None and not np.isnan(val_meta_acc) else 'N/A'
         kendall_tau_str = f"{val_kendall_tau:.4f}" if val_kendall_tau is not None and not np.isnan(val_kendall_tau) else 'N/A'
         best_model_mrr_str = f"{val_best_model_mrr:.4f}" if val_best_model_mrr is not None and not np.isnan(val_best_model_mrr) else 'N/A'
-        log.info(f"Validation metrics: accuracy={val_accuracy:.4f}, nll={val_nll:.4f}, ece={ece_str}, auc={auc_str}, "
-               f"d_regret={d_regret_str}, brier_d_regret={brier_d_regret_str}, meta_acc={meta_acc_str}, "
-               f"kendall_tau={kendall_tau_str}, best_model_mrr={best_model_mrr_str}")
+        # log.info(f"Validation metrics: accuracy={val_accuracy:.4f}, nll={val_nll:.4f}, ece={ece_str}, auc={auc_str}, "
+        #        f"d_regret={d_regret_str}, brier_d_regret={brier_d_regret_str}, meta_acc={meta_acc_str}, "
+        #        f"kendall_tau={kendall_tau_str}, best_model_mrr={best_model_mrr_str}")
         
         # Compute grouped metrics by dataset
         if hasattr(self, 'validation_dataset_indices') and self.validation_dataset_indices is not None:
             # Transpose validation logits to [num_examples, num_models, num_options]
             val_model_logits_transposed = np.transpose(self.all_model_val_logits, (1, 0, 2)) if self.all_model_val_logits is not None else None
             grouped_metrics = self._compute_grouped_metrics(
-                val_predictions, val_probs, self.validation_labels, self.validation_dataset_indices, val_wagers, val_model_logits_transposed
+                val_predictions,
+                val_probs,
+                self.validation_labels,
+                self.validation_dataset_indices,
+                self.validation_example_local_indices,
+                val_wagers,
+                val_model_logits_transposed,
             )
             metrics["grouped"] = grouped_metrics
             
             # Log grouped metrics
-            for dataset_idx, dataset_metrics in grouped_metrics.items():
-                dataset_name = f"dataset_{dataset_idx}"
-                log.info(f"Validation metrics for {dataset_name}: accuracy={dataset_metrics['accuracy']:.4f}, "
-                        f"nll={dataset_metrics['nll']:.4f}, num_examples={dataset_metrics['num_examples']}")
+            # for dataset_idx, dataset_metrics in grouped_metrics.items():
+            #     dataset_name = f"dataset_{dataset_idx}"
+                # log.info(f"Validation metrics for {dataset_name}: accuracy={dataset_metrics['accuracy']:.4f}, "
+                #         f"nll={dataset_metrics['nll']:.4f}, num_examples={dataset_metrics['num_examples']}")
             
             # Plot validation wagers by dataset
-            val_results = {
-                "dataset_indices": self.validation_dataset_indices,
-            }
-            self._plot_validation_wagers_by_dataset(val_wagers, val_results)
+            if self.enable_artifact_outputs:
+                val_results = {
+                    "dataset_indices": self.validation_dataset_indices,
+                }
+                self._plot_validation_wagers_by_dataset(val_wagers, val_results)
         
         return metrics, val_nash_gaps, val_score_diffs, val_wagers, val_sigmoid_wagers
 
@@ -2445,7 +2591,7 @@ class WageringTrainer:
             self.current_step += 1
             
             epoch_accuracies.append(epoch_accuracy)
-            log.info(f"Epoch {epoch+1} training accuracy: {epoch_accuracy:.4f}, NLL: {epoch_nll:.4f}")
+            # log.info(f"Epoch {epoch+1} training accuracy: {epoch_accuracy:.4f}, NLL: {epoch_nll:.4f}")
 
             if stop_training_now:
                 break
@@ -2988,13 +3134,15 @@ class WageringTrainer:
         if hasattr(self, '_processed_start_idx'):
             start_idx = self._processed_start_idx
             processed_dataset_indices = self.dataset_indices[start_idx:start_idx + num_processed]
+            processed_example_local_indices = self.example_local_indices[start_idx:start_idx + num_processed]
         else:
             processed_dataset_indices = self.dataset_indices[:num_processed]
+            processed_example_local_indices = self.example_local_indices[:num_processed]
         
         # Compute grouped metrics by dataset
         grouped_metrics = self._compute_grouped_metrics(
             all_predictions, all_aggregated_probs, processed_labels,
-            processed_dataset_indices, wagers_history, final_model_logits
+            processed_dataset_indices, processed_example_local_indices, wagers_history, final_model_logits
         )
         
         results = {
@@ -3028,37 +3176,40 @@ class WageringTrainer:
             log.info(f"{display_name}: accuracy={dataset_metrics['accuracy']:.4f}, "
                 f"nll={dataset_metrics['nll']:.4f}, num_examples={dataset_metrics['num_examples']}")
         
-        # Create analytics dataframe
-        dataset_size = len(self.combined_dataset.x) if hasattr(self, 'combined_dataset') and self.combined_dataset is not None else None
-        analytics_df = WageringAnalytics.create_training_analytics(
-            wagering_method=self.wagering_method,
-            aggregation_function=self.aggregation_function,
-            models=self.models,
-            datasets=self.datasets,
-            shuffle_data=self.shuffle_data,
-            shuffle_seed=self.shuffle_seed,
-            early_stopping_patience=self.early_stopping_patience,
-            early_stopping_criterion=self.early_stopping_criterion,
-            use_brier_d_regret_for_early_stopping=self.use_brier_d_regret_for_early_stopping,
-            save_every=self.save_every,
-            results=results,
-            metadata=self.metadata,
-            checkpoint_dir=self.checkpoint_dir,
-            dataset_size=dataset_size,
-        )
-        results["analytics_df"] = analytics_df
-        
-        # Save analytics dataframe to checkpoint directory
-        if self.checkpoint_dir:
-            analytics_path = self.checkpoint_dir / "analytics.csv"
-            analytics_df.to_csv(analytics_path, index=False)
-            log.debug(f"Saved analytics dataframe to {analytics_path}")
+        if self.enable_artifact_outputs:
+            # Create analytics dataframe
+            dataset_size = len(self.combined_dataset.x) if hasattr(self, 'combined_dataset') and self.combined_dataset is not None else None
+            analytics_df = WageringAnalytics.create_training_analytics(
+                wagering_method=self.wagering_method,
+                aggregation_function=self.aggregation_function,
+                models=self.models,
+                datasets=self.datasets,
+                shuffle_data=self.shuffle_data,
+                shuffle_seed=self.shuffle_seed,
+                early_stopping_patience=self.early_stopping_patience,
+                early_stopping_criterion=self.early_stopping_criterion,
+                use_brier_d_regret_for_early_stopping=self.use_brier_d_regret_for_early_stopping,
+                save_every=self.save_every,
+                results=results,
+                metadata=self.metadata,
+                checkpoint_dir=self.checkpoint_dir,
+                dataset_size=dataset_size,
+            )
+            results["analytics_df"] = analytics_df
 
-            if len(self.batch_metrics_history) > 0:
-                batch_metrics_df = pd.DataFrame(self.batch_metrics_history)
-                batch_metrics_path = self.checkpoint_dir / "batch_metrics.csv"
-                batch_metrics_df.to_csv(batch_metrics_path, index=False)
-                log.debug(f"Saved batch metrics dataframe to {batch_metrics_path}")
+            # Save analytics dataframe to checkpoint directory
+            if self.checkpoint_dir:
+                analytics_path = self.checkpoint_dir / "analytics.csv"
+                analytics_df.to_csv(analytics_path, index=False)
+                log.debug(f"Saved analytics dataframe to {analytics_path}")
+
+                if len(self.batch_metrics_history) > 0:
+                    batch_metrics_df = pd.DataFrame(self.batch_metrics_history)
+                    batch_metrics_path = self.checkpoint_dir / "batch_metrics.csv"
+                    batch_metrics_df.to_csv(batch_metrics_path, index=False)
+                    log.debug(f"Saved batch metrics dataframe to {batch_metrics_path}")
+        else:
+            results["analytics_df"] = None
         
         # Log final training metrics to wandb
         if self.wandb_logger:
@@ -3224,13 +3375,14 @@ class WageringTrainer:
                     raise RuntimeError(f"Error logging val/final metrics to wandb: {e}") from e
         
         # Plot wagers over time
-        self._plot_wagers_over_time(wagers_history, results)
-        self._plot_val_nash_gap_relationships(
-            val_nash_gap_history=np.array(val_nash_gap_history, dtype=np.float32),
-            val_d_regret_history=np.array(val_d_regret_history, dtype=np.float32),
-            val_accuracy_history=np.array(val_accuracy_history, dtype=np.float32),
-            val_history_epochs=np.array(val_nash_gap_history_epochs, dtype=np.int32),
-        )
+        if self.enable_artifact_outputs:
+            self._plot_wagers_over_time(wagers_history, results)
+            self._plot_val_nash_gap_relationships(
+                val_nash_gap_history=np.array(val_nash_gap_history, dtype=np.float32),
+                val_d_regret_history=np.array(val_d_regret_history, dtype=np.float32),
+                val_accuracy_history=np.array(val_accuracy_history, dtype=np.float32),
+                val_history_epochs=np.array(val_nash_gap_history_epochs, dtype=np.int32),
+            )
         
         return results
     

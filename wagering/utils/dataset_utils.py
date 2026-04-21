@@ -75,6 +75,12 @@ def _build_dataset_cache_config_signature(
     random_seed: Optional[int],
 ) -> Dict[str, Any]:
     """Build a deterministic dataset configuration signature for cache keys."""
+    cache_cfg = dict(dataset_cfg)
+    # Debug-only subsetting should not force cache misses. Keep cache identity tied
+    # to source data and split config, not post-load evaluation caps.
+    cache_cfg.pop("size", None)
+    cache_cfg.pop("sample_size", None)
+
     signature_payload: Dict[str, Any] = {
         "dataset_name": dataset_name,
         "load_split": load_split,
@@ -85,7 +91,7 @@ def _build_dataset_cache_config_signature(
         "dataset_target_split": dataset_target_split,
         # Keep random seed in signature only if explicitly pinned in dataset config.
         "split_seed": dataset_cfg.get("split_seed") if "split_seed" in dataset_cfg else None,
-        "dataset_config": dict(dataset_cfg),
+        "dataset_config": cache_cfg,
         "dataset_files_fingerprint": _local_path_fingerprint({
             "name": dataset_cfg.get("name"),
             "data_files": dataset_cfg.get("data_files"),
@@ -634,27 +640,35 @@ def _apply_balanced_binary_split(
             )
 
             if per_class_limit <= 0:
-                raise ValueError(
-                    f"Requested size={requested_size_int} is too small to keep class balance "
-                    f"for dataset '{dataset_name}'."
-                )
-
-            rng.shuffle(split_pos_indices)
-            rng.shuffle(split_neg_indices)
-
-            selected_indices = np.concatenate(
-                [split_pos_indices[:per_class_limit], split_neg_indices[:per_class_limit]]
-            )
-            rng.shuffle(selected_indices)
-
-            balanced_size = int(selected_indices.shape[0])
-            if balanced_size < requested_size_int:
+                # Debug fallback: allow very small subsets (e.g., size=1) even if
+                # exact class balance is impossible.
+                selected_indices = selected_indices[:requested_size_int]
                 log.warning(
-                    "Requested size=%d for dataset '%s' adjusted to %d to preserve class balance.",
+                    "Requested size=%d for dataset '%s' is too small to preserve class "
+                    "balance; using unbalanced debug subset of size %d.",
                     requested_size_int,
                     dataset_name,
-                    balanced_size,
+                    int(selected_indices.shape[0]),
                 )
+                per_class_limit = 0
+
+            if per_class_limit > 0:
+                rng.shuffle(split_pos_indices)
+                rng.shuffle(split_neg_indices)
+
+                selected_indices = np.concatenate(
+                    [split_pos_indices[:per_class_limit], split_neg_indices[:per_class_limit]]
+                )
+                rng.shuffle(selected_indices)
+
+                balanced_size = int(selected_indices.shape[0])
+                if balanced_size < requested_size_int:
+                    log.warning(
+                        "Requested size=%d for dataset '%s' adjusted to %d to preserve class balance.",
+                        requested_size_int,
+                        dataset_name,
+                        balanced_size,
+                    )
 
     # Keep any mixed-context prompt variants aligned with the selected subset.
     dataset_type_hint = str(getattr(dataset, "pubmedqa_prompt_strategy", "")).strip().lower()
@@ -765,7 +779,8 @@ def load_datasets_from_config(
             for key in ("split_ratios", "train_target_split", "eval_target_split")
         )
         use_balanced_binary_split = (not is_pubmedqa and not is_race and generic_split_keys_present)
-        requested_size = dataset_cfg.get("size", None)
+        # Backward-compatible alias: some configs use sample_size for dataset caps.
+        requested_size = dataset_cfg.get("size", dataset_cfg.get("sample_size", None))
 
         if is_pubmedqa:
             config_name = dataset_cfg.get(
@@ -862,6 +877,8 @@ def load_datasets_from_config(
                 "probability_label_column",
                 "positive_label",
                 "mixed_context_routing",
+                "prompt_helper",
+                "prompt_without_context_helper",
             ):
                 if optional_key in dataset_cfg and dataset_cfg.get(optional_key) is not None:
                     dataset_load_kwargs[optional_key] = dataset_cfg.get(optional_key)

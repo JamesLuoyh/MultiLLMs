@@ -61,6 +61,7 @@ _configure_default_hf_cache_env()
 from wagering.calibration import calibration_enabled, fit_or_load_logit_calibrator
 from wagering.methods.factory import load_wagering_method
 from wagering.utils import load_and_merge_configs
+from wagering.utils.multi_llm_ensemble import configure_wagering_cache_dir
 
 # Import training and evaluation functions
 def load_module_from_path(module_name, file_path):
@@ -157,6 +158,7 @@ def run_pipeline(
         log.info("Using CUDA_VISIBLE_DEVICES=%s", visible_gpus)
 
     args = load_and_merge_configs(config_path)
+    configure_wagering_cache_dir(args.get("cache_path"))
     calibration_path = None
     checkpoint_path = None
     created_checkpoint_path = None

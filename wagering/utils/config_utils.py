@@ -7,7 +7,7 @@ All paths should be explicit and errors are raised immediately if files are not 
 
 import yaml
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 
 
 def _normalize_option_tokens(config: Dict[str, Any]) -> None:
@@ -118,11 +118,54 @@ def _merge_dataset_includes(
 
 
 def _merge_ood_include(config: Dict[str, Any], base_dir: Path) -> None:
-    """Resolve OOD dataset include directive in-place."""
-    if "_include_ood_dataset" not in config:
+    """Resolve OOD dataset include directives in-place."""
+    include_single = config.get("_include_ood_dataset")
+    include_multi = config.get("_include_ood_datasets")
+
+    if include_single is None and include_multi is None:
         return
 
-    dataset_file = resolve_config_path(config["_include_ood_dataset"], base_dir)
+    if include_single is not None and include_multi is not None:
+        raise ValueError("Use either _include_ood_dataset or _include_ood_datasets, not both")
+
+    if include_multi is not None:
+        if not isinstance(include_multi, list):
+            raise ValueError(f"_include_ood_datasets must be a list, got {type(include_multi)}")
+
+        override_configs = config.get("ood_datasets", [])
+        ood_configs: List[Dict[str, Any]] = []
+        for idx, dataset_path in enumerate(include_multi):
+            dataset_file = resolve_config_path(dataset_path, base_dir)
+            dataset_config = load_yaml_file(dataset_file)
+
+            if idx < len(override_configs) and isinstance(override_configs[idx], dict):
+                dataset_config.update(override_configs[idx])
+
+            ood_configs.append(dataset_config)
+
+        config["ood_datasets"] = ood_configs
+        del config["_include_ood_datasets"]
+        return
+
+    # Backward compatibility: allow a single include path or a list under _include_ood_dataset.
+    if isinstance(include_single, list):
+        include_paths = include_single
+        override_configs = config.get("ood_datasets", [])
+        ood_configs: List[Dict[str, Any]] = []
+        for idx, dataset_path in enumerate(include_paths):
+            dataset_file = resolve_config_path(dataset_path, base_dir)
+            dataset_config = load_yaml_file(dataset_file)
+
+            if idx < len(override_configs) and isinstance(override_configs[idx], dict):
+                dataset_config.update(override_configs[idx])
+
+            ood_configs.append(dataset_config)
+
+        config["ood_datasets"] = ood_configs
+        del config["_include_ood_dataset"]
+        return
+
+    dataset_file = resolve_config_path(include_single, base_dir)
     ood_config = load_yaml_file(dataset_file)
 
     if "ood_dataset" in config and isinstance(config["ood_dataset"], dict):

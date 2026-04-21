@@ -60,7 +60,7 @@ cache_path: /common/users/yl2310/MultiLLMs/cache
 _include_datasets:
   - datasets/pubmedqa_context_only.yaml
 
-num_epochs: 1 #50
+num_epochs: 50
 checkpoint_base_dir: /common/users/yl2310/MultiLLMs/checkpoints
 save_every: 100
 training_batch_size: 100

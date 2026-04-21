@@ -32,6 +32,7 @@ from wagering.utils import (
 from wagering.calibration import calibration_enabled, fit_or_load_logit_calibrator
 from wagering.utils.multi_llm_ensemble import (
     assign_pubmedqa_context_models,
+    configure_wagering_cache_dir,
     get_cached_logits_and_hidden_states_for_model,
     get_model_prompt_variant,
     resolve_hidden_state_layers_for_model,
@@ -82,6 +83,7 @@ def main(config_path: Optional[str] = None, calibration_path: Optional[str] = No
     
     # Load config
     args = load_and_merge_configs(config_path)
+    configure_wagering_cache_dir(args.get("cache_path"))
     
     # Set up logging
     logging.basicConfig(level=logging.INFO, format='%(name)s - %(levelname)s - %(message)s')
@@ -350,6 +352,11 @@ def main(config_path: Optional[str] = None, calibration_path: Optional[str] = No
     forced_save_every = 0
     forced_save_epoch_checkpoints = False
 
+    search_mode_raw = args.get("search_mode", False)
+    search_mode = str(search_mode_raw).strip().lower() in {"1", "true", "yes", "on"}
+    if search_mode:
+        log.info("Search mode enabled: disabling non-essential artifact outputs (analytics/plots).")
+
     # Create trainer
     trainer = WageringTrainer(
         models=models,
@@ -374,6 +381,7 @@ def main(config_path: Optional[str] = None, calibration_path: Optional[str] = No
         logit_calibrator=logit_calibrator,
         save_epoch_checkpoints=forced_save_epoch_checkpoints,
         max_epoch_checkpoints=None,
+        enable_artifact_outputs=(not search_mode),
     )
     
     # Train

@@ -3,7 +3,8 @@
 Repeat-run wrapper for scripts/wagering_pipeline.py.
 
 Runs the same config N times (parallel by default), forces wandb off, varies
-shuffle_seed and dataset_split_seed per repeat, and gives each repeat its own
+shuffle_seed per repeat (keeps dataset_split_seed fixed by default for cache reuse),
+and gives each repeat its own
 checkpoint directory. Use ``--max-workers-per-gpu K`` to cap concurrency at
 ``K`` jobs per visible GPU (each subprocess gets its own ``CUDA_VISIBLE_DEVICES``).
 
@@ -68,11 +69,13 @@ DEFAULT_AGGREGATE_METRICS = [
     "kendall_tau",
     "best_model_mrr",
     "ece",
+    "kl_divergence",
+    "tv_distance",
 ]
 
 # Printed as (value * scale); e.g. accuracy 0.76 -> "76.12" with scale 100.
 _AGGREGATE_PRINT_SCALE_100 = frozenset(
-    {"accuracy", "ece", "best_model_mrr", "d_regret", "brier_d_regret", "kendall_tau"}
+    {"accuracy", "ece", "best_model_mrr", "d_regret", "brier_d_regret", "kendall_tau", "kl_divergence", "tv_distance"}
 )
 
 
@@ -234,7 +237,12 @@ def _force_wandb_off(cfg: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
-def _vary_seeds(cfg: Dict[str, Any], repeat_idx: int) -> Dict[str, Any]:
+def _vary_seeds(
+    cfg: Dict[str, Any],
+    repeat_idx: int,
+    *,
+    vary_dataset_split_seed: bool = False,
+) -> Dict[str, Any]:
     out = dict(cfg)
 
     def _base_int(key: str, default: int) -> int:
@@ -248,7 +256,12 @@ def _vary_seeds(cfg: Dict[str, Any], repeat_idx: int) -> Dict[str, Any]:
     base_split = _base_int("dataset_split_seed", 42)
 
     out["shuffle_seed"] = base_shuffle + int(repeat_idx)
-    out["dataset_split_seed"] = base_split + int(repeat_idx)
+    if vary_dataset_split_seed:
+        out["dataset_split_seed"] = base_split + int(repeat_idx)
+    else:
+        # Keep dataset split fixed so prompt routing/cache keys remain stable
+        # across repeats and existing cache artifacts can be reused.
+        out["dataset_split_seed"] = base_split
     return out
 
 
@@ -490,6 +503,14 @@ def main() -> int:
         default=None,
         help="Base checkpoint directory; each repeat uses <base>/<run_tag>/repeat_NNNN/",
     )
+    parser.add_argument(
+        "--vary-dataset-split-seed",
+        action="store_true",
+        help=(
+            "Also vary dataset_split_seed per repeat (default: keep fixed for cache reuse). "
+            "When omitted, only shuffle_seed is varied."
+        ),
+    )
     parser.add_argument("--skip-training", action="store_true", help="Pass through to pipeline")
     parser.add_argument("--skip-evaluation", action="store_true", help="Pass through to pipeline")
     parser.add_argument(
@@ -648,7 +669,11 @@ def main() -> int:
 
     def _run_one(repeat_idx: int) -> int:
         repeat_ckpt_dir = _repeat_checkpoint_dir(base_ckpt_dir, repeat_idx, run_tag)
-        repeat_cfg = _vary_seeds(cfg, repeat_idx)
+        repeat_cfg = _vary_seeds(
+            cfg,
+            repeat_idx,
+            vary_dataset_split_seed=bool(args.vary_dataset_split_seed),
+        )
         repeat_cfg["checkpoint_base_dir"] = str(repeat_ckpt_dir)
 
         temp_cfg_path = config_path.parent / f".tmp_wagering_repeat_{run_tag}_{repeat_idx:04d}.yaml"

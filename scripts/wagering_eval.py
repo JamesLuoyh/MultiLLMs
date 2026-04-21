@@ -29,6 +29,7 @@ from wagering.utils import load_models_from_config, load_datasets_from_config, l
 from wagering.calibration import calibration_enabled, fit_or_load_logit_calibrator
 from wagering.utils.multi_llm_ensemble import (
     assign_pubmedqa_context_models,
+    configure_wagering_cache_dir,
     get_cached_logits_and_hidden_states_for_model,
     get_model_prompt_variant,
     resolve_hidden_state_layers_for_model,
@@ -82,6 +83,7 @@ def main(
     
     # Load config
     args = load_and_merge_configs(config_path)
+    configure_wagering_cache_dir(args.get("cache_path"))
     
     # Set up logging
     logging.basicConfig(level=logging.INFO, format='%(name)s - %(levelname)s - %(message)s')
@@ -147,24 +149,29 @@ def main(
         )
         test_datasets = [(ds, name) for ds, name in zip(test_ds, test_names)]
 
-    # Load OOD dataset
-    ood_dataset = None
-    if "ood_dataset" in args and args["ood_dataset"]:
+    # Load OOD datasets (supports both single and multiple config styles).
+    ood_datasets = []
+    if "ood_datasets" in args and args["ood_datasets"]:
+        ood_configs = args["ood_datasets"]
+    elif "ood_dataset" in args and args["ood_dataset"]:
         ood_configs = [args["ood_dataset"]] if isinstance(args["ood_dataset"], dict) else args["ood_dataset"]
+    else:
+        ood_configs = []
+
+    if ood_configs:
         ood_ds, ood_names = load_datasets_from_config(
             ood_configs,
             split="test",
             random_seed=dataset_split_seed,
         )
-        if ood_ds:
-            ood_dataset = (ood_ds[0], ood_names[0])
+        ood_datasets = [(ds, name) for ds, name in zip(ood_ds, ood_names)]
 
     # Configure PubMedQA mixed-context prompts with balanced randomized per-example assignment.
     eval_dataset_objects = [ds for ds, _ in test_datasets]
     eval_dataset_names = [name for _, name in test_datasets]
-    if ood_dataset is not None:
-        eval_dataset_objects.append(ood_dataset[0])
-        eval_dataset_names.append(ood_dataset[1])
+    if ood_datasets:
+        eval_dataset_objects.extend(ds for ds, _ in ood_datasets)
+        eval_dataset_names.extend(name for _, name in ood_datasets)
     pubmedqa_context_seed = dataset_split_seed
     pubmedqa_context_policy = str(args.get("pubmedqa_context_policy", "single_with_context"))
     pubmedqa_assignments = assign_pubmedqa_context_models(
@@ -206,6 +213,9 @@ def main(
         config=wagering_config.get("config", {}),
     )
     method_requires_hidden_states = bool(getattr(wagering_method, "requires_hidden_states", True))
+    method_requires_model_perplexities = bool(
+        getattr(wagering_method, "requires_model_perplexities", False)
+    )
     hidden_state_layers = None
     hidden_state_layers_per_model = None
     if method_requires_hidden_states:
@@ -241,8 +251,8 @@ def main(
     model_cfgs = args["models"]
 
     eval_datasets = [ds for ds, _ in test_datasets]
-    if ood_dataset is not None:
-        eval_datasets.append(ood_dataset[0])
+    if ood_datasets:
+        eval_datasets.extend(ds for ds, _ in ood_datasets)
 
     cache_miss_indices = []
     cached_model_names = []
@@ -280,7 +290,17 @@ def main(
 
     models = []
     model_names = cached_model_names[:]
-    if cache_miss_indices:
+    if method_requires_model_perplexities:
+        log.info(
+            "Wagering method requires model perplexities; loading all models to compute prompt perplexity."
+        )
+        models, model_names = load_models_from_config(
+            model_cfgs,
+            cache_kwargs={"cache_dir": args.get("cache_path", "./workdir/cache")}
+            if args.get("cache_path")
+            else {},
+        )
+    elif cache_miss_indices:
         log.info(f"Cache miss for {len(cache_miss_indices)}/{num_models} models. Loading missing models...")
         missing_cfgs = [model_cfgs[i] for i in cache_miss_indices]
         missing_models, missing_names = load_models_from_config(
@@ -504,12 +524,13 @@ def main(
     # Evaluate
     log.info("Starting evaluation...")
     log.info(f"  Test datasets: {len(test_datasets)}")
-    if ood_dataset:
-        log.info(f"  OOD dataset: {ood_dataset[1]}")
+    log.info(f"  OOD datasets: {len(ood_datasets)}")
+    for _, ood_name in ood_datasets:
+        log.info(f"    - {ood_name}")
     
     results = evaluator.evaluate_multiple(
         test_datasets=test_datasets,
-        ood_dataset=ood_dataset,
+        ood_datasets=ood_datasets,
         resume=False,  # Always evaluate from scratch
     )
 
@@ -529,6 +550,8 @@ def main(
         "meta_auc": [],
         "kendall_tau": [],
         "best_model_mrr": [],
+        "kl_divergence": [],
+        "tv_distance": [],
     }
     
     for dataset_name, result in results.items():
@@ -564,6 +587,8 @@ def main(
         meta_auc_val = get_metric_float(result, "meta_auc")
         kendall_tau_val = get_metric_float(result, "kendall_tau")
         best_model_mrr_val = get_metric_float(result, "best_model_mrr")
+        kl_divergence_val = get_metric_float(result, "kl_divergence")
+        tv_distance_val = get_metric_float(result, "tv_distance")
 
         if accuracy_val is not None:
             aggregate_metrics["accuracy"].append(accuracy_val)
@@ -589,6 +614,10 @@ def main(
             aggregate_metrics["kendall_tau"].append(kendall_tau_val)
         if best_model_mrr_val is not None:
             aggregate_metrics["best_model_mrr"].append(best_model_mrr_val)
+        if kl_divergence_val is not None:
+            aggregate_metrics["kl_divergence"].append(kl_divergence_val)
+        if tv_distance_val is not None:
+            aggregate_metrics["tv_distance"].append(tv_distance_val)
 
         accuracy_str = get_metric_str(result, "accuracy")
         nll_str = get_metric_str(result, "nll")
@@ -602,15 +631,18 @@ def main(
         meta_auc_str = get_metric_str(result, "meta_auc")
         kendall_tau_str = get_metric_str(result, "kendall_tau")
         best_model_mrr_str = get_metric_str(result, "best_model_mrr")
+        kl_divergence_str = get_metric_str(result, "kl_divergence")
+        tv_distance_str = get_metric_str(result, "tv_distance")
         
         log.info(
             f"{dataset_name}: Accuracy={accuracy_str}, "
             f"NLL={nll_str}, Brier={brier_str}, AUC={auc_str}, ECE={ece_str}, "
             f"DRegret={d_regret_str}, BrierDRegret={brier_d_regret_str}, MetaAcc={meta_acc_str}, MetaNLL={meta_nll_str}, MetaAUC={meta_auc_str}, "
-            f"KendallTau={kendall_tau_str}, BestModelMRR={best_model_mrr_str}"
+            f"KendallTau={kendall_tau_str}, BestModelMRR={best_model_mrr_str}, "
+            f"KLDivergence={kl_divergence_str}, TVDistance={tv_distance_str}"
         )
         
-        results_summary[dataset_name] = f"Accuracy={accuracy_str}, AUC={auc_str}, ECE={ece_str}, NLL={nll_str}, Brier={brier_str}, DRegret={d_regret_str}, BrierDRegret={brier_d_regret_str}, MetaAcc={meta_acc_str}, MetaAuc={meta_auc_str}, MetaNLL={meta_nll_str}, KendallTau={kendall_tau_str}, BestModelMRR={best_model_mrr_str}"
+        results_summary[dataset_name] = f"Accuracy={accuracy_str}, AUC={auc_str}, ECE={ece_str}, NLL={nll_str}, Brier={brier_str}, DRegret={d_regret_str}, BrierDRegret={brier_d_regret_str}, MetaAcc={meta_acc_str}, MetaAuc={meta_auc_str}, MetaNLL={meta_nll_str}, KendallTau={kendall_tau_str}, BestModelMRR={best_model_mrr_str}, KLDivergence={kl_divergence_str}, TVDistance={tv_distance_str}"
 
     def aggregate_metric_str(values):
         if not values:
@@ -630,11 +662,14 @@ def main(
     overall_meta_auc = aggregate_metric_str(aggregate_metrics["meta_auc"])
     overall_kendall_tau = aggregate_metric_str(aggregate_metrics["kendall_tau"])
     overall_best_model_mrr = aggregate_metric_str(aggregate_metrics["best_model_mrr"])
+    overall_kl_divergence = aggregate_metric_str(aggregate_metrics["kl_divergence"])
+    overall_tv_distance = aggregate_metric_str(aggregate_metrics["tv_distance"])
 
     results_summary["overall"] = (
         f"Accuracy={overall_accuracy}, AUC={overall_auc}, ECE={overall_ece}, "
         f"NLL={overall_nll}, Brier={overall_brier}, DRegret={overall_d_regret}, BrierDRegret={overall_brier_d_regret}, MetaAcc={overall_meta_acc}, "
-        f"MetaAuc={overall_meta_auc}, MetaNLL={overall_meta_nll}, KendallTau={overall_kendall_tau}, BestModelMRR={overall_best_model_mrr}"
+        f"MetaAuc={overall_meta_auc}, MetaNLL={overall_meta_nll}, KendallTau={overall_kendall_tau}, BestModelMRR={overall_best_model_mrr}, "
+        f"KLDivergence={overall_kl_divergence}, TVDistance={overall_tv_distance}"
     )
     
     # Log summary to wandb

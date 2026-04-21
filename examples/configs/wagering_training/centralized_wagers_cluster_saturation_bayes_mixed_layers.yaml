@@ -21,7 +21,7 @@ wagering_method:
   config:
     hidden_dim: 4096
     hidden_layers: [512, 256]
-    hidden_state_layers_per_model: [-4, -3, -2, -1]
+    hidden_state_layers_per_model: [-4,-3,-2, -1]
     learning_rate: 5e-6
     lr_decay_factor: 1
     lr_decay_steps: 100
@@ -37,16 +37,15 @@ aggregation:
 
 # Binary option tokens for this synthetic dataset.
 option_tokens: ["1", "0"]
-cache_path: /common/users/yl2310/MultiLLMs/cache
 
 # ============================================================================
 # TRAINING CONFIGURATION
 # ============================================================================
 
 _include_datasets:
-  - datasets/cluster_saturation_bayes.yaml
+  - datasets/cluster_saturation_bayes_extreme.yaml
 
-num_epochs: 50
+num_epochs: 5
 checkpoint_base_dir: /common/users/yl2310/MultiLLMs/checkpoints
 save_every: 100
 training_batch_size: 100
@@ -68,7 +67,8 @@ wandb_name: centralized_wagers_cluster_saturation_bayes_mixed_layers
 # ============================================================================
 
 _include_test_datasets:
-  - datasets/cluster_saturation_bayes.yaml
+  - datasets/cluster_saturation_bayes_extreme.yaml
 
 test_datasets:
   - display_name: cluster_saturation_bayes_test
+    # size: 2  # Use a small sample size for quick evaluation during development
