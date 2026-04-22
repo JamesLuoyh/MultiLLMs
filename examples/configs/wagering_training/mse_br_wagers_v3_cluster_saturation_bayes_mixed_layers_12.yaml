@@ -64,9 +64,8 @@ auto_resume: false
 balance_training_datasets: true
 shuffle_data: true
 shuffle_seed: 18
-early_stopping_patience: 150  # Stop training if no improvement for 20 epochs (default: 10)
-early_stopping_criterion: online_learning  # Use validation performance for early stopping (default: "validation")
-use_brier_d_regret_for_early_stopping: true
+early_stopping_patience: 5
+early_stopping_criterion: validation
 
 report_to_wandb: true
 wandb_project: multi-llm-wagering

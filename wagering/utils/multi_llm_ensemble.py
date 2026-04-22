@@ -1051,6 +1051,83 @@ def get_cached_logits_and_hidden_states_for_model(
     return None, None, None
 
 
+def has_cached_logits_and_hidden_states_for_model(
+    model_path: str,
+    dataset: Dataset,
+    option_tokens: List[str],
+    prompt_variant: Optional[str] = None,
+    model_index: Optional[int] = None,
+    hidden_state_layers: Optional[Sequence[int]] = None,
+    require_hidden_states: bool = True,
+) -> bool:
+    """Fast cache check that avoids loading large arrays into memory.
+
+    This only verifies that a compatible cache file exists and contains the
+    expected keys. Full integrity/shape checks still happen when the cache is
+    actually loaded during training.
+    """
+    model_key: str = model_path
+    if _requires_slot_specific_cache(dataset):
+        if model_index is None:
+            raise ValueError(
+                "Mixed-context cache lookups require model_index to disambiguate repeated model paths"
+            )
+        model_key = f"{model_path}::idx={int(model_index)}"
+
+    prompt_variants_to_try: List[Optional[str]] = [prompt_variant]
+    full_split_variant = _get_legacy_full_split_prompt_variant(
+        dataset,
+        model_index=int(model_index) if model_index is not None else 0,
+        prompt_variant=prompt_variant,
+    )
+    if full_split_variant is not None:
+        prompt_variants_to_try.append(full_split_variant)
+
+    expanded_variants: List[Optional[str]] = []
+    for candidate in prompt_variants_to_try:
+        expanded_variants.append(candidate)
+        if isinstance(candidate, str):
+            legacy_marker = "balanced_random_context_single_with_context_m"
+            if legacy_marker in candidate:
+                expanded_variants.append(
+                    candidate.replace(legacy_marker, "balanced_random_context_m")
+                )
+
+    deduped_variants: List[Optional[str]] = []
+    seen_variants: set[Optional[str]] = set()
+    for candidate in expanded_variants:
+        if candidate in seen_variants:
+            continue
+        seen_variants.add(candidate)
+        deduped_variants.append(candidate)
+
+    for prompt_variant_candidate in deduped_variants:
+        cache_key = _wagering_logits_cache_key(
+            model_key,
+            dataset,
+            option_tokens,
+            prompt_variant_candidate,
+            hidden_state_layers=hidden_state_layers,
+        )
+        cache_path = _get_cache_path(cache_key)
+        if not cache_path.exists():
+            continue
+
+        try:
+            with np.load(cache_path, allow_pickle=True) as data:
+                has_logits = "logits" in data
+                has_hidden_states = ("hidden_states" in data) or ("hidden_states_pickle" in data)
+                if not has_logits:
+                    continue
+                if require_hidden_states and not has_hidden_states:
+                    continue
+                return True
+        except Exception:
+            continue
+
+    return False
+
+
 def set_cached_logits_and_hidden_states_for_model(
     model: WhiteboxModel,
     dataset: Dataset,

@@ -507,27 +507,27 @@ class WageringEvaluator:
                     evidence_part += f",evidence_model_name={str(model_names[int(evidence_model_idx)])}"
                 per_model_parts.append(evidence_part)
 
-            per_model_log = "; ".join(per_model_parts)
+            # per_model_log = "; ".join(per_model_parts)
 
-            if prior_dist is None:
-                log.info(
-                    "%s - sample=%d gt_distribution=%s aggregated_predicted_distribution=%s %s",
-                    dataset_name,
-                    sample_idx,
-                    np.array2string(gt_dist, precision=6, separator=", "),
-                    np.array2string(np.asarray(agg_dist, dtype=np.float64), precision=6, separator=", "),
-                    per_model_log,
-                )
-            else:
-                log.info(
-                    "%s - sample=%d prior_distribution=%s gt_distribution=%s aggregated_predicted_distribution=%s %s",
-                    dataset_name,
-                    sample_idx,
-                    np.array2string(prior_dist, precision=6, separator=", "),
-                    np.array2string(gt_dist, precision=6, separator=", "),
-                    np.array2string(np.asarray(agg_dist, dtype=np.float64), precision=6, separator=", "),
-                    per_model_log,
-                )
+            # if prior_dist is None:
+            #     log.info(
+            #         "%s - sample=%d gt_distribution=%s aggregated_predicted_distribution=%s %s",
+            #         dataset_name,
+            #         sample_idx,
+            #         np.array2string(gt_dist, precision=6, separator=", "),
+            #         np.array2string(np.asarray(agg_dist, dtype=np.float64), precision=6, separator=", "),
+            #         per_model_log,
+            #     )
+            # else:
+            #     log.info(
+            #         "%s - sample=%d prior_distribution=%s gt_distribution=%s aggregated_predicted_distribution=%s %s",
+            #         dataset_name,
+            #         sample_idx,
+            #         np.array2string(prior_dist, precision=6, separator=", "),
+            #         np.array2string(gt_dist, precision=6, separator=", "),
+            #         np.array2string(np.asarray(agg_dist, dtype=np.float64), precision=6, separator=", "),
+            #         per_model_log,
+            #     )
 
     def _extract_cluster_saturation_prior_probs(
         self,

@@ -40,11 +40,14 @@ class OneZeroWagers(WageringMethod):
             wagers: np.ndarray of shape [batch_size, num_models] (batch)
                 or [num_models] (single sample)
         """
-        base_wagers = np.concatenate([
-            np.ones(self.num_models // 2, dtype=np.float32),
-            np.zeros(self.num_models - self.num_models // 2, dtype=np.float32)
-        ])
-        
+        # base_wagers = np.concatenate([
+        #     np.ones(self.num_models // 2, dtype=np.float32),
+        #     np.zeros(self.num_models - self.num_models // 2, dtype=np.float32)
+        # ])
+
+
+        base_wagers = np.zeros(self.num_models, dtype=np.float32)  # All zeros for zero-one wagers
+        base_wagers[0] = 1.0  # Assign weight 1 to the first model, 0 to the rest
         # Detect batch mode from model_logits if provided
         if model_logits is not None and model_logits.ndim == 3:
             batch_size = model_logits.shape[0]

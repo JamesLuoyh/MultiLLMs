@@ -15,5 +15,5 @@ split_ratios: [0.8, 0.1, 0.1]
 train_target_split: train_val
 eval_target_split: test
 split_seed: 18
-prompt_helper: "scripts.generate_cluster_saturation_bayes_extreme_dataset:_format_full_prompt"
+prompt_helper: "scripts.generate_cluster_saturation_bayes_extreme_dataset:_format_prompt_without_context"
 prompt_without_context_helper: "scripts.generate_cluster_saturation_bayes_extreme_dataset:_format_prompt_without_context"

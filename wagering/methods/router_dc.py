@@ -58,6 +58,7 @@ class RouterDCWagers(WageringMethod):
         self.max_seq_length = int(cfg.get("max_seq_length", 512))
         self.learning_rate = float(cfg.get("learning_rate", 5e-5))
         self.temperature = float(cfg.get("temperature", 1.0))
+        self.wager_floor = float(cfg.get("wager_floor", 1e-16))
         self.grad_clip_norm = float(cfg.get("grad_clip_norm", 1.0))
         self.weight_decay = float(cfg.get("weight_decay", 0.01))
         self.freeze_encoder = bool(cfg.get("freeze_encoder", False))
@@ -220,6 +221,8 @@ class RouterDCWagers(WageringMethod):
             logits = self._compute_similarity(query_emb)
             logits = logits / self.temperature
             wagers = torch.softmax(logits, dim=1)
+            wagers = torch.clamp(wagers, min=self.wager_floor, max=1.0 - self.wager_floor)
+            wagers = wagers / wagers.sum(dim=1, keepdim=True)
 
         if self._training:
             self._cached_wagers = wagers
@@ -364,6 +367,7 @@ class RouterDCWagers(WageringMethod):
                 "max_seq_length": self.max_seq_length,
                 "learning_rate": self.learning_rate,
                 "temperature": self.temperature,
+                "wager_floor": self.wager_floor,
                 "grad_clip_norm": self.grad_clip_norm,
                 "weight_decay": self.weight_decay,
                 "freeze_encoder": self.freeze_encoder,

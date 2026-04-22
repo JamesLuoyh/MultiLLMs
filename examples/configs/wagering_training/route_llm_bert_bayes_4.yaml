@@ -51,7 +51,7 @@ _include_datasets:
   - datasets/cluster_saturation_bayes_extreme.yaml
 
 num_epochs: 5
-checkpoint_base_dir: /filer/tmp1/yl2310/MultiLLMs/checkpoints
+checkpoint_base_dir: /common/users/yl2310/MultiLLMs/checkpoints
 save_every: 100
 training_batch_size: 50
 

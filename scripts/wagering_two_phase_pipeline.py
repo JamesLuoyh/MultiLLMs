@@ -18,8 +18,11 @@ Usage:
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import copy
+import hashlib
 import importlib.util
+import json
 import logging
 import os
 import re
@@ -114,6 +117,45 @@ def _save_yaml(path: Path, payload: Dict[str, Any]) -> None:
         yaml.safe_dump(payload, f, sort_keys=False)
 
 
+def _load_yaml(path: Path) -> Dict[str, Any]:
+    if not path.exists():
+        return {}
+    with path.open("r") as f:
+        loaded = yaml.safe_load(f)
+    if isinstance(loaded, dict):
+        return loaded
+    return {}
+
+
+def _stable_payload_hash(payload: Dict[str, Any]) -> str:
+    serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def _build_method_cache_fingerprint(
+    base_cfg: Dict[str, Any],
+    phase1_cfg: Dict[str, Any],
+    phase2_cfg: Dict[str, Any],
+    method_cfg: Dict[str, Any],
+    run_evaluation: bool,
+) -> str:
+    base_without_methods = copy.deepcopy(base_cfg)
+    phase_shift_cfg = base_without_methods.get("phase_shift")
+    if isinstance(phase_shift_cfg, dict):
+        phase_shift_cfg = copy.deepcopy(phase_shift_cfg)
+        phase_shift_cfg.pop("methods", None)
+        base_without_methods["phase_shift"] = phase_shift_cfg
+
+    payload = {
+        "base_config": base_without_methods,
+        "phase1": phase1_cfg,
+        "phase2": phase2_cfg,
+        "method": method_cfg,
+        "run_evaluation": bool(run_evaluation),
+    }
+    return _stable_payload_hash(payload)
+
+
 def _load_api_keys_from_config() -> Dict[str, str]:
     """Load API keys from .api_keys.yaml file if it exists."""
     api_keys_path = PROJECT_ROOT / ".api_keys.yaml"
@@ -135,14 +177,30 @@ def _load_api_keys_from_config() -> Dict[str, str]:
         return filtered
 
 
+def _finish_active_wandb_run() -> None:
+    """Best-effort close of any active wandb run in this process."""
+    try:
+        import wandb
+    except Exception:
+        return
+
+    try:
+        if wandb.run is not None:
+            wandb.finish()
+    except Exception as e:
+        log.warning("Failed to close active wandb run cleanly: %s", e)
+
+
 def _latest_transition_checkpoint(checkpoint_dir: Path) -> Path:
-    candidates = sorted(checkpoint_dir.glob("checkpoint_epoch_*_step_*.pt"))
+    candidates = list(checkpoint_dir.glob("checkpoint_epoch_*_step_*.pt"))
     if not candidates:
         raise RuntimeError(
             f"No resumable checkpoint files found under {checkpoint_dir}. "
             "Expected checkpoint_epoch_*_step_*.pt"
         )
-    return candidates[-1]
+    # Use mtime instead of filename sort: stale files from previous runs can
+    # have larger step numbers and be selected incorrectly by lexical ordering.
+    return max(candidates, key=lambda p: p.stat().st_mtime)
 
 
 def _build_phase_config(
@@ -152,6 +210,9 @@ def _build_phase_config(
     run_label: str,
     phase_name: str,
     resume_checkpoint: Optional[str] = None,
+    device_override: Optional[str] = None,
+    emit_resume_checkpoint: bool = False,
+    enable_method_wandb: bool = True,
 ) -> Dict[str, Any]:
     cfg = copy.deepcopy(base_cfg)
     cfg["wagering_method"] = copy.deepcopy(method_cfg)
@@ -174,12 +235,17 @@ def _build_phase_config(
 
     wm_cfg = cfg.setdefault("wagering_method", {}).setdefault("config", {})
 
+    if device_override is not None:
+        wm_cfg["device"] = str(device_override)
+
     if "frozen_model_indices" in phase_cfg:
         wm_cfg["frozen_model_indices"] = list(phase_cfg.get("frozen_model_indices", []))
     if "inactive_model_indices" in phase_cfg:
         wm_cfg["inactive_model_indices"] = list(phase_cfg.get("inactive_model_indices", []))
 
     cfg["resume_from_checkpoint"] = resume_checkpoint
+    cfg["emit_resume_checkpoint"] = bool(emit_resume_checkpoint)
+    cfg["report_to_wandb"] = bool(enable_method_wandb and cfg.get("report_to_wandb", False))
 
     # Helpful metadata tags for downstream analysis.
     cfg["phase_shift_run_label"] = str(run_label)
@@ -362,11 +428,19 @@ def _run_single_method(
     phase2_cfg: Dict[str, Any],
     output_root: Path,
     run_evaluation: bool,
+    device_override: Optional[str] = None,
+    enable_method_wandb: bool = True,
 ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     method_name = str(method_cfg.get("name", "unknown_method"))
     method_slug = _slugify(method_name)
     method_output_dir = output_root / method_slug
     method_output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Only touch process-global wandb state when per-method wandb is enabled.
+    # In parallel mode, per-method wandb is disabled and concurrent finish() calls
+    # can serialize or stall workers before training even starts.
+    if enable_method_wandb:
+        _finish_active_wandb_run()
 
     with tempfile.TemporaryDirectory(prefix=f"phase_shift_{method_slug}_") as tmp_dir:
         tmp_dir_path = Path(tmp_dir)
@@ -378,6 +452,9 @@ def _run_single_method(
             run_label=run_label,
             phase_name="phase1",
             resume_checkpoint=None,
+            device_override=device_override,
+            emit_resume_checkpoint=True,
+            enable_method_wandb=enable_method_wandb,
         )
         phase1_cfg_path = tmp_dir_path / f"{method_slug}_phase1.yaml"
         _save_yaml(phase1_cfg_path, phase1_payload)
@@ -396,6 +473,9 @@ def _run_single_method(
             run_label=run_label,
             phase_name="phase2",
             resume_checkpoint=str(phase1_resume_ckpt),
+            device_override=device_override,
+            emit_resume_checkpoint=False,
+            enable_method_wandb=enable_method_wandb,
         )
         phase2_cfg_path = tmp_dir_path / f"{method_slug}_phase2.yaml"
         _save_yaml(phase2_cfg_path, phase2_payload)
@@ -412,6 +492,10 @@ def _run_single_method(
                 checkpoint_path=str(phase2_checkpoint_dir),
                 calibration_path=phase2_results.get("calibration_path"),
             )
+
+    # Do not leak method-specific wandb run into subsequent methods.
+    if enable_method_wandb:
+        _finish_active_wandb_run()
 
     phase1_df = _load_batch_metrics(phase1_checkpoint_dir).copy()
     phase2_df = _load_batch_metrics(phase2_checkpoint_dir).copy()
@@ -441,10 +525,24 @@ def _run_single_method(
         "evaluation_aggregated": _aggregate_eval_metrics(eval_results, DEFAULT_METRICS),
     }
 
-
-def run_two_phase_pipeline(config_path: Path) -> Dict[str, Any]:
+def run_two_phase_pipeline(
+    config_path: Path,
+    device_override: Optional[str] = None,
+    max_workers: int = 1,
+) -> Dict[str, Any]:
     cfg = load_and_merge_configs(config_path)
     phase_shift_cfg = cfg.get("phase_shift", {})
+
+    effective_device_override = device_override
+    if effective_device_override is None:
+        cfg_device = phase_shift_cfg.get("device") if isinstance(phase_shift_cfg, dict) else None
+        if isinstance(cfg_device, str) and cfg_device.strip():
+            effective_device_override = cfg_device.strip()
+
+    if effective_device_override is not None:
+        phase_shift_cfg["device"] = str(effective_device_override)
+        cfg["phase_shift"] = phase_shift_cfg
+        log.info("Using global phase-shift wagering device override: %s", effective_device_override)
 
     if "phase1" not in phase_shift_cfg or "phase2" not in phase_shift_cfg:
         raise ValueError("Config must define phase_shift.phase1 and phase_shift.phase2")
@@ -493,9 +591,24 @@ def run_two_phase_pipeline(config_path: Path) -> Dict[str, Any]:
 
     run_evaluation = bool(phase_shift_cfg.get("evaluate_after_phase2", True))
 
+    # Training/eval wandb logs from per-method runs share process-global state and
+    # cannot be isolated safely across threads. In parallel mode, disable method
+    # wandb logs and keep only pipeline-level plot logging.
+    enable_method_wandb = True
+    if max_workers > 1 and bool(cfg.get("report_to_wandb", False)):
+        enable_method_wandb = False
+        log.warning(
+            "Disabling per-method wandb logging because max_workers=%d > 1. "
+            "This avoids non-monotonic step collisions across concurrent method runs.",
+            max_workers,
+        )
+
     run_label = f"{_slugify(config_path.stem)}_two_phase"
     output_root = Path(phase_shift_cfg.get("output_dir", PROJECT_ROOT / "workdir" / "phase_shift_results" / run_label))
     output_root.mkdir(parents=True, exist_ok=True)
+    method_cache_path = output_root / "method_metrics_cache.yaml"
+    method_cache = _load_yaml(method_cache_path)
+    cache_entries = method_cache.get("entries", {}) if isinstance(method_cache.get("entries"), dict) else {}
 
     wandb_logger, started_plot_run = _init_or_get_wandb_for_plots(
         cfg=cfg,
@@ -505,19 +618,25 @@ def run_two_phase_pipeline(config_path: Path) -> Dict[str, Any]:
 
     method_frames: Dict[str, pd.DataFrame] = {}
     method_summaries: List[Dict[str, Any]] = []
+    failed_methods: List[Dict[str, str]] = []
 
-    for method_cfg in normalized_methods:
-        method_name = str(method_cfg["name"])
-        frame, summary = _run_single_method(
-            base_cfg=cfg,
-            run_label=run_label,
-            method_cfg=method_cfg,
-            phase1_cfg=phase1_cfg,
-            phase2_cfg=phase2_cfg,
-            output_root=output_root,
-            run_evaluation=run_evaluation,
-        )
+    def _persist_method_cache() -> None:
+        cache_payload = {
+            "config_path": str(config_path),
+            "run_label": run_label,
+            "output_root": str(output_root),
+            "entries": cache_entries,
+        }
+        _save_yaml(method_cache_path, cache_payload)
 
+    def _finalize_method_result(
+        method_name: str,
+        method_slug: str,
+        cache_key: str,
+        frame: pd.DataFrame,
+        summary: Dict[str, Any],
+        method_frame_out: Path,
+    ) -> None:
         for spec in metric_specs:
             source_metric = spec["source_metric"]
             output_metric = spec["output_metric"]
@@ -532,13 +651,186 @@ def run_two_phase_pipeline(config_path: Path) -> Dict[str, Any]:
             )
             frame[f"phase_cum_{output_metric}"] = phase_cum
 
-        method_slug = _slugify(method_name)
-        frame_out = output_root / method_slug / "two_phase_batch_metrics.csv"
-        frame.to_csv(frame_out, index=False)
+        frame.to_csv(method_frame_out, index=False)
+
+        cache_entries[method_slug] = {
+            "cache_key": cache_key,
+            "batch_metrics_path": str(method_frame_out),
+            "summary": {
+                "method_name": method_name,
+                "phase1_checkpoint_dir": summary.get("phase1_checkpoint_dir"),
+                "phase2_checkpoint_dir": summary.get("phase2_checkpoint_dir"),
+                "phase1_transition_checkpoint": summary.get("phase1_transition_checkpoint"),
+                "evaluation_aggregated": summary.get("evaluation_aggregated"),
+                "evaluation": summary.get("evaluation"),
+            },
+        }
+        _persist_method_cache()
 
         method_frames[method_name] = frame
-        summary["batch_metrics_path"] = str(frame_out)
+        summary["batch_metrics_path"] = str(method_frame_out)
         method_summaries.append(summary)
+
+    pending_methods: List[Dict[str, Any]] = []
+
+    for method_cfg in normalized_methods:
+        method_name = str(method_cfg["name"])
+        method_slug = _slugify(method_name)
+        method_frame_out = output_root / method_slug / "two_phase_batch_metrics.csv"
+        cache_key = _build_method_cache_fingerprint(
+            base_cfg=cfg,
+            phase1_cfg=phase1_cfg,
+            phase2_cfg=phase2_cfg,
+            method_cfg=method_cfg,
+            run_evaluation=run_evaluation,
+        )
+
+        cached_entry = cache_entries.get(method_slug, {})
+
+        # Backfill cache index from prior partial runs where per-method outputs
+        # exist but method_metrics_cache.yaml was not flushed yet.
+        if (not isinstance(cached_entry, dict) or not cached_entry) and method_frame_out.is_file():
+            cached_entry = {
+                "cache_key": cache_key,
+                "batch_metrics_path": str(method_frame_out),
+                "summary": {
+                    "method_name": method_name,
+                    "phase1_checkpoint_dir": None,
+                    "phase2_checkpoint_dir": None,
+                    "phase1_transition_checkpoint": None,
+                    "evaluation_aggregated": _aggregate_eval_metrics(None, DEFAULT_METRICS),
+                    "evaluation": None,
+                },
+            }
+            cache_entries[method_slug] = cached_entry
+            _persist_method_cache()
+            log.info("[%s] Bootstrapped method cache index from existing output %s", method_name, method_frame_out)
+
+        cached_frame_path_str = cached_entry.get("batch_metrics_path") if isinstance(cached_entry, dict) else None
+        cached_frame_path = Path(cached_frame_path_str) if isinstance(cached_frame_path_str, str) and cached_frame_path_str else None
+
+        if (
+            isinstance(cached_entry, dict)
+            and cached_entry.get("cache_key") == cache_key
+            and cached_frame_path is not None
+            and cached_frame_path.is_file()
+        ):
+            log.info("[%s] Cache hit: loading existing metrics from %s", method_name, cached_frame_path)
+            frame = pd.read_csv(cached_frame_path)
+            summary = copy.deepcopy(cached_entry.get("summary", {}))
+            summary["method_name"] = method_name
+            summary["batch_metrics_path"] = str(cached_frame_path)
+            summary["cached"] = True
+            _finalize_method_result(
+                method_name=method_name,
+                method_slug=method_slug,
+                cache_key=cache_key,
+                frame=frame,
+                summary=summary,
+                method_frame_out=method_frame_out,
+            )
+        else:
+            pending_methods.append(
+                {
+                    "method_cfg": method_cfg,
+                    "method_name": method_name,
+                    "method_slug": method_slug,
+                    "cache_key": cache_key,
+                    "method_frame_out": method_frame_out,
+                }
+            )
+
+    if pending_methods:
+        workers = max(1, int(max_workers))
+        workers = min(workers, len(pending_methods))
+
+        if workers > 1:
+            log.info(
+                "Executing %d uncached method(s) in parallel with max_workers=%d",
+                len(pending_methods),
+                workers,
+            )
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                futures = {
+                    executor.submit(
+                        _run_single_method,
+                        base_cfg=cfg,
+                        run_label=run_label,
+                        method_cfg=job["method_cfg"],
+                        phase1_cfg=phase1_cfg,
+                        phase2_cfg=phase2_cfg,
+                        output_root=output_root,
+                        run_evaluation=run_evaluation,
+                        device_override=effective_device_override,
+                        enable_method_wandb=enable_method_wandb,
+                    ): job
+                    for job in pending_methods
+                }
+                for future in as_completed(futures):
+                    job = futures[future]
+                    try:
+                        frame, summary = future.result()
+                    except Exception as e:
+                        method_name = str(job.get("method_name", "unknown_method"))
+                        error_msg = f"{type(e).__name__}: {e}"
+                        log.exception(
+                            "[%s] Method execution failed in parallel worker; continuing with remaining methods",
+                            method_name,
+                        )
+                        method_summaries.append(
+                            {
+                                "method_name": method_name,
+                                "phase1_checkpoint_dir": None,
+                                "phase2_checkpoint_dir": None,
+                                "phase1_transition_checkpoint": None,
+                                "evaluation": None,
+                                "evaluation_aggregated": _aggregate_eval_metrics(None, DEFAULT_METRICS),
+                                "batch_metrics_path": None,
+                                "cached": False,
+                                "failed": True,
+                                "error": error_msg,
+                            }
+                        )
+                        failed_methods.append(
+                            {
+                                "method_name": method_name,
+                                "error": error_msg,
+                            }
+                        )
+                        continue
+                    summary["cached"] = False
+                    _finalize_method_result(
+                        method_name=job["method_name"],
+                        method_slug=job["method_slug"],
+                        cache_key=job["cache_key"],
+                        frame=frame,
+                        summary=summary,
+                        method_frame_out=job["method_frame_out"],
+                    )
+        else:
+            for job in pending_methods:
+                frame, summary = _run_single_method(
+                    base_cfg=cfg,
+                    run_label=run_label,
+                    method_cfg=job["method_cfg"],
+                    phase1_cfg=phase1_cfg,
+                    phase2_cfg=phase2_cfg,
+                    output_root=output_root,
+                    run_evaluation=run_evaluation,
+                    device_override=effective_device_override,
+                    enable_method_wandb=enable_method_wandb,
+                )
+                summary["cached"] = False
+                _finalize_method_result(
+                    method_name=job["method_name"],
+                    method_slug=job["method_slug"],
+                    cache_key=job["cache_key"],
+                    frame=frame,
+                    summary=summary,
+                    method_frame_out=job["method_frame_out"],
+                )
+
+    _persist_method_cache()
 
     # Combined plots across methods.
     plots_dir = output_root / "plots"
@@ -595,6 +887,7 @@ def run_two_phase_pipeline(config_path: Path) -> Dict[str, Any]:
         "metrics": [spec["output_metric"] for spec in metric_specs],
         "eval_method_comparison_csv": str(eval_out),
         "methods": method_summaries,
+        "failed_methods": failed_methods,
     }
     summary_path = output_root / "summary.yaml"
     _save_yaml(summary_path, summary_payload)
@@ -610,6 +903,13 @@ def run_two_phase_pipeline(config_path: Path) -> Dict[str, Any]:
     if wandb_logger is not None and started_plot_run and hasattr(wandb_logger, "finish"):
         wandb_logger.finish()
 
+    if failed_methods:
+        failed_names = ", ".join(m["method_name"] for m in failed_methods)
+        raise RuntimeError(
+            f"Two-phase run completed with {len(failed_methods)} failed method(s): {failed_names}. "
+            f"See summary at {summary_path} for details."
+        )
+
     log.info("Two-phase run complete. Outputs: %s", output_root)
     return summary_payload
 
@@ -617,6 +917,24 @@ def run_two_phase_pipeline(config_path: Path) -> Dict[str, Any]:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run two-phase wagering pipeline")
     parser.add_argument("config", type=str, help="Path to config YAML")
+    parser.add_argument(
+        "--max-workers",
+        type=int,
+        default=1,
+        help=(
+            "Number of wagering methods to execute concurrently. "
+            "Use 1 for sequential execution (default)."
+        ),
+    )
+    parser.add_argument(
+        "--device",
+        type=str,
+        default=None,
+        help=(
+            "Optional device override for all phase-shift methods (for example: "
+            "cuda:0, cuda:1, cpu). Overrides phase_shift.device in config."
+        ),
+    )
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(name)s - %(levelname)s - %(message)s")
@@ -627,8 +945,14 @@ def main() -> None:
     config_path = Path(args.config)
     if not config_path.exists():
         raise FileNotFoundError(f"Config file not found: {config_path}")
+    if int(args.max_workers) <= 0:
+        raise ValueError("--max-workers must be > 0")
 
-    run_two_phase_pipeline(config_path)
+    run_two_phase_pipeline(
+        config_path,
+        device_override=args.device,
+        max_workers=int(args.max_workers),
+    )
 
 
 if __name__ == "__main__":

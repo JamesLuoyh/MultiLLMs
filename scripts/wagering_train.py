@@ -10,6 +10,7 @@ Usage: python wagering_train.py <config_file.yaml>
 import logging
 import os
 import sys
+import time
 import yaml
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -34,6 +35,7 @@ from wagering.utils.multi_llm_ensemble import (
     assign_pubmedqa_context_models,
     configure_wagering_cache_dir,
     get_cached_logits_and_hidden_states_for_model,
+    has_cached_logits_and_hidden_states_for_model,
     get_model_prompt_variant,
     resolve_hidden_state_layers_for_model,
 )
@@ -256,6 +258,7 @@ def main(config_path: Optional[str] = None, calibration_path: Optional[str] = No
 
     cache_miss_indices = []
     cached_model_names = []
+    cache_probe_start = time.perf_counter()
     for idx, model_cfg in enumerate(model_cfgs):
         model_path = model_cfg["path"]
         cached_model_names.append(model_path.replace("/", "_"))
@@ -269,20 +272,24 @@ def main(config_path: Optional[str] = None, calibration_path: Optional[str] = No
         model_cache_ok = True
         for dataset in train_datasets:
             prompt_variant = get_model_prompt_variant(dataset, model_index=idx)
-            cached_logits, cached_hidden_states, _ = get_cached_logits_and_hidden_states_for_model(
+            cache_ok = has_cached_logits_and_hidden_states_for_model(
                 model_path,
                 dataset,
                 option_tokens,
                 prompt_variant=prompt_variant,
                 model_index=idx,
                 hidden_state_layers=model_hidden_layers,
+                require_hidden_states=needs_hidden_states,
             )
-            if cached_logits is None or (needs_hidden_states and cached_hidden_states is None):
+            if not cache_ok:
                 model_cache_ok = False
                 break
 
         if not model_cache_ok:
             cache_miss_indices.append(idx)
+
+    cache_probe_seconds = time.perf_counter() - cache_probe_start
+    log.info("Cache probe completed in %.1fs", cache_probe_seconds)
 
     models = []
     model_names = cached_model_names[:]
@@ -388,6 +395,16 @@ def main(config_path: Optional[str] = None, calibration_path: Optional[str] = No
     log.info("Starting training...")
     results = trainer.train(num_epochs=args.get("num_epochs", 100))
 
+    # Optionally emit a single resumable checkpoint even when periodic checkpoints
+    # are globally disabled. This is required by the two-phase pipeline transition.
+    if bool(args.get("emit_resume_checkpoint", False)):
+        try:
+            last_epoch = max(0, int(args.get("num_epochs", 1)) - 1)
+        except Exception:
+            last_epoch = 0
+        trainer._save_checkpoint(epoch=last_epoch)
+        log.info("Emitted explicit resume checkpoint for phase transition")
+
     # Expose final validation metrics for downstream hyperparameter search.
     final_validation_metrics: Optional[Dict[str, Any]] = None
     if getattr(trainer, "validation_dataset", None) is not None:
@@ -410,9 +427,15 @@ def main(config_path: Optional[str] = None, calibration_path: Optional[str] = No
     
     # Return results (wandb run stays active)
     results["checkpoint_path"] = str(checkpoint_dir)
-    transition_checkpoints = sorted(checkpoint_dir.glob("checkpoint_epoch_*_step_*.pt"))
+    transition_checkpoints = list(checkpoint_dir.glob("checkpoint_epoch_*_step_*.pt"))
     if len(transition_checkpoints) > 0:
-        results["phase_transition_checkpoint_path"] = str(transition_checkpoints[-1])
+        # Prefer the checkpoint produced most recently in this run; filename
+        # ordering can select stale checkpoints from prior runs with larger steps.
+        latest_transition_checkpoint = max(
+            transition_checkpoints,
+            key=lambda p: p.stat().st_mtime,
+        )
+        results["phase_transition_checkpoint_path"] = str(latest_transition_checkpoint)
     if calibration_artifact_path is not None:
         results["calibration_path"] = calibration_artifact_path
     if wandb_logger and hasattr(wandb_logger, 'run') and wandb_logger.run is not None:

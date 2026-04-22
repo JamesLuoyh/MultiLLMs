@@ -1,30 +1,32 @@
-# Evaluation configuration for KL-uniform wagers on PubMedQA
-# No training is necessary for this inference-only method
+# Evaluation configuration for equal wagers on MMLU, MedMCQA, and ARC Easy with 1000 samples each
+# No training is necessary for equal wagers
 
 # Include model configs (must match training)
 _include_models:
-  - models/gemma_2_9b_it.yaml
-  
+    - models/biomistral_7b.yaml
+    - models/llama3_1_8b_instruct.yaml
+    - models/gemma_2_9b_it.yaml
+    - models/llama3_aloe_8b_alpha.yaml
+    
 
-# Checkpoint path (for inference-only method, this can be a dummy path)
-checkpoint_path: /common/users/yl2310/MultiLLMs/checkpoints/dummy_kl_uniform_wagers
-cache_path: /research/projects/ecoai/yl2310/MultiLLMs/wagering_model_logits_states_caches
+# Checkpoint path (for equal_wagers, this can be a dummy path since no training is needed)
+checkpoint_path: /common/users/yl2310/MultiLLMs/checkpoints/dummy_equal_wagers
 
 # Apply adaptive temperature scaling to cached option logits before wagering.
-calibrated: false
+calibrated: true
+_include_calibration: calibration/adaptive_temperature_1000samples.yaml
 
-shuffle_data: true  # Shuffle training data across datasets
-shuffle_seed: 18 #18 #17
 
-# Wagering method - KL divergence to uniform (inference-only)
+# Wagering method - equal wagers (no trainable parameters)
 wagering_method:
-  name: equal_wagers
+  name: one_zero_wagers
   config: {}
 
 # Aggregation function
 aggregation:
   name: weighted_linear_pooling
   config: {}
+option_tokens: ["A", "B", "C", "D"]
 
 # ============================================================================
 # TRAINING CONFIGURATION
@@ -50,7 +52,7 @@ aggregation:
 # # Training options
 # auto_resume: false  # Automatically resume from latest checkpoint if available
 # shuffle_data: true  # Shuffle training data across datasets
-# shuffle_seed: 18 #18 #42  # Random seed for shuffling (will be overridden by sweep)
+# shuffle_seed: 18 #18 #18 #18 #18 #42  # Random seed for shuffling (will be overridden by sweep)
 # early_stopping_patience: 10  # Stop training if no improvement for 10 epochs (default: 10)
 # validation_split_ratio: 0.1  # 10% of data for validation set (for early stopping)
 
@@ -58,24 +60,40 @@ aggregation:
 report_to_wandb: true
 wandb_project: multi-llm-wagering
 wandb_entity: null
-wandb_name: kl_uniform_wagers_cluster_saturation_bayes_mixed_layers_eval
+wandb_name: null
 
 # Include test dataset configs
 _include_test_datasets:
-  - datasets/cluster_saturation_bayes_extreme.yaml
+  - datasets/mmlu_full.yaml
+  - datasets/medmcqa.yaml
 
-# Override dataset-specific settings for evaluation
+# Override dataset-specific settings for evaluation with 1000 samples each
 test_datasets:
-  - display_name: cluster_saturation_bayes_test
-    # size: 2  # Use a small sample size for quick evaluation during development
+  - display_name: mmlu_full_test
+    eval_split: test
+  - display_name: medmcqa_test
+    eval_split: validation  # MedMCQA test split has no labels, use validation
+# Include OOD dataset configs
+_include_ood_datasets:
+  - datasets/arc_challenge.yaml
+  - datasets/forecastqa.yaml
+
+# Override OOD dataset-specific settings
+ood_datasets:
+  - display_name: arc_challenge_ood
+    eval_split: test
+  - display_name: forecastqa_ood
+    eval_split: test
+
+
 # Evaluation parameters
-option_tokens: ["1", "0"]
 
 # Evaluation checkpoint/resume (set to false to start fresh)
 resume_eval: false  # Set to true to resume from checkpoint
 
+
 # Wandb logging
-report_to_wandb: false
+report_to_wandb: true
 wandb_project: multi-llm-wagering
 wandb_entity: null
-wandb_name: kl_uniform_wagers_cluster_saturation_bayes_mixed_layers_eval
+wandb_name: equal_wagers_linear_pooling_eval

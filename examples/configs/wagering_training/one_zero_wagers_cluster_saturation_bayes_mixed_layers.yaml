@@ -4,11 +4,22 @@
 # Include model configs (must match training)
 _include_models:
   - models/gemma_2_9b_it.yaml
+  - models/gemma_2_9b_it.yaml
+  - models/gemma_2_9b_it.yaml
+  - models/gemma_2_9b_it.yaml
+  - models/gemma_2_9b_it.yaml
+  - models/gemma_2_9b_it.yaml
+  - models/gemma_2_9b_it.yaml
+  - models/gemma_2_9b_it.yaml
   
+  - models/gemma_2_9b_it.yaml
+  - models/gemma_2_9b_it.yaml
+  - models/gemma_2_9b_it.yaml
+  - models/gemma_2_9b_it.yaml
 
 # Checkpoint path (for inference-only method, this can be a dummy path)
 checkpoint_path: /common/users/yl2310/MultiLLMs/checkpoints/dummy_kl_uniform_wagers
-cache_path: /research/projects/ecoai/yl2310/MultiLLMs/wagering_model_logits_states_caches
+cache_path: /filer/tmp1/yl2310/MultiLLMs/wagering_model_logits_states_caches
 
 # Apply adaptive temperature scaling to cached option logits before wagering.
 calibrated: false
@@ -18,7 +29,7 @@ shuffle_seed: 18 #18 #17
 
 # Wagering method - KL divergence to uniform (inference-only)
 wagering_method:
-  name: equal_wagers
+  name: one_zero_wagers
   config: {}
 
 # Aggregation function
