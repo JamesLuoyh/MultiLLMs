@@ -1,9 +1,4 @@
-# Full end-to-end pipeline for decentralized per-model routers on PubMedQA
-# Structure matches centralized_wagers_pubmedqa.yaml; only wagering_method differs.
-
-# ============================================================================
-# SHARED CONFIGURATION (used by both training and evaluation)
-# ============================================================================
+# RouteLLM-style BERT router (arXiv:2406.18665) — PubMedQA, mirrors centralized_wagers_pubmedqa.yaml structure
 
 _include_models:
   - models/llama3_aloe_8b_alpha.yaml
@@ -15,17 +10,22 @@ calibrated: false
 _include_calibration: calibration/adaptive_temperature_pubmedqa_1000samples.yaml
 
 wagering_method:
-  name: decentralized_wagers
+  name: route_llm_bert
   config:
-    hidden_dim: 4096
-    hidden_layers: [512, 256]
+    bert_model_name: bert-base-uncased
+    max_seq_length: 512
     hidden_state_layers: [-1]
-    learning_rate: 5e-6
+    learning_rate: 5e-5
     lr_decay_factor: 1
     lr_decay_steps: 100
     temperature: 2.0
     grad_clip_norm: 1.0
-    normalize_hidden_states: false
+    weight_decay: 0.01
+    freeze_bert: false
+    pubmedqa_strip_context: true
+    router_dropout: 0.1
+    ranking_loss_weight: 0.0
+    ranking_margin: 0.1
     device: cuda:0
 
 aggregation:
@@ -34,10 +34,6 @@ aggregation:
 
 option_tokens: ["YES", "NO"]
 cache_path: /common/users/yl2310/MultiLLMs/cache
-
-# ============================================================================
-# TRAINING CONFIGURATION
-# ============================================================================
 
 _include_datasets:
   - datasets/pubmedqa.yaml
@@ -57,11 +53,7 @@ early_stopping_criterion: validation
 report_to_wandb: true
 wandb_project: multi-llm-wagering
 wandb_entity: null
-wandb_name: decentralized_wagers_pubmedqa
-
-# ============================================================================
-# EVALUATION CONFIGURATION
-# ============================================================================
+wandb_name: route_llm_bert_pubmedqa
 
 _include_test_datasets:
   - datasets/pubmedqa.yaml

@@ -29,10 +29,8 @@ from wagering.utils import load_models_from_config, load_datasets_from_config, l
 from wagering.calibration import calibration_enabled, fit_or_load_logit_calibrator
 from wagering.utils.multi_llm_ensemble import (
     assign_pubmedqa_context_models,
-    configure_wagering_cache_dir,
     get_cached_logits_and_hidden_states_for_model,
     get_model_prompt_variant,
-    resolve_hidden_state_layers_for_model,
 )
 from wagering.methods.factory import load_wagering_method
 from wagering.inference import WageringEvaluator
@@ -83,7 +81,6 @@ def main(
     
     # Load config
     args = load_and_merge_configs(config_path)
-    configure_wagering_cache_dir(args.get("cache_path"))
     
     # Set up logging
     logging.basicConfig(level=logging.INFO, format='%(name)s - %(levelname)s - %(message)s')
@@ -149,22 +146,23 @@ def main(
         )
         test_datasets = [(ds, name) for ds, name in zip(test_ds, test_names)]
 
-    # Load OOD datasets (supports both single and multiple config styles).
+    # Load OOD datasets (supports both plural and legacy singular keys)
     ood_datasets = []
     if "ood_datasets" in args and args["ood_datasets"]:
-        ood_configs = args["ood_datasets"]
+        ood_ds, ood_names = load_datasets_from_config(
+            args["ood_datasets"],
+            split="test",
+            random_seed=dataset_split_seed,
+        )
+        ood_datasets.extend((ds, name) for ds, name in zip(ood_ds, ood_names))
     elif "ood_dataset" in args and args["ood_dataset"]:
         ood_configs = [args["ood_dataset"]] if isinstance(args["ood_dataset"], dict) else args["ood_dataset"]
-    else:
-        ood_configs = []
-
-    if ood_configs:
         ood_ds, ood_names = load_datasets_from_config(
             ood_configs,
             split="test",
             random_seed=dataset_split_seed,
         )
-        ood_datasets = [(ds, name) for ds, name in zip(ood_ds, ood_names)]
+        ood_datasets.extend((ds, name) for ds, name in zip(ood_ds, ood_names))
 
     # Configure PubMedQA mixed-context prompts with balanced randomized per-example assignment.
     eval_dataset_objects = [ds for ds, _ in test_datasets]
@@ -173,12 +171,10 @@ def main(
         eval_dataset_objects.extend(ds for ds, _ in ood_datasets)
         eval_dataset_names.extend(name for _, name in ood_datasets)
     pubmedqa_context_seed = dataset_split_seed
-    pubmedqa_context_policy = str(args.get("pubmedqa_context_policy", "single_with_context"))
     pubmedqa_assignments = assign_pubmedqa_context_models(
         eval_dataset_objects,
         [model_cfg["path"] for model_cfg in args["models"]],
         random_seed=pubmedqa_context_seed,
-        context_policy=pubmedqa_context_policy,
     )
     for dataset_idx, assignment_info in pubmedqa_assignments.items():
         dataset_name = eval_dataset_names[dataset_idx] if dataset_idx < len(eval_dataset_names) else f"dataset_{dataset_idx}"
@@ -212,26 +208,14 @@ def main(
         num_models=num_models,
         config=wagering_config.get("config", {}),
     )
-    method_requires_hidden_states = bool(getattr(wagering_method, "requires_hidden_states", True))
-    method_requires_model_perplexities = bool(
-        getattr(wagering_method, "requires_model_perplexities", False)
+    hidden_state_layers = getattr(
+        wagering_method,
+        "hidden_state_layers",
+        wagering_config.get("config", {}).get("hidden_state_layers"),
     )
-    hidden_state_layers = None
-    hidden_state_layers_per_model = None
-    if method_requires_hidden_states:
-        hidden_state_layers = getattr(
-            wagering_method,
-            "hidden_state_layers",
-            wagering_config.get("config", {}).get("hidden_state_layers"),
-        )
-        hidden_state_layers_per_model = getattr(
-            wagering_method,
-            "hidden_state_layers_per_model",
-            wagering_config.get("config", {}).get("hidden_state_layers_per_model"),
-        )
-        # Keep cache checks and evaluator runtime on the same layer selection.
-        setattr(wagering_method, "hidden_state_layers", hidden_state_layers)
-        setattr(wagering_method, "hidden_state_layers_per_model", hidden_state_layers_per_model)
+    # Keep cache checks and evaluator runtime on the same layer selection, even
+    # for methods that don't explicitly expose hidden_state_layers.
+    setattr(wagering_method, "hidden_state_layers", hidden_state_layers)
 
     requires_checkpoint = len(wagering_method.get_trainable_parameters()) > 0
 
@@ -244,7 +228,11 @@ def main(
     checkpoint_path = Path(checkpoint_path) if checkpoint_path is not None else None
 
     # Determine if hidden states are required
-    needs_hidden_states = method_requires_hidden_states or logit_calibrator is not None
+    wagering_method_name = type(wagering_method).__name__
+    needs_hidden_states = (
+        wagering_method_name not in ["EqualWagers", "ZeroOneWagers", "OneZeroWagers"]
+        or logit_calibrator is not None
+    )
 
     # Check cache per model across all eval datasets
     option_tokens = args.get("option_tokens", ["A", "B", "C", "D"])
@@ -260,12 +248,6 @@ def main(
     for idx, model_cfg in enumerate(model_cfgs):
         model_path = model_cfg["path"]
         model_cached = True
-        model_hidden_layers = resolve_hidden_state_layers_for_model(
-            hidden_state_layers,
-            hidden_state_layers_per_model,
-            model_index=idx,
-            num_models=num_models,
-        )
         for ds in eval_datasets:
             prompt_variant = get_model_prompt_variant(ds, model_index=idx)
             cached_logits, cached_hidden_states, _ = get_cached_logits_and_hidden_states_for_model(
@@ -274,7 +256,7 @@ def main(
                 option_tokens,
                 prompt_variant=prompt_variant,
                 model_index=idx,
-                hidden_state_layers=model_hidden_layers,
+                hidden_state_layers=hidden_state_layers,
             )
             if cached_logits is None or (needs_hidden_states and cached_hidden_states is None):
                 model_cached = False
@@ -288,29 +270,35 @@ def main(
             cache_miss_indices.append(idx)
         cached_model_names.append(model_path.replace("/", "_"))
 
+    force_load_all_models = bool(getattr(wagering_method, "requires_model_perplexities", False))
+    if force_load_all_models:
+        # Prompt-perplexity methods need live model objects even when logits are cached.
+        log.info(
+            "Wagering method requires model prompt perplexities; loading all %d models for evaluation.",
+            num_models,
+        )
+
     models = []
     model_names = cached_model_names[:]
-    if method_requires_model_perplexities:
-        log.info(
-            "Wagering method requires model perplexities; loading all models to compute prompt perplexity."
-        )
-        models, model_names = load_models_from_config(
-            model_cfgs,
-            cache_kwargs={"cache_dir": args.get("cache_path", "./workdir/cache")}
-            if args.get("cache_path")
-            else {},
-        )
-    elif cache_miss_indices:
-        log.info(f"Cache miss for {len(cache_miss_indices)}/{num_models} models. Loading missing models...")
-        missing_cfgs = [model_cfgs[i] for i in cache_miss_indices]
+    load_model_indices = list(range(num_models)) if force_load_all_models else cache_miss_indices
+    if load_model_indices:
+        if force_load_all_models:
+            log.info(
+                "Loading %d/%d models to compute prompt perplexities.",
+                len(load_model_indices),
+                num_models,
+            )
+        else:
+            log.info(f"Cache miss for {len(load_model_indices)}/{num_models} models. Loading missing models...")
+        missing_cfgs = [model_cfgs[i] for i in load_model_indices]
         missing_models, missing_names = load_models_from_config(
             missing_cfgs,
             cache_kwargs={"cache_dir": args.get("cache_path", "./workdir/cache")} if args.get("cache_path") else {},
         )
-        missing_name_map = {idx: name for idx, name in zip(cache_miss_indices, missing_names)}
+        missing_name_map = {idx: name for idx, name in zip(load_model_indices, missing_names)}
         missing_iter = iter(missing_models)
         for i in range(num_models):
-            if i in cache_miss_indices:
+            if i in load_model_indices:
                 models.append(next(missing_iter))
                 model_names[i] = missing_name_map.get(i, model_names[i])
             else:
@@ -330,6 +318,10 @@ def main(
                 log.debug(f"  Model {i} ({model_names[i]}): hidden_dim={hidden_dim}, expected proj key=proj_{i}")
             elif i in cache_miss_indices:
                 log.debug(f"  Model {i} ({model_names[i]}): hidden_dim=unknown (cache miss, will compute during eval)")
+            elif force_load_all_models:
+                log.debug(
+                    f"  Model {i} ({model_names[i]}): hidden_dim=unknown (model loaded for prompt perplexity computation)"
+                )
     
     # Load checkpoint
     # Check if the method has trainable parameters
@@ -524,9 +516,10 @@ def main(
     # Evaluate
     log.info("Starting evaluation...")
     log.info(f"  Test datasets: {len(test_datasets)}")
-    log.info(f"  OOD datasets: {len(ood_datasets)}")
-    for _, ood_name in ood_datasets:
-        log.info(f"    - {ood_name}")
+    if ood_datasets:
+        log.info(f"  OOD datasets: {len(ood_datasets)}")
+        for _, ood_name in ood_datasets:
+            log.info(f"    - {ood_name}")
     
     results = evaluator.evaluate_multiple(
         test_datasets=test_datasets,
@@ -550,8 +543,6 @@ def main(
         "meta_auc": [],
         "kendall_tau": [],
         "best_model_mrr": [],
-        "kl_divergence": [],
-        "tv_distance": [],
     }
     
     for dataset_name, result in results.items():
@@ -587,8 +578,6 @@ def main(
         meta_auc_val = get_metric_float(result, "meta_auc")
         kendall_tau_val = get_metric_float(result, "kendall_tau")
         best_model_mrr_val = get_metric_float(result, "best_model_mrr")
-        kl_divergence_val = get_metric_float(result, "kl_divergence")
-        tv_distance_val = get_metric_float(result, "tv_distance")
 
         if accuracy_val is not None:
             aggregate_metrics["accuracy"].append(accuracy_val)
@@ -614,10 +603,6 @@ def main(
             aggregate_metrics["kendall_tau"].append(kendall_tau_val)
         if best_model_mrr_val is not None:
             aggregate_metrics["best_model_mrr"].append(best_model_mrr_val)
-        if kl_divergence_val is not None:
-            aggregate_metrics["kl_divergence"].append(kl_divergence_val)
-        if tv_distance_val is not None:
-            aggregate_metrics["tv_distance"].append(tv_distance_val)
 
         accuracy_str = get_metric_str(result, "accuracy")
         nll_str = get_metric_str(result, "nll")
@@ -631,18 +616,15 @@ def main(
         meta_auc_str = get_metric_str(result, "meta_auc")
         kendall_tau_str = get_metric_str(result, "kendall_tau")
         best_model_mrr_str = get_metric_str(result, "best_model_mrr")
-        kl_divergence_str = get_metric_str(result, "kl_divergence")
-        tv_distance_str = get_metric_str(result, "tv_distance")
         
         log.info(
             f"{dataset_name}: Accuracy={accuracy_str}, "
             f"NLL={nll_str}, Brier={brier_str}, AUC={auc_str}, ECE={ece_str}, "
             f"DRegret={d_regret_str}, BrierDRegret={brier_d_regret_str}, MetaAcc={meta_acc_str}, MetaNLL={meta_nll_str}, MetaAUC={meta_auc_str}, "
-            f"KendallTau={kendall_tau_str}, BestModelMRR={best_model_mrr_str}, "
-            f"KLDivergence={kl_divergence_str}, TVDistance={tv_distance_str}"
+            f"KendallTau={kendall_tau_str}, BestModelMRR={best_model_mrr_str}"
         )
         
-        results_summary[dataset_name] = f"Accuracy={accuracy_str}, AUC={auc_str}, ECE={ece_str}, NLL={nll_str}, Brier={brier_str}, DRegret={d_regret_str}, BrierDRegret={brier_d_regret_str}, MetaAcc={meta_acc_str}, MetaAuc={meta_auc_str}, MetaNLL={meta_nll_str}, KendallTau={kendall_tau_str}, BestModelMRR={best_model_mrr_str}, KLDivergence={kl_divergence_str}, TVDistance={tv_distance_str}"
+        results_summary[dataset_name] = f"Accuracy={accuracy_str}, AUC={auc_str}, ECE={ece_str}, NLL={nll_str}, Brier={brier_str}, DRegret={d_regret_str}, BrierDRegret={brier_d_regret_str}, MetaAcc={meta_acc_str}, MetaAuc={meta_auc_str}, MetaNLL={meta_nll_str}, KendallTau={kendall_tau_str}, BestModelMRR={best_model_mrr_str}"
 
     def aggregate_metric_str(values):
         if not values:
@@ -662,14 +644,11 @@ def main(
     overall_meta_auc = aggregate_metric_str(aggregate_metrics["meta_auc"])
     overall_kendall_tau = aggregate_metric_str(aggregate_metrics["kendall_tau"])
     overall_best_model_mrr = aggregate_metric_str(aggregate_metrics["best_model_mrr"])
-    overall_kl_divergence = aggregate_metric_str(aggregate_metrics["kl_divergence"])
-    overall_tv_distance = aggregate_metric_str(aggregate_metrics["tv_distance"])
 
     results_summary["overall"] = (
         f"Accuracy={overall_accuracy}, AUC={overall_auc}, ECE={overall_ece}, "
         f"NLL={overall_nll}, Brier={overall_brier}, DRegret={overall_d_regret}, BrierDRegret={overall_brier_d_regret}, MetaAcc={overall_meta_acc}, "
-        f"MetaAuc={overall_meta_auc}, MetaNLL={overall_meta_nll}, KendallTau={overall_kendall_tau}, BestModelMRR={overall_best_model_mrr}, "
-        f"KLDivergence={overall_kl_divergence}, TVDistance={overall_tv_distance}"
+        f"MetaAuc={overall_meta_auc}, MetaNLL={overall_meta_nll}, KendallTau={overall_kendall_tau}, BestModelMRR={overall_best_model_mrr}"
     )
     
     # Log summary to wandb

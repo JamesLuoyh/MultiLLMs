@@ -2,11 +2,15 @@
 Linear pooling aggregation: weighted average of probabilities.
 """
 
+import logging
 import numpy as np
 import torch
 from typing import Tuple
 
 from .base import AggregationFunction
+
+
+logger = logging.getLogger(__name__)
 
 
 class LinearPooling(AggregationFunction):
@@ -35,6 +39,21 @@ class LinearPooling(AggregationFunction):
         """
         model_logits = np.asarray(model_logits, dtype=np.float32)
         wagers = np.asarray(wagers, dtype=np.float32)
+
+        def _array_stats(name: str, arr: np.ndarray) -> str:
+            arr = np.asarray(arr)
+            nan_count = int(np.isnan(arr).sum())
+            inf_count = int(np.isinf(arr).sum())
+            finite = arr[np.isfinite(arr)]
+            if finite.size == 0:
+                return (
+                    f"{name}: shape={arr.shape}, nan={nan_count}, inf={inf_count}, "
+                    "finite_min=nan, finite_max=nan"
+                )
+            return (
+                f"{name}: shape={arr.shape}, nan={nan_count}, inf={inf_count}, "
+                f"finite_min={float(finite.min()):.6g}, finite_max={float(finite.max()):.6g}"
+            )
         
         # Batch mode
         if model_logits.ndim == 3 and wagers.ndim == 2:
@@ -53,6 +72,28 @@ class LinearPooling(AggregationFunction):
             if np.any(wager_sums <= 1e-10):
                 raise ValueError("Wagers must have positive sum")
 
+            if np.any(~np.isfinite(model_logits)):
+                bad_idx = np.argwhere(~np.isfinite(model_logits))
+                first_bad = tuple(int(i) for i in bad_idx[0]) if bad_idx.size else None
+                logger.error(
+                    "LinearPooling received non-finite model logits in batch mode. %s | %s | first_bad_logit_index=%s",
+                    _array_stats("model_logits", model_logits),
+                    _array_stats("wagers", wagers),
+                    first_bad,
+                )
+                raise ValueError("Invalid model logits (NaN or inf detected)")
+
+            if np.any(~np.isfinite(wagers)):
+                bad_idx = np.argwhere(~np.isfinite(wagers))
+                first_bad = tuple(int(i) for i in bad_idx[0]) if bad_idx.size else None
+                logger.error(
+                    "LinearPooling received non-finite wagers in batch mode. %s | %s | first_bad_wager_index=%s",
+                    _array_stats("wagers", wagers),
+                    _array_stats("model_logits", model_logits),
+                    first_bad,
+                )
+                raise ValueError("Invalid wagers (NaN or inf detected)")
+
             normalized_wagers = wagers / wager_sums
             
             # Softmax to get probabilities
@@ -65,7 +106,23 @@ class LinearPooling(AggregationFunction):
             aggregated_probs = (normalized_wagers[:, :, None] * probs).sum(axis=1)
             
             if np.any(np.isnan(aggregated_probs)) or np.any(np.isinf(aggregated_probs)):
-                raise ValueError("Invalid aggregated probabilities (NaN or inf detected)")
+                bad_batch_idx = np.argwhere(~np.isfinite(aggregated_probs))
+                first_bad = tuple(int(i) for i in bad_batch_idx[0]) if bad_batch_idx.size else None
+                logger.error(
+                    "Invalid aggregated probabilities in LinearPooling batch mode. %s | %s | %s | %s | first_bad_aggregated_index=%s",
+                    _array_stats("model_logits", model_logits),
+                    _array_stats("wagers", wagers),
+                    _array_stats("normalized_wagers", normalized_wagers),
+                    _array_stats("model_probs", probs),
+                    first_bad,
+                )
+                raise ValueError(
+                    "Invalid aggregated probabilities (NaN or inf detected); "
+                    f"first_bad_index={first_bad}; "
+                    f"model_logits_nan={int(np.isnan(model_logits).sum())}, "
+                    f"model_logits_inf={int(np.isinf(model_logits).sum())}, "
+                    f"wagers_nan={int(np.isnan(wagers).sum())}, wagers_inf={int(np.isinf(wagers).sum())}"
+                )
             
             # Normalize
             probs_sum = aggregated_probs.sum(axis=1, keepdims=True)
@@ -100,6 +157,28 @@ class LinearPooling(AggregationFunction):
             if wager_sum <= 1e-10:
                 raise ValueError("Wagers must have positive sum")
 
+            if np.any(~np.isfinite(model_logits)):
+                bad_idx = np.argwhere(~np.isfinite(model_logits))
+                first_bad = tuple(int(i) for i in bad_idx[0]) if bad_idx.size else None
+                logger.error(
+                    "LinearPooling received non-finite model logits in single mode. %s | %s | first_bad_logit_index=%s",
+                    _array_stats("model_logits", model_logits),
+                    _array_stats("wagers", wagers),
+                    first_bad,
+                )
+                raise ValueError("Invalid model logits (NaN or inf detected)")
+
+            if np.any(~np.isfinite(wagers)):
+                bad_idx = np.argwhere(~np.isfinite(wagers))
+                first_bad = tuple(int(i) for i in bad_idx[0]) if bad_idx.size else None
+                logger.error(
+                    "LinearPooling received non-finite wagers in single mode. %s | %s | first_bad_wager_index=%s",
+                    _array_stats("wagers", wagers),
+                    _array_stats("model_logits", model_logits),
+                    first_bad,
+                )
+                raise ValueError("Invalid wagers (NaN or inf detected)")
+
             normalized_wagers = wagers / wager_sum
             
             # Softmax to get probabilities
@@ -110,6 +189,24 @@ class LinearPooling(AggregationFunction):
             
             # Weighted average
             pooled_probs = (normalized_wagers[:, None] * probs).sum(axis=0)
+            if np.any(~np.isfinite(pooled_probs)):
+                bad_idx = np.argwhere(~np.isfinite(pooled_probs))
+                first_bad = tuple(int(i) for i in bad_idx[0]) if bad_idx.size else None
+                logger.error(
+                    "Invalid pooled probabilities in LinearPooling single mode. %s | %s | %s | %s | first_bad_pooled_index=%s",
+                    _array_stats("model_logits", model_logits),
+                    _array_stats("wagers", wagers),
+                    _array_stats("normalized_wagers", normalized_wagers),
+                    _array_stats("model_probs", probs),
+                    first_bad,
+                )
+                raise ValueError(
+                    "Invalid pooled probabilities (NaN or inf detected); "
+                    f"first_bad_index={first_bad}; "
+                    f"model_logits_nan={int(np.isnan(model_logits).sum())}, "
+                    f"model_logits_inf={int(np.isinf(model_logits).sum())}, "
+                    f"wagers_nan={int(np.isnan(wagers).sum())}, wagers_inf={int(np.isinf(wagers).sum())}"
+                )
             pooled_probs = pooled_probs / pooled_probs.sum()
             
             # Validate

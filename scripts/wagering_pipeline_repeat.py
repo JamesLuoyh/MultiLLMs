@@ -3,10 +3,10 @@
 Repeat-run wrapper for scripts/wagering_pipeline.py.
 
 Runs the same config N times (parallel by default), forces wandb off, varies
-shuffle_seed per repeat (keeps dataset_split_seed fixed by default for cache reuse),
-and gives each repeat its own
+shuffle_seed and dataset_split_seed per repeat, and gives each repeat its own
 checkpoint directory. Use ``--max-workers-per-gpu K`` to cap concurrency at
 ``K`` jobs per visible GPU (each subprocess gets its own ``CUDA_VISIBLE_DEVICES``).
+Optionally set ``--gpus`` to constrain visible GPU IDs (e.g. ``--gpus 2,3``).
 
 After repeats, aggregates eval metrics from
 ``<checkpoint_base>/<run_tag>/repeat_*/eval/analytics_*.csv`` (mean, sample std,
@@ -33,7 +33,6 @@ from __future__ import annotations
 
 import argparse
 import os
-import shutil
 import subprocess
 import sys
 import time
@@ -69,13 +68,11 @@ DEFAULT_AGGREGATE_METRICS = [
     "kendall_tau",
     "best_model_mrr",
     "ece",
-    "kl_divergence",
-    "tv_distance",
 ]
 
 # Printed as (value * scale); e.g. accuracy 0.76 -> "76.12" with scale 100.
 _AGGREGATE_PRINT_SCALE_100 = frozenset(
-    {"accuracy", "ece", "best_model_mrr", "d_regret", "brier_d_regret", "kendall_tau", "kl_divergence", "tv_distance"}
+    {"accuracy", "ece", "best_model_mrr", "d_regret", "brier_d_regret", "kendall_tau"}
 )
 
 
@@ -208,11 +205,22 @@ def _visible_gpu_count() -> int:
 
 
 def _parse_gpu_ids(csv: str) -> List[str]:
-    """Parse comma-separated GPU identifiers into a non-empty list."""
     gpu_ids = [p.strip() for p in str(csv).split(",") if p.strip()]
     if not gpu_ids:
         raise ValueError("No GPUs provided. Example: --gpus 0,1,2,3")
     return gpu_ids
+
+
+def _resolve_visible_gpu_ids(gpus_arg: Optional[str]) -> List[str]:
+    if gpus_arg is not None:
+        return _parse_gpu_ids(gpus_arg)
+    raw = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if raw is not None and str(raw).strip() != "":
+        ids = _parse_gpu_ids(str(raw))
+        if ids:
+            return ids
+    count = _visible_gpu_count()
+    return [str(i) for i in range(count)]
 
 
 def _load_yaml(path: Path) -> Dict[str, Any]:
@@ -237,12 +245,7 @@ def _force_wandb_off(cfg: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
-def _vary_seeds(
-    cfg: Dict[str, Any],
-    repeat_idx: int,
-    *,
-    vary_dataset_split_seed: bool = False,
-) -> Dict[str, Any]:
+def _vary_seeds(cfg: Dict[str, Any], repeat_idx: int) -> Dict[str, Any]:
     out = dict(cfg)
 
     def _base_int(key: str, default: int) -> int:
@@ -256,12 +259,7 @@ def _vary_seeds(
     base_split = _base_int("dataset_split_seed", 42)
 
     out["shuffle_seed"] = base_shuffle + int(repeat_idx)
-    if vary_dataset_split_seed:
-        out["dataset_split_seed"] = base_split + int(repeat_idx)
-    else:
-        # Keep dataset split fixed so prompt routing/cache keys remain stable
-        # across repeats and existing cache artifacts can be reused.
-        out["dataset_split_seed"] = base_split
+    out["dataset_split_seed"] = base_split + int(repeat_idx)
     return out
 
 
@@ -282,41 +280,6 @@ def _resolve_base_checkpoint_dir(
 
 def _repeat_checkpoint_dir(base: Path, repeat_idx: int, run_tag: str) -> Path:
     return base / run_tag / f"repeat_{repeat_idx:04d}"
-
-
-def _cleanup_repeat_training_artifacts(repeat_ckpt_dir: Path) -> None:
-    """Remove bulky training artifacts while keeping eval outputs for aggregation."""
-    if not repeat_ckpt_dir.exists():
-        return
-
-    removed_files = 0
-    removed_dirs = 0
-
-    for path in repeat_ckpt_dir.rglob("checkpoint_epoch_*_step_*.pt"):
-        try:
-            path.unlink()
-            removed_files += 1
-        except Exception:
-            pass
-    for path in repeat_ckpt_dir.rglob("checkpoint_epoch_*_step_*.pt.tmp"):
-        try:
-            path.unlink()
-            removed_files += 1
-        except Exception:
-            pass
-    for final_dir in repeat_ckpt_dir.rglob("final"):
-        if not final_dir.is_dir():
-            continue
-        try:
-            shutil.rmtree(final_dir)
-            removed_dirs += 1
-        except Exception:
-            pass
-
-    print(
-        f"[cleanup] {repeat_ckpt_dir}: removed {removed_files} transition/tmp files and {removed_dirs} final dirs",
-        flush=True,
-    )
 
 
 def _wandb_disabled_env(base_env: Dict[str, str]) -> Dict[str, str]:
@@ -473,7 +436,7 @@ def main() -> int:
     parser.add_argument(
         "--max-workers-per-gpu",
         type=int,
-        default=1,
+        default=None,
         metavar="K",
         help=(
             "Run at most K pipeline jobs per visible GPU; sets CUDA_VISIBLE_DEVICES per "
@@ -486,9 +449,8 @@ def main() -> int:
         type=str,
         default=None,
         help=(
-            "Comma-separated GPU ids to schedule over when using --max-workers-per-gpu "
-            "(example: 1,2,3). If omitted, uses CUDA_VISIBLE_DEVICES when set, "
-            "otherwise all detected CUDA devices."
+            "Comma-separated GPU ids to use (e.g. 0,1,2,3). Limits scheduling for "
+            "--max-workers-per-gpu and sets CUDA_VISIBLE_DEVICES for child runs."
         ),
     )
     parser.add_argument(
@@ -503,14 +465,6 @@ def main() -> int:
         default=None,
         help="Base checkpoint directory; each repeat uses <base>/<run_tag>/repeat_NNNN/",
     )
-    parser.add_argument(
-        "--vary-dataset-split-seed",
-        action="store_true",
-        help=(
-            "Also vary dataset_split_seed per repeat (default: keep fixed for cache reuse). "
-            "When omitted, only shuffle_seed is varied."
-        ),
-    )
     parser.add_argument("--skip-training", action="store_true", help="Pass through to pipeline")
     parser.add_argument("--skip-evaluation", action="store_true", help="Pass through to pipeline")
     parser.add_argument(
@@ -518,24 +472,6 @@ def main() -> int:
         type=str,
         default=None,
         help="Pass through to pipeline (with --skip-training)",
-    )
-    parser.add_argument(
-        "--pipeline-cleanup-checkpoints",
-        type=str,
-        default="transition",
-        choices=["none", "transition", "all"],
-        help=(
-            "Cleanup mode forwarded to each wagering_pipeline.py subprocess "
-            "(default: transition)."
-        ),
-    )
-    parser.add_argument(
-        "--cleanup-training-artifacts",
-        action="store_true",
-        help=(
-            "After each repeat finishes, remove training checkpoint artifacts inside that "
-            "repeat directory (transition *.pt/*.pt.tmp and final/ dirs) while keeping eval outputs."
-        ),
     )
     parser.add_argument("--sleep-seconds", type=float, default=0.0, help="Sleep between repeats (sequential mode only)")
     parser.add_argument("--fail-fast", action="store_true", help="Stop submitting new repeats on first failure (parallel mode drains in-flight)")
@@ -618,34 +554,27 @@ def main() -> int:
         parser.error("Use either --max-workers or --max-workers-per-gpu, not both")
 
     gpu_slot_queue: Optional[Queue[str]] = None
+    visible_gpu_ids = _resolve_visible_gpu_ids(args.gpus)
+    if args.gpus is not None:
+        print(f"[schedule] Using explicit GPU ids: {','.join(visible_gpu_ids)}", flush=True)
     if args.max_workers_per_gpu is not None:
         if args.max_workers_per_gpu <= 0:
             raise ValueError("--max-workers-per-gpu must be > 0")
-        if args.gpus is not None:
-            gpu_ids = _parse_gpu_ids(args.gpus)
-        else:
-            env_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
-            if env_visible is not None and str(env_visible).strip() != "":
-                gpu_ids = _parse_gpu_ids(env_visible)
-            else:
-                num_visible = _visible_gpu_count()
-                gpu_ids = [str(i) for i in range(num_visible)]
-
-        num_gpus = len(gpu_ids)
+        num_gpus = len(visible_gpu_ids)
         if num_gpus < 1:
             raise ValueError(
                 "Found 0 CUDA device(s) for --max-workers-per-gpu. "
-                "Pass --gpus, set CUDA_VISIBLE_DEVICES, install PyTorch with CUDA, "
+                "Set --gpus or CUDA_VISIBLE_DEVICES, or install PyTorch with CUDA, "
                 "or use --max-workers instead."
             )
         args.max_workers = min(int(args.n_repeats), num_gpus * int(args.max_workers_per_gpu))
         gpu_slot_queue = Queue()
-        for g in gpu_ids:
+        for g in visible_gpu_ids:
             for _ in range(int(args.max_workers_per_gpu)):
                 gpu_slot_queue.put(g)
         print(
-            f"[schedule] GPUs [{','.join(gpu_ids)}], {args.max_workers_per_gpu} worker(s)/GPU "
-            f"-> max concurrent repeats {args.max_workers}",
+            f"[schedule] {num_gpus} visible GPU(s) ({','.join(visible_gpu_ids)}), "
+            f"{args.max_workers_per_gpu} worker(s)/GPU -> max concurrent repeats {args.max_workers}",
             flush=True,
         )
     elif args.max_workers is None:
@@ -660,6 +589,8 @@ def main() -> int:
     run_tag_dir = base_ckpt_dir / run_tag
 
     env = _wandb_disabled_env(os.environ)
+    if visible_gpu_ids:
+        env["CUDA_VISIBLE_DEVICES"] = ",".join(visible_gpu_ids)
 
     python_exe = Path(args.python) if args.python else (DEFAULT_VENV_PYTHON if DEFAULT_VENV_PYTHON.exists() else Path(sys.executable))
     if not python_exe.exists():
@@ -669,11 +600,7 @@ def main() -> int:
 
     def _run_one(repeat_idx: int) -> int:
         repeat_ckpt_dir = _repeat_checkpoint_dir(base_ckpt_dir, repeat_idx, run_tag)
-        repeat_cfg = _vary_seeds(
-            cfg,
-            repeat_idx,
-            vary_dataset_split_seed=bool(args.vary_dataset_split_seed),
-        )
+        repeat_cfg = _vary_seeds(cfg, repeat_idx)
         repeat_cfg["checkpoint_base_dir"] = str(repeat_ckpt_dir)
 
         temp_cfg_path = config_path.parent / f".tmp_wagering_repeat_{run_tag}_{repeat_idx:04d}.yaml"
@@ -681,8 +608,8 @@ def main() -> int:
         gpu_index: Optional[str] = None
         run_env = dict(env)
         if gpu_slot_queue is not None:
-            gpu_index = gpu_slot_queue.get()
-            run_env["CUDA_VISIBLE_DEVICES"] = gpu_index
+            gpu_index = str(gpu_slot_queue.get())
+            run_env["CUDA_VISIBLE_DEVICES"] = str(gpu_index)
 
         try:
             _dump_yaml(temp_cfg_path, repeat_cfg)
@@ -694,17 +621,13 @@ def main() -> int:
                 cmd.append("--skip-evaluation")
             if args.checkpoint_path is not None:
                 cmd.extend(["--checkpoint-path", args.checkpoint_path])
-            cmd.extend(["--cleanup-checkpoints", args.pipeline_cleanup_checkpoints])
 
             gpu_note = f" CUDA_VISIBLE_DEVICES={gpu_index}" if gpu_index is not None else ""
             print(f"[repeat {repeat_idx+1}/{args.n_repeats}] running:{gpu_note} {' '.join(cmd)}", flush=True)
             print(f"[repeat {repeat_idx+1}/{args.n_repeats}] checkpoint_base_dir: {repeat_ckpt_dir}", flush=True)
 
             completed = subprocess.run(cmd, env=run_env)
-            return_code = int(completed.returncode)
-            if return_code == 0 and args.cleanup_training_artifacts:
-                _cleanup_repeat_training_artifacts(repeat_ckpt_dir)
-            return return_code
+            return int(completed.returncode)
         finally:
             if gpu_slot_queue is not None and gpu_index is not None:
                 gpu_slot_queue.put(gpu_index)

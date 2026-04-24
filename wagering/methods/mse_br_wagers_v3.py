@@ -157,6 +157,16 @@ class MSEBrWagersV3(WageringMethod):
         
         # Project each model's batch
         for i in range(self.num_models):
+            if i in self.inactive_model_indices:
+                projected_batch_list.append(
+                    torch.zeros(
+                        (batch_size, self.common_hidden_dim),
+                        dtype=torch.float32,
+                        device=self.device,
+                    )
+                )
+                continue
+
             model_hs_batch = hidden_states_list[i]
             model_hidden_dim = model_hs_batch.shape[-1]
             
@@ -192,6 +202,11 @@ class MSEBrWagersV3(WageringMethod):
         # Route: compute raw wagers for each router
         raw_wagers_list = []
         for i in range(self.num_models):
+            if i in self.inactive_model_indices:
+                raw_wagers_list.append(
+                    torch.zeros((batch_size, 1), dtype=torch.float32, device=self.device)
+                )
+                continue
             model_projected = projected_batch_list[i]
             router_i = self.routers[i]
             raw_wager_i = router_i(model_projected)
@@ -199,10 +214,12 @@ class MSEBrWagersV3(WageringMethod):
         
         # Normalize
         raw_wagers_tensor = torch.cat(raw_wagers_list, dim=1)
-        sigmoid_wagers = torch.sigmoid(raw_wagers_tensor/self.temperature)
+        sigmoid_wagers = torch.sigmoid(raw_wagers_tensor / self.temperature)
         if len(self.inactive_model_indices) > 0:
             inactive_list = sorted(self.inactive_model_indices)
-            sigmoid_wagers[:, inactive_list] = 0.0
+            active_mask = torch.ones((1, self.num_models), dtype=sigmoid_wagers.dtype, device=self.device)
+            active_mask[:, inactive_list] = 0.0
+            sigmoid_wagers = sigmoid_wagers * active_mask
                 
         # Compute sum for normalization
         sigmoid_sum = torch.sum(sigmoid_wagers, dim=1, keepdim=True)
@@ -221,7 +238,7 @@ class MSEBrWagersV3(WageringMethod):
             # (they won't be updated, but they need to be in the computation graph)
             self._cached_hidden_states_list = [
                 torch.as_tensor(hidden_states_list[i], dtype=torch.float32, device=self.device)
-                    .requires_grad_(True)
+                    .requires_grad_(self._is_model_trainable(i))
                 for i in range(self.num_models)
             ]
         is_batch = model_logits.ndim == 3
@@ -352,7 +369,7 @@ class MSEBrWagersV3(WageringMethod):
                 hs_tensor = torch.as_tensor(hs, dtype=torch.float32, device=self.device)
             else:
                 hs_tensor = hs.to(self.device)
-            hs_tensor.requires_grad_(True)
+            hs_tensor.requires_grad_(self._is_model_trainable(i))
             hidden_states_tensors.append(hs_tensor)
         
         # PHASE 1: Compute forward pass ONCE from original state (with all intermediate tensors)
@@ -360,6 +377,12 @@ class MSEBrWagersV3(WageringMethod):
         with torch.enable_grad():
             raw_wagers_list = []
             for j in range(self.num_models):
+                if j in self.inactive_model_indices:
+                    raw_wagers_list.append(
+                        torch.zeros((batch_size, 1), dtype=torch.float32, device=self.device)
+                    )
+                    continue
+
                 model_hs_j = hidden_states_tensors[j]
                 
                 # Apply projection if exists
@@ -384,7 +407,9 @@ class MSEBrWagersV3(WageringMethod):
             sigmoid_wagers = torch.sigmoid(raw_wagers_tensor / self.temperature) # [batch_size, num_models]
             if len(self.inactive_model_indices) > 0:
                 inactive_list = sorted(self.inactive_model_indices)
-                sigmoid_wagers[:, inactive_list] = 0.0
+                active_mask = torch.ones((1, self.num_models), dtype=sigmoid_wagers.dtype, device=self.device)
+                active_mask[:, inactive_list] = 0.0
+                sigmoid_wagers = sigmoid_wagers * active_mask
             
 
             # scores = ((scores - #.detach()

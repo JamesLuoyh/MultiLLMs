@@ -6,6 +6,11 @@ Key features:
 - Explicit phase 1 -> phase 2 transition with guaranteed checkpoint resume.
 - Optional per-phase PubMedQA context routing policies.
 - Optional model holdout via wagering method config overrides per phase.
+- Optional per-phase ``max_batches`` (maps to ``max_training_batches`` in the trainer)
+  to stop after N training-loop batches instead of a full epoch/dataset pass.
+  May be set on ``phase1`` / ``phase2`` or on a dataset entry; it does not change
+  logits-cache or checkpoint-dir identity (full cached tensors are loaded, then training
+  stops early).
 - Per-batch metric export and plots:
   - rolling average over last X batches
   - cumulative average since phase start
@@ -75,6 +80,23 @@ DEFAULT_METRICS = [
     "best_model_mrr",
     "brier_d_regret",
 ]
+
+METHOD_CACHE_SCHEMA_VERSION = 2
+
+# Methods that should always retrain end-to-end when model topology changes.
+# For these centralized routers, partial per-model freezing/inactivation and
+# phase2 checkpoint warm-start are intentionally disabled.
+CENTRALIZED_FULL_RETRAIN_METHODS = {
+    "centralized_wagers",
+    "nirt_router",
+    "router_dc",
+    "route_llm_bert",
+}
+
+
+def _requires_full_retrain_for_model_addition(method_cfg: Dict[str, Any]) -> bool:
+    method_name = str(method_cfg.get("name", "")).strip().lower()
+    return method_name in CENTRALIZED_FULL_RETRAIN_METHODS
 
 
 def _aggregate_eval_metrics(
@@ -147,6 +169,7 @@ def _build_method_cache_fingerprint(
         base_without_methods["phase_shift"] = phase_shift_cfg
 
     payload = {
+        "cache_schema_version": METHOD_CACHE_SCHEMA_VERSION,
         "base_config": base_without_methods,
         "phase1": phase1_cfg,
         "phase2": phase2_cfg,
@@ -203,6 +226,124 @@ def _latest_transition_checkpoint(checkpoint_dir: Path) -> Path:
     return max(candidates, key=lambda p: p.stat().st_mtime)
 
 
+def _resolved_phase_max_batches(phase_cfg: Dict[str, Any]) -> Any:
+    """Effective max_batches from phase dict or first nested dataset entry (if any)."""
+    if phase_cfg.get("max_batches") is not None:
+        return phase_cfg.get("max_batches")
+    for d in phase_cfg.get("datasets") or []:
+        if isinstance(d, dict) and d.get("max_batches") is not None:
+            return d.get("max_batches")
+    return None
+
+
+def _phase_model_holdout_indices(phase_cfg: Dict[str, Any]) -> List[int]:
+    """Union of phase-level frozen/inactive indices, parsed as ints."""
+    parsed: set[int] = set()
+    for key in ("frozen_model_indices", "inactive_model_indices"):
+        raw_values = phase_cfg.get(key, [])
+        if raw_values is None:
+            continue
+        if not isinstance(raw_values, (list, tuple, set)):
+            raise ValueError(
+                f"{key} must be a list/tuple/set of model indices, got {type(raw_values).__name__}"
+            )
+        for value in raw_values:
+            try:
+                parsed.add(int(value))
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"Invalid model index in {key}: {value}") from exc
+    return sorted(parsed)
+
+
+def _trim_hidden_state_layers_per_model(
+    hidden_layers_cfg: Any,
+    keep_model_indices: List[int],
+    total_models: int,
+) -> Any:
+    """Subset per-model hidden-layer config so model count matches trimmed phase1 models."""
+    if hidden_layers_cfg is None:
+        return None
+
+    if isinstance(hidden_layers_cfg, (list, tuple)):
+        if len(hidden_layers_cfg) != total_models:
+            raise ValueError(
+                "hidden_state_layers_per_model length must match model count before trimming: "
+                f"expected {total_models}, got {len(hidden_layers_cfg)}"
+            )
+        return [hidden_layers_cfg[idx] for idx in keep_model_indices]
+
+    if isinstance(hidden_layers_cfg, dict):
+        trimmed: Dict[int, Any] = {}
+        for new_idx, old_idx in enumerate(keep_model_indices):
+            if old_idx in hidden_layers_cfg:
+                trimmed[new_idx] = hidden_layers_cfg[old_idx]
+            elif str(old_idx) in hidden_layers_cfg:
+                trimmed[new_idx] = hidden_layers_cfg[str(old_idx)]
+            else:
+                raise ValueError(
+                    "hidden_state_layers_per_model is missing an entry for model index "
+                    f"{old_idx}"
+                )
+        return trimmed
+
+    raise ValueError(
+        "hidden_state_layers_per_model must be a list/tuple/dict when provided, "
+        f"got {type(hidden_layers_cfg).__name__}"
+    )
+
+
+def _apply_phase_model_holdout_for_full_retrain(
+    cfg: Dict[str, Any],
+    phase_cfg: Dict[str, Any],
+    phase_name: str,
+) -> None:
+    """
+    For centralized full-retrain methods, physically remove held-out models per phase.
+
+    Each phase starts from the original base config, so applying this per-phase lets
+    phase1/phase2 independently choose which model subset is loaded before method init.
+    """
+    holdout_indices = _phase_model_holdout_indices(phase_cfg)
+    if not holdout_indices:
+        return
+
+    models_cfg = cfg.get("models")
+    if not isinstance(models_cfg, list) or len(models_cfg) == 0:
+        raise ValueError("Config must provide a non-empty models list for phase model holdout")
+
+    num_models = len(models_cfg)
+    invalid = [idx for idx in holdout_indices if idx < 0 or idx >= num_models]
+    if invalid:
+        raise ValueError(
+            f"{phase_name} model holdout indices out of range for {num_models} models: {invalid}"
+        )
+
+    holdout_set = set(holdout_indices)
+    keep_indices = [idx for idx in range(num_models) if idx not in holdout_set]
+    if not keep_indices:
+        raise ValueError(
+            f"{phase_name} model holdout removed all models. Keep at least one active model."
+        )
+
+    cfg["models"] = [models_cfg[idx] for idx in keep_indices]
+
+    wm_cfg = cfg.setdefault("wagering_method", {}).setdefault("config", {})
+    if "hidden_state_layers_per_model" in wm_cfg:
+        wm_cfg["hidden_state_layers_per_model"] = _trim_hidden_state_layers_per_model(
+            wm_cfg.get("hidden_state_layers_per_model"),
+            keep_indices,
+            num_models,
+        )
+
+    log.info(
+        "[%s] %s model holdout active: excluding indices=%s, training with kept indices=%s",
+        cfg.get("wagering_method", {}).get("name", "unknown_method"),
+        phase_name,
+        holdout_indices,
+        keep_indices,
+    )
+
+
 def _build_phase_config(
     base_cfg: Dict[str, Any],
     phase_cfg: Dict[str, Any],
@@ -217,10 +358,25 @@ def _build_phase_config(
     cfg = copy.deepcopy(base_cfg)
     cfg["wagering_method"] = copy.deepcopy(method_cfg)
 
+    max_batches_val = _resolved_phase_max_batches(phase_cfg)
+
     if "datasets" in phase_cfg:
-        cfg["datasets"] = copy.deepcopy(phase_cfg["datasets"])
+        cfg["datasets"] = []
+        for d in phase_cfg["datasets"]:
+            dc = copy.deepcopy(d)
+            if isinstance(dc, dict):
+                dc.pop("max_batches", None)
+            cfg["datasets"].append(dc)
 
     cfg["num_epochs"] = int(phase_cfg.get("num_epochs", cfg.get("num_epochs", 1)))
+
+    # Allow phase-specific control while defaulting to shuffled training.
+    cfg["shuffle_data"] = bool(phase_cfg.get("shuffle_data", cfg.get("shuffle_data", True)))
+    if "shuffle_seed" in phase_cfg and phase_cfg.get("shuffle_seed") is not None:
+        cfg["shuffle_seed"] = int(phase_cfg["shuffle_seed"])
+
+    if max_batches_val is not None:
+        cfg["max_training_batches"] = int(max_batches_val)
 
     # Validation is not used for early stopping in this pipeline.
     cfg["validation_split_ratio"] = float(phase_cfg.get("validation_split_ratio", 0.0))
@@ -233,15 +389,48 @@ def _build_phase_config(
     if "pubmedqa_context_policy" in phase_cfg:
         cfg["pubmedqa_context_policy"] = str(phase_cfg["pubmedqa_context_policy"])
 
+    # Optional phase-shift optimization: reuse perplexities for identical model+prompt variants.
+    phase_shift_cfg = cfg.get("phase_shift", {})
+    if isinstance(phase_shift_cfg, dict):
+        if "reuse_prompt_perplexities_for_identical_models" in phase_shift_cfg:
+            cfg["reuse_prompt_perplexities_for_identical_models"] = bool(
+                phase_shift_cfg["reuse_prompt_perplexities_for_identical_models"]
+            )
+    if "reuse_prompt_perplexities_for_identical_models" in phase_cfg:
+        cfg["reuse_prompt_perplexities_for_identical_models"] = bool(
+            phase_cfg["reuse_prompt_perplexities_for_identical_models"]
+        )
+
     wm_cfg = cfg.setdefault("wagering_method", {}).setdefault("config", {})
+    method_name = str(cfg.get("wagering_method", {}).get("name", "")).lower()
+
+    # Keep RouterDC stabilization scoped to two-phase runs only so regular
+    # wagering_pipeline behavior/results remain unchanged unless explicitly set.
+    if method_name in {"router_dc", "routerdc", "routerdcwagers"}:
+        wm_cfg.setdefault("force_fp32_params", True)
+        wm_cfg.setdefault("optimizer_foreach", False)
+        wm_cfg.setdefault("optimizer_fused", False)
+
+    full_retrain_for_model_addition = _requires_full_retrain_for_model_addition(
+        cfg.get("wagering_method", {})
+    )
 
     if device_override is not None:
         wm_cfg["device"] = str(device_override)
 
-    if "frozen_model_indices" in phase_cfg:
-        wm_cfg["frozen_model_indices"] = list(phase_cfg.get("frozen_model_indices", []))
-    if "inactive_model_indices" in phase_cfg:
-        wm_cfg["inactive_model_indices"] = list(phase_cfg.get("inactive_model_indices", []))
+    if full_retrain_for_model_addition:
+        _apply_phase_model_holdout_for_full_retrain(
+            cfg=cfg,
+            phase_cfg=phase_cfg,
+            phase_name=phase_name,
+        )
+        wm_cfg.pop("frozen_model_indices", None)
+        wm_cfg.pop("inactive_model_indices", None)
+    else:
+        if "frozen_model_indices" in phase_cfg:
+            wm_cfg["frozen_model_indices"] = list(phase_cfg.get("frozen_model_indices", []))
+        if "inactive_model_indices" in phase_cfg:
+            wm_cfg["inactive_model_indices"] = list(phase_cfg.get("inactive_model_indices", []))
 
     cfg["resume_from_checkpoint"] = resume_checkpoint
     cfg["emit_resume_checkpoint"] = bool(emit_resume_checkpoint)
@@ -433,6 +622,7 @@ def _run_single_method(
 ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     method_name = str(method_cfg.get("name", "unknown_method"))
     method_slug = _slugify(method_name)
+    full_retrain_for_model_addition = _requires_full_retrain_for_model_addition(method_cfg)
     method_output_dir = output_root / method_slug
     method_output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -466,13 +656,21 @@ def _run_single_method(
         if phase1_resume_ckpt is None:
             phase1_resume_ckpt = str(_latest_transition_checkpoint(phase1_checkpoint_dir))
 
+        phase2_resume_ckpt: Optional[str] = str(phase1_resume_ckpt)
+        if full_retrain_for_model_addition:
+            phase2_resume_ckpt = None
+            log.info(
+                "[%s] Full retrain enabled for model addition; phase2 will start from scratch",
+                method_name,
+            )
+
         phase2_payload = _build_phase_config(
             base_cfg=base_cfg,
             phase_cfg=phase2_cfg,
             method_cfg=method_cfg,
             run_label=run_label,
             phase_name="phase2",
-            resume_checkpoint=str(phase1_resume_ckpt),
+            resume_checkpoint=phase2_resume_ckpt,
             device_override=device_override,
             emit_resume_checkpoint=False,
             enable_method_wandb=enable_method_wandb,
@@ -480,7 +678,7 @@ def _run_single_method(
         phase2_cfg_path = tmp_dir_path / f"{method_slug}_phase2.yaml"
         _save_yaml(phase2_cfg_path, phase2_payload)
 
-        log.info("[%s] Starting phase 2 training (resume=%s)", method_name, phase1_resume_ckpt)
+        log.info("[%s] Starting phase 2 training (resume=%s)", method_name, phase2_resume_ckpt)
         phase2_results = train_main(config_path=str(phase2_cfg_path), calibration_path=None)
         phase2_checkpoint_dir = Path(phase2_results["checkpoint_path"]) 
 
@@ -521,6 +719,7 @@ def _run_single_method(
         "phase1_checkpoint_dir": str(phase1_checkpoint_dir),
         "phase2_checkpoint_dir": str(phase2_checkpoint_dir),
         "phase1_transition_checkpoint": str(phase1_resume_ckpt),
+        "phase2_resume_checkpoint": phase2_resume_ckpt,
         "evaluation": eval_results,
         "evaluation_aggregated": _aggregate_eval_metrics(eval_results, DEFAULT_METRICS),
     }
@@ -610,11 +809,8 @@ def run_two_phase_pipeline(
     method_cache = _load_yaml(method_cache_path)
     cache_entries = method_cache.get("entries", {}) if isinstance(method_cache.get("entries"), dict) else {}
 
-    wandb_logger, started_plot_run = _init_or_get_wandb_for_plots(
-        cfg=cfg,
-        run_label=run_label,
-        metric_specs=metric_specs,
-    )
+    wandb_logger = None
+    started_plot_run = False
 
     method_frames: Dict[str, pd.DataFrame] = {}
     method_summaries: List[Dict[str, Any]] = []
@@ -632,7 +828,6 @@ def run_two_phase_pipeline(
     def _finalize_method_result(
         method_name: str,
         method_slug: str,
-        cache_key: str,
         frame: pd.DataFrame,
         summary: Dict[str, Any],
         method_frame_out: Path,
@@ -654,13 +849,13 @@ def run_two_phase_pipeline(
         frame.to_csv(method_frame_out, index=False)
 
         cache_entries[method_slug] = {
-            "cache_key": cache_key,
             "batch_metrics_path": str(method_frame_out),
             "summary": {
                 "method_name": method_name,
                 "phase1_checkpoint_dir": summary.get("phase1_checkpoint_dir"),
                 "phase2_checkpoint_dir": summary.get("phase2_checkpoint_dir"),
                 "phase1_transition_checkpoint": summary.get("phase1_transition_checkpoint"),
+                "phase2_resume_checkpoint": summary.get("phase2_resume_checkpoint"),
                 "evaluation_aggregated": summary.get("evaluation_aggregated"),
                 "evaluation": summary.get("evaluation"),
             },
@@ -677,13 +872,6 @@ def run_two_phase_pipeline(
         method_name = str(method_cfg["name"])
         method_slug = _slugify(method_name)
         method_frame_out = output_root / method_slug / "two_phase_batch_metrics.csv"
-        cache_key = _build_method_cache_fingerprint(
-            base_cfg=cfg,
-            phase1_cfg=phase1_cfg,
-            phase2_cfg=phase2_cfg,
-            method_cfg=method_cfg,
-            run_evaluation=run_evaluation,
-        )
 
         cached_entry = cache_entries.get(method_slug, {})
 
@@ -691,7 +879,6 @@ def run_two_phase_pipeline(
         # exist but method_metrics_cache.yaml was not flushed yet.
         if (not isinstance(cached_entry, dict) or not cached_entry) and method_frame_out.is_file():
             cached_entry = {
-                "cache_key": cache_key,
                 "batch_metrics_path": str(method_frame_out),
                 "summary": {
                     "method_name": method_name,
@@ -709,22 +896,22 @@ def run_two_phase_pipeline(
         cached_frame_path_str = cached_entry.get("batch_metrics_path") if isinstance(cached_entry, dict) else None
         cached_frame_path = Path(cached_frame_path_str) if isinstance(cached_frame_path_str, str) and cached_frame_path_str else None
 
+        preferred_existing_frame = method_frame_out if method_frame_out.is_file() else None
+        if preferred_existing_frame is None and cached_frame_path is not None and cached_frame_path.is_file():
+            preferred_existing_frame = cached_frame_path
+
         if (
-            isinstance(cached_entry, dict)
-            and cached_entry.get("cache_key") == cache_key
-            and cached_frame_path is not None
-            and cached_frame_path.is_file()
+            preferred_existing_frame is not None
         ):
-            log.info("[%s] Cache hit: loading existing metrics from %s", method_name, cached_frame_path)
-            frame = pd.read_csv(cached_frame_path)
+            log.info("[%s] Cache hit (path-based): loading existing metrics from %s", method_name, preferred_existing_frame)
+            frame = pd.read_csv(preferred_existing_frame)
             summary = copy.deepcopy(cached_entry.get("summary", {}))
             summary["method_name"] = method_name
-            summary["batch_metrics_path"] = str(cached_frame_path)
+            summary["batch_metrics_path"] = str(preferred_existing_frame)
             summary["cached"] = True
             _finalize_method_result(
                 method_name=method_name,
                 method_slug=method_slug,
-                cache_key=cache_key,
                 frame=frame,
                 summary=summary,
                 method_frame_out=method_frame_out,
@@ -735,7 +922,6 @@ def run_two_phase_pipeline(
                     "method_cfg": method_cfg,
                     "method_name": method_name,
                     "method_slug": method_slug,
-                    "cache_key": cache_key,
                     "method_frame_out": method_frame_out,
                 }
             )
@@ -802,7 +988,6 @@ def run_two_phase_pipeline(
                     _finalize_method_result(
                         method_name=job["method_name"],
                         method_slug=job["method_slug"],
-                        cache_key=job["cache_key"],
                         frame=frame,
                         summary=summary,
                         method_frame_out=job["method_frame_out"],
@@ -824,7 +1009,6 @@ def run_two_phase_pipeline(
                 _finalize_method_result(
                     method_name=job["method_name"],
                     method_slug=job["method_slug"],
-                    cache_key=job["cache_key"],
                     frame=frame,
                     summary=summary,
                     method_frame_out=job["method_frame_out"],
@@ -884,6 +1068,8 @@ def run_two_phase_pipeline(
         "config_path": str(config_path),
         "output_root": str(output_root),
         "rolling_window_batches": rolling_window,
+        "phase1_max_batches": _resolved_phase_max_batches(phase1_cfg),
+        "phase2_max_batches": _resolved_phase_max_batches(phase2_cfg),
         "metrics": [spec["output_metric"] for spec in metric_specs],
         "eval_method_comparison_csv": str(eval_out),
         "methods": method_summaries,
@@ -891,6 +1077,14 @@ def run_two_phase_pipeline(
     }
     summary_path = output_root / "summary.yaml"
     _save_yaml(summary_path, summary_payload)
+
+    # Initialize the plot logging run at the end so per-method cleanup does not
+    # close it before artifacts are uploaded.
+    wandb_logger, started_plot_run = _init_or_get_wandb_for_plots(
+        cfg=cfg,
+        run_label=run_label,
+        metric_specs=metric_specs,
+    )
 
     _log_plots_to_wandb(
         wandb_logger=wandb_logger,

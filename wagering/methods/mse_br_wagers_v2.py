@@ -216,7 +216,9 @@ class MSEBrWagersV2(WageringMethod):
         sigmoid_wagers = torch.clamp(sigmoid_wagers, min=1e-16, max=1.0-1e-16)  # Prevent zero wagers for stability
         if len(self.inactive_model_indices) > 0:
             inactive_list = sorted(self.inactive_model_indices)
-            sigmoid_wagers[:, inactive_list] = 0.0
+            active_mask = torch.ones((1, self.num_models), dtype=sigmoid_wagers.dtype, device=self.device)
+            active_mask[:, inactive_list] = 0.0
+            sigmoid_wagers = sigmoid_wagers * active_mask
 
         # Compute sum for normalization
         sigmoid_sum = torch.sum(sigmoid_wagers, dim=1, keepdim=True)
@@ -404,7 +406,9 @@ class MSEBrWagersV2(WageringMethod):
             sigmoid_wagers = torch.clamp(sigmoid_wagers, min=1e-16, max=1.0-1e-16)  # Prevent zero wagers for stability
             if len(self.inactive_model_indices) > 0:
                 inactive_list = sorted(self.inactive_model_indices)
-                sigmoid_wagers[:, inactive_list] = 0.0
+                active_mask = torch.ones((1, self.num_models), dtype=sigmoid_wagers.dtype, device=self.device)
+                active_mask[:, inactive_list] = 0.0
+                sigmoid_wagers = sigmoid_wagers * active_mask
 
             
 

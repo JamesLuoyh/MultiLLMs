@@ -42,52 +42,42 @@ def _posterior(prior: float, tpr: float, fpr: float, evidence: int) -> float:
     return num / den
 
 
-def _format_full_prompt(prior: float, tpr: float, fpr: float, evidence: int) -> str:
+def _format_full_prompt(prior_prob: float, tpr: float, fpr: float, evidence: int) -> str:
     return (
         "A central load-balancing mechanism must forecast compute cluster saturation. "
-        "Let the state space be Omega = {0, 1}. Let S in Omega be the random variable "
-        "indicating whether the primary compute cluster will become saturated (>95% "
-        "capacity) within the next 10 minutes, where S=1 denotes saturation. "
-        f"Based on current time-of-day traffic models, the prior probability of saturation is P(S=1) = {prior:.4f}.\n\n"
-        "Update Rule: To improve forecasting, the mechanism queries a lightweight, predictive monitoring agent. "
-        "Let W in Omega be the random variable representing the agent's output warning. "
-        "The agent possesses the following conditional probabilities: "
-        f"True Positive Rate (Probability of a warning given imminent saturation): P(W=1|S=1) = {tpr:.4f}. "
-        f"False Positive Rate (Probability of a warning given normal loads): P(W=1|S=0) = {fpr:.4f}.\n\n"
-        f"Evidence: The monitoring agent analyzes the telemetry and outputs W={evidence}.\n\n"
-        "Question: Determine if it is more likely than not (with probability > 0.5) that the cluster will saturate. "
-        "Output exactly one character: 1 if P(S=1|W=evidence) > 0.5, or 0 otherwise. Provide no other text."
+        "Let the state space be $\\Omega = \\{0, 1\\}$. Let $S \\in \\Omega$ be the random variable "
+        "indicating whether the primary compute cluster will become saturated ($>95\\%$ "
+        "capacity) within the next $10$ minutes, where $S=1$ denotes saturation. "
+        f"Based on current time-of-day traffic models, the empirical probability of saturation is $P(S=1) =$ {prior_prob:.4f}.\n\n"
+        "Update Rule:To improve forecasting, the mechanism queries a lightweight, predictive monitoring agent. "
+        "Let $W \\in \\Omega$ be the random variable representing the agent's output warning. "
+        "The agent possesses the following conditional probabilities:"
+        f"True Positive Rate (Probability of a warning given imminent saturation): $P(W=1|S=1) =$ {tpr:.4f}."
+        f"False Positive Rate (Probability of a warning given normal loads): $P(W=1|S=0) =$ {fpr:.4f}.\n\n"
+        f"Evidence:The monitoring agent analyzes the telemetry and outputs $W=$ {evidence}.\n\n"
+        "Question:It is more likely than not (with probability $> 0.5$) that the cluster will saturate. "
+        "Output exactly one character: 1 if it is more likely that the cluster will saturate, or 0 otherwise."
     )
 
 
-def _format_prompt_without_context(prior: float, tpr: float, fpr: float, evidence: int) -> str:
-    update_block = (
-        "Update Rule: To improve forecasting, the mechanism queries a lightweight, predictive monitoring agent. "
-        "Let W in Omega be the random variable representing the agent's output warning. "
-        "The agent possesses the following conditional probabilities: "
-        f"True Positive Rate (Probability of a warning given imminent saturation): P(W=1|S=1) = {tpr:.4f}. "
-        f"False Positive Rate (Probability of a warning given normal loads): P(W=1|S=0) = {fpr:.4f}."
-    )
-    evidence_block = "Evidence: The monitoring agent's output W is withheld for this participant."
-
+def _format_prompt_without_context(prior_prob: float, tpr: float, fpr: float, evidence: int) -> str:
     return (
         "A central load-balancing mechanism must forecast compute cluster saturation. "
-        "Let the state space be Omega = {0, 1}. Let S in Omega be the random variable "
-        "indicating whether the primary compute cluster will become saturated (>95% "
-        "capacity) within the next 10 minutes, where S=1 denotes saturation. "
-        f"Based on current time-of-day traffic models, the prior probability of saturation is P(S=1) = {prior:.4f}.\n\n"
-        f"{update_block}\n\n"
-        f"{evidence_block}\n\n"
-        "Question: Determine if it is more likely than not (with probability > 0.5) that the cluster will saturate. "
-        "Output exactly one character: 1 if P(S=1|W=evidence) > 0.5, or 0 otherwise. Provide no other text."
+        "Let the state space be $\\Omega = \\{0, 1\\}$. Let $S \\in \\Omega$ be the random variable "
+        "indicating whether the primary compute cluster will become saturated ($>95\\%$ "
+        "capacity) within the next $10$ minutes, where $S=1$ denotes saturation. "
+        f"Based on current time-of-day traffic models, the empirical probability of saturation is $P(S=1) =$ {prior_prob:.4f}.\n\n"
+        "Question:It is more likely than not (with probability $> 0.5$) that the cluster will saturate. "
+        "Output exactly one character: 1 if it is more likely that the cluster will saturate, or 0 otherwise."
     )
 
 
 def _build_row(example_id: int, rng: random.Random) -> Dict[str, object]:
-    prior = _sample_float(rng, 0.10, 0.90)
-    tpr = _sample_float(rng, 0.75, 0.99)
+    idx = random.choice([0,1])
+    prior = _sample_float(rng, 0.01, 0.99)# if idx == 1 else _sample_float(rng, 0.9, 0.99)
+    tpr = _sample_float(rng, 0.80, 0.99)
     fpr = _sample_float(rng, 0.05, 0.30)
-    evidence = int(rng.randint(0, 1))
+    evidence = idx# int(rng.randint(0, 1))
 
     posterior = _posterior(prior=prior, tpr=tpr, fpr=fpr, evidence=evidence)
     binary_label = 1 if posterior > 0.5 else 0
@@ -138,10 +128,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-path",
         type=Path,
-        default=Path("workdir/datasets/cluster_saturation_bayes.csv"),
+        default=Path("workdir/datasets/cluster_saturation_bayes_general.csv"),
         help="Path to output CSV file",
     )
-    parser.add_argument("--num-samples", type=int, default=1000, help="Number of examples to generate")
+    parser.add_argument("--num-samples", type=int, default=10000, help="Number of examples to generate")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument(
         "--include-rendered-prompts",

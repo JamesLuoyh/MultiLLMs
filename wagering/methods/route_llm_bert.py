@@ -47,9 +47,6 @@ class RouteLLMBertWagers(WageringMethod):
         super().__init__(num_models, config or {})
         cfg = self.config
 
-        # RouteLLM-BERT routes from prompt text embeddings only.
-        self.requires_hidden_states = False
-
         self.bert_model_name = str(cfg.get("bert_model_name", "bert-base-uncased"))
         self.max_seq_length = int(cfg.get("max_seq_length", 512))
         self.learning_rate = float(cfg.get("learning_rate", 5e-5))
@@ -58,9 +55,6 @@ class RouteLLMBertWagers(WageringMethod):
         self.weight_decay = float(cfg.get("weight_decay", 0.01))
         self.freeze_bert = bool(cfg.get("freeze_bert", False))
         self.pubmedqa_strip_context = bool(cfg.get("pubmedqa_strip_context", True))
-        self.use_concatenated_prompt_context = bool(
-            cfg.get("use_concatenated_prompt_context", True)
-        )
         self.router_dropout_p = float(cfg.get("router_dropout", 0.1))
         self.ranking_loss_weight = float(cfg.get("ranking_loss_weight", 0.0))
         self.ranking_margin = float(cfg.get("ranking_margin", 0.1))
@@ -69,6 +63,9 @@ class RouteLLMBertWagers(WageringMethod):
 
         self.device_str = str(cfg.get("device", "cuda" if torch.cuda.is_available() else "cpu"))
         self.device = torch.device(self.device_str)
+
+        # Match centralized configs that pass hidden_state_layers for cache/trainer
+        self.hidden_state_layers = cfg.get("hidden_state_layers", [-1])
 
         self.tokenizer = AutoTokenizer.from_pretrained(self.bert_model_name)
         self.bert = AutoModel.from_pretrained(self.bert_model_name).to(self.device)
@@ -97,10 +94,9 @@ class RouteLLMBertWagers(WageringMethod):
         self._cached_router_logits: Optional[torch.Tensor] = None
 
     def _encode_questions_batch(self, questions: List[str]) -> torch.Tensor:
-        strip_context = self.pubmedqa_strip_context and (not self.use_concatenated_prompt_context)
         processed = preprocess_pubmedqa_prompts_for_embedding(
             questions,
-            strip_context=strip_context,
+            strip_context=self.pubmedqa_strip_context,
         )
         inputs = self.tokenizer(
             processed,
@@ -118,7 +114,7 @@ class RouteLLMBertWagers(WageringMethod):
             pooled = outputs.pooler_output
         else:
             pooled = outputs.last_hidden_state[:, 0, :]
-        return pooled.to(dtype=self.router_head.weight.dtype)
+        return pooled
 
     def compute_wagers(
         self,
@@ -271,12 +267,12 @@ class RouteLLMBertWagers(WageringMethod):
                 "weight_decay": self.weight_decay,
                 "freeze_bert": self.freeze_bert,
                 "pubmedqa_strip_context": self.pubmedqa_strip_context,
-                "use_concatenated_prompt_context": self.use_concatenated_prompt_context,
                 "router_dropout": self.router_dropout_p,
                 "ranking_loss_weight": self.ranking_loss_weight,
                 "ranking_margin": self.ranking_margin,
                 "lr_decay_factor": self.lr_decay_factor,
                 "lr_decay_steps": self.lr_decay_steps,
+                "hidden_state_layers": self.hidden_state_layers,
                 "device": self.device_str,
             },
         }

@@ -10,10 +10,10 @@ aggregation:
 
 option_tokens: [A, B, C, D]
 
-checkpoint_base_dir: /common/users/yl2310/MultiLLMs/checkpoints
+checkpoint_base_dir: /research/projects/ecoai/yl2310/MultiLLMs/checkpoints
 save_every: 100
 # Trainer loop batch size. Keep aligned with per-phase dataset batch_size for clarity.
-training_batch_size: 100
+training_batch_size: 8
 shuffle_data: true
 shuffle_seed: 18 #18 #42
 dataset_split_seed: 42
@@ -25,9 +25,9 @@ wandb_name: phase_shift_dataset_only
 test_datasets: []
 
 phase_shift:
-  rolling_window_batches: 50
+  rolling_window_batches: 30
   evaluate_after_phase2: false
-  output_dir: /common/users/yl2310/MultiLLMs/phase_shift_outputs/scenario_dataset_shift_cache
+  output_dir: /research/projects/ecoai/yl2310/MultiLLMs/phase_shift_outputs/scenario_dataset_shift_short_bs_8_cache
   metrics: [accuracy, ece, kendall_tau, best_model_mrr, brier_d_regret]
   methods:
     - name: centralized_wagers
@@ -46,7 +46,7 @@ phase_shift:
         learning_rate: 5e-5
         temperature: 2.0
         normalize_hidden_states: false
-        device: cuda:0
+        device: cuda:1
     - name: mse_br_wagers_v3
       config:
         common_hidden_dim: 4096
@@ -55,15 +55,15 @@ phase_shift:
         learning_rate: 5e-5
         temperature: 2.0
         normalize_hidden_states: false
-        device: cuda:1
+        device: cuda:3
     - name: equal_wagers
       config:
-        device: cuda:1
+        device: cuda:2
     - name: packllm_perplexity_wagers
       config:
         tau: 1.0
         epsilon: 1.0e-12
-        device: cuda:1
+        device: cuda:2
     - name: kl_uniform_wagers
       config:
         confidence_epsilon: 1.0e-8
@@ -80,7 +80,7 @@ phase_shift:
         temperature: 1.0
         grad_clip_norm: 1.0
         weight_decay: 0.01
-        freeze_encoder: false
+        freeze_encoder: true
         pubmedqa_strip_context: true
         knowledge_dim: 25
         model_embedding_dim: 256
@@ -96,13 +96,14 @@ phase_shift:
         tokenizer_use_fast: false
         hidden_state_layers: [-1]  # Per-model layer picks, aligned with _include_models order
         max_seq_length: 512
-        learning_rate: 1e-6
+        learning_rate: 1e-7
         lr_decay_factor: 1
         lr_decay_steps: 100
-        temperature: 1.0
-        grad_clip_norm: 1.0
-        weight_decay: 0.01
-        freeze_encoder: false
+        micro_batch_size: 25
+        temperature: 2.0
+        grad_clip_norm: 0.25
+        weight_decay: 0.001
+        freeze_encoder: true
         pubmedqa_strip_context: true
         similarity_function: cos
         top_k: 3
@@ -138,6 +139,7 @@ phase_shift:
         label_column: answer
         train_split: auxiliary_train
         batch_size: 5
+        max_batches: 200
         max_prompt_tokens: 1200
         load_from_disk: false
         trust_remote_code: false
@@ -153,6 +155,7 @@ phase_shift:
         label_column: cop
         train_split: train
         batch_size: 5
+        max_batches: 200
         max_prompt_tokens: 1200
         load_from_disk: false
         trust_remote_code: false

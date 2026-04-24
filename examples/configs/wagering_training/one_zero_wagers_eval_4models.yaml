@@ -3,10 +3,10 @@
 
 # Include model configs (must match training)
 _include_models:
-    - models/biomistral_7b.yaml
-    - models/llama3_1_8b_instruct.yaml
-    - models/gemma_2_9b_it.yaml
     - models/llama3_aloe_8b_alpha.yaml
+    - models/llama3_1_8b_instruct.yaml
+    
+    
     
 
 # Checkpoint path (for equal_wagers, this can be a dummy path since no training is needed)
@@ -83,7 +83,7 @@ ood_datasets:
   - display_name: arc_challenge_ood
     eval_split: test
   - display_name: forecastqa_ood
-    eval_split: test
+    eval_split: train
 
 
 # Evaluation parameters

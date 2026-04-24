@@ -3,10 +3,8 @@
 
 # Include model configs (must match training)
 _include_models:
-  - models/gemma_2_9b_it.yaml
   - models/llama3_aloe_8b_alpha.yaml
   - models/llama3_1_8b_instruct.yaml
-  - models/biomistral_7b.yaml
 # Checkpoint path (for inference-only method, this can be a dummy path)
 checkpoint_path: /common/users/yl2310/MultiLLMs/checkpoints/dummy_kl_uniform_wagers
 

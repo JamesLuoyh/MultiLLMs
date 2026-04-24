@@ -2,8 +2,8 @@
 """
 Hyperparameter search for wagering training configs (learning rate only).
 
-Runs training for each (learning_rate, seed) pair with wandb disabled,
-aggregates validation-set metrics across repeats, and prints the best LR.
+Runs train -> eval for each (learning_rate, seed) pair with wandb disabled,
+aggregates test-set metrics across repeats, and prints the best LR.
 
 Example:
   python scripts/wagering_lr_search.py \
@@ -17,13 +17,11 @@ import argparse
 import importlib.util
 import json
 import math
-import multiprocessing as mp
 import os
 import queue
-import shutil
 import sys
 import time
-from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -33,7 +31,7 @@ import yaml
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SRC_PATH = PROJECT_ROOT / "src"
-DISK_ROOT = PROJECT_ROOT
+DISK_ROOT = Path("/common/users/yl2310/MultiLLMs")
 
 
 def _ensure_project_importable() -> None:
@@ -84,7 +82,7 @@ def _parse_gpus(gpus: str) -> List[int]:
 
 def _coarse_lrs_fixed() -> List[float]:
     # Exactly: 1e-6, 1e-5, ..., 1e-1
-    return [10.0 ** (-k) for k in range(7, 3, -1)]
+    return [10.0 ** (-k) for k in range(5, 4, -1)]
 
 
 def _log10_int(x: float) -> int:
@@ -119,30 +117,22 @@ def _mean(values: List[float]) -> Optional[float]:
     return float(sum(values) / len(values))
 
 
-def _extract_objective_from_train_results(
-    train_results: Dict[str, Any],
+def _extract_objective_from_eval_results(
+    eval_results: Dict[str, Dict[str, Any]],
     metric: str,
 ) -> Optional[float]:
-    if not isinstance(train_results, dict):
-        return None
-
-    # Preferred path: explicitly exported final validation metrics.
-    val_metrics = train_results.get("final_validation_metrics")
-    if isinstance(val_metrics, dict) and metric in val_metrics:
+    vals: List[float] = []
+    for _, res in eval_results.items():
+        if not isinstance(res, dict):
+            continue
+        v = res.get(metric, None)
+        if v is None:
+            continue
         try:
-            return _ensure_float(val_metrics.get(metric))
+            vals.append(_ensure_float(v))
         except Exception:
-            pass
-
-    # Backward-compatible fallback for common metric names.
-    fallback_key = f"final_validation_{metric}"
-    if fallback_key in train_results:
-        try:
-            return _ensure_float(train_results.get(fallback_key))
-        except Exception:
-            pass
-
-    return None
+            continue
+    return _mean(vals)
 
 
 def _objective_is_higher_better(metric: str) -> bool:
@@ -191,12 +181,6 @@ def _make_derived_config(
     args["auto_resume"] = False
     args.pop("resume_from_checkpoint", None)
 
-    # LR search only needs final validation metrics; avoid writing bulky checkpoints.
-    args["save_epoch_checkpoints"] = False
-    args["save_final_checkpoint"] = False
-    args["search_mode"] = True
-    args["wager_score_plot_every"] = None
-
     # Unique per (lr, seed) so parallel jobs never share a checkpoint directory.
     job_key = f"lr_{lr:.10g}_seed_{seed}".replace("+", "")
     args["checkpoint_base_dir"] = str(workdir / "checkpoints" / run_id / job_key)
@@ -224,8 +208,6 @@ def _run_train_eval_on_gpu(
     stage: str,
     workdir: str,
     run_id: str,
-    cleanup_artifacts: bool,
-    cleanup_in_worker: bool,
 ) -> JobResult:
     try:
         # Isolate GPU and disable wandb at env level too.
@@ -250,6 +232,7 @@ def _run_train_eval_on_gpu(
         )
 
         train_main = _load_script_main("wagering_train.py")
+        eval_main = _load_script_main("wagering_eval.py")
 
         train_res = train_main(str(derived_config_path))
         checkpoint_path = train_res.get("checkpoint_path") if isinstance(train_res, dict) else None
@@ -266,9 +249,17 @@ def _run_train_eval_on_gpu(
         except Exception:
             pass
 
-        objective = _extract_objective_from_train_results(train_res, metric=metric)
+        eval_res = eval_main(
+            str(derived_config_path),
+            checkpoint_path=str(checkpoint_path),
+            calibration_path=calibration_path,
+        )
 
-        result = JobResult(
+        objective = None
+        if isinstance(eval_res, dict):
+            objective = _extract_objective_from_eval_results(eval_res, metric=metric)
+
+        return JobResult(
             lr=lr,
             seed=seed,
             stage=stage,
@@ -278,23 +269,6 @@ def _run_train_eval_on_gpu(
             metric=metric,
             error=None,
         )
-
-        if cleanup_artifacts and cleanup_in_worker:
-            # Remove per-job artifacts to keep disk usage bounded during large sweeps.
-            try:
-                if checkpoint_path is not None:
-                    shutil.rmtree(str(checkpoint_path), ignore_errors=True)
-            except Exception:
-                pass
-            try:
-                derived_config_path.unlink(missing_ok=True)
-                lr_dir = derived_config_path.parent
-                if lr_dir.exists() and not any(lr_dir.iterdir()):
-                    lr_dir.rmdir()
-            except Exception:
-                pass
-
-        return result
     except Exception as e:
         return JobResult(
             lr=lr,
@@ -317,8 +291,6 @@ def _schedule_jobs(
     procs_per_gpu: int,
     workdir: Path,
     run_id: str,
-    cleanup_artifacts: bool,
-    cleanup_in_worker: bool,
 ) -> List[JobResult]:
     gpu_slots: "queue.Queue[int]" = queue.Queue()
     for g in gpus:
@@ -340,47 +312,21 @@ def _schedule_jobs(
             stage=job.stage,
             workdir=str(workdir),
             run_id=run_id,
-            cleanup_artifacts=cleanup_artifacts,
-            cleanup_in_worker=cleanup_in_worker,
         )
         fut._wagering_gpu = gpu  # type: ignore[attr-defined]
         fut._wagering_job = job  # type: ignore[attr-defined]
         return fut
 
-    # Use "spawn" to avoid CUDA/fork interaction issues that can stall workers.
-    # Also recycle each worker process after one task to keep GPU context handling isolated.
-    with ProcessPoolExecutor(
-        max_workers=max_workers,
-        mp_context=mp.get_context("spawn"),
-        max_tasks_per_child=1,
-    ) as ex:
-        pending: Dict[Any, JobSpec] = {}
-        next_idx = 0
-
-        while next_idx < len(jobs) and len(pending) < max_workers:
-            job = jobs[next_idx]
-            fut = submit_one(ex, job)
-            pending[fut] = job
-            next_idx += 1
-
-        while pending:
-            done, _ = wait(set(pending.keys()), return_when=FIRST_COMPLETED)
-            for fut in done:
-                pending.pop(fut, None)
-                gpu = getattr(fut, "_wagering_gpu", None)
-                if gpu is not None:
-                    gpu_slots.put(int(gpu))
-
-                res = fut.result()
-                results.append(res)
-                # Stream progress as JSON lines for easy parsing.
-                print(json.dumps(res.__dict__, sort_keys=True), flush=True)
-
-                if next_idx < len(jobs):
-                    job = jobs[next_idx]
-                    new_fut = submit_one(ex, job)
-                    pending[new_fut] = job
-                    next_idx += 1
+    with ProcessPoolExecutor(max_workers=max_workers) as ex:
+        futures = [submit_one(ex, j) for j in jobs]
+        for fut in as_completed(futures):
+            gpu = getattr(fut, "_wagering_gpu", None)
+            if gpu is not None:
+                gpu_slots.put(int(gpu))
+            res = fut.result()
+            results.append(res)
+            # Stream progress as JSON lines for easy parsing.
+            print(json.dumps(res.__dict__, sort_keys=True), flush=True)
     return results
 
 
@@ -413,46 +359,6 @@ def _pick_best_lr(
     return best_lr, by_lr
 
 
-def _cleanup_single_job_artifacts(
-    result: JobResult,
-    *,
-    workdir: Path,
-    run_id: str,
-) -> None:
-    checkpoint_path = result.checkpoint_path
-    if checkpoint_path:
-        try:
-            shutil.rmtree(str(checkpoint_path), ignore_errors=True)
-        except Exception:
-            pass
-
-    try:
-        derived_config_path = workdir / "derived_configs" / run_id / f"lr_{result.lr:.0e}" / f"seed_{result.seed}.yaml"
-        derived_config_path.unlink(missing_ok=True)
-        lr_dir = derived_config_path.parent
-        if lr_dir.exists() and not any(lr_dir.iterdir()):
-            lr_dir.rmdir()
-    except Exception:
-        pass
-
-
-def _cleanup_results_artifacts(
-    results: List[JobResult],
-    *,
-    workdir: Path,
-    run_id: str,
-) -> None:
-    cleanable = [r for r in results if r.error is None]
-    if not cleanable:
-        return
-
-    print(f"\n=== Cleaning run artifacts ({len(cleanable)} jobs) ===", flush=True)
-    for idx, r in enumerate(cleanable, start=1):
-        _cleanup_single_job_artifacts(r, workdir=workdir, run_id=run_id)
-        if idx % 5 == 0 or idx == len(cleanable):
-            print(f"cleanup_progress={idx}/{len(cleanable)}", flush=True)
-
-
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--config", required=True, type=str, help="Path to base YAML config.")
@@ -460,25 +366,15 @@ def main() -> None:
     p.add_argument("--seed-start", default=2025, type=int, help="First seed (default: 2025).")
     p.add_argument("--metric", default="accuracy", type=str, help="Eval metric to optimize (default: accuracy).")
     p.add_argument("--gpus", default="0,1,2,3", type=str, help="Comma-separated GPU ids (default: 0,1,2,3).")
-    p.add_argument("--max-workers-per-gpu", default=1, type=int, help="Parallel processes per GPU (default: 5).")
+    p.add_argument("--procs-per-gpu", default=5, type=int, help="Parallel processes per GPU (default: 5).")
     p.add_argument(
         "--workdir",
         default=str(DISK_ROOT / "workdir" / "lr_search"),
         type=str,
         help="Directory for derived configs + checkpoints.",
     )
-    p.add_argument(
-        "--keep-run-artifacts",
-        action="store_true",
-        help="Keep per-job checkpoints/configs (disabled by default to save disk).",
-    )
-    p.add_argument(
-        "--cleanup-in-worker",
-        action="store_true",
-        help="Perform artifact cleanup inside worker processes (default: cleanup in parent process).",
-    )
     args = p.parse_args()
-    args.procs_per_gpu = args.max_workers_per_gpu
+
     base_config_path = Path(args.config)
     if not base_config_path.exists():
         raise FileNotFoundError(f"Config not found: {base_config_path}")
@@ -486,7 +382,6 @@ def main() -> None:
     gpus = _parse_gpus(args.gpus)
     workdir = Path(args.workdir)
     run_id = _now_run_id()
-    cleanup_artifacts = not bool(args.keep_run_artifacts)
 
     seeds = [int(args.seed_start + i) for i in range(int(args.n_repeats))]
     coarse_lrs = _coarse_lrs_fixed()
@@ -500,8 +395,6 @@ def main() -> None:
         procs_per_gpu=int(args.procs_per_gpu),
         workdir=workdir,
         run_id=run_id,
-        cleanup_artifacts=cleanup_artifacts,
-        cleanup_in_worker=bool(args.cleanup_in_worker),
     )
 
     best_lr, _ = _pick_best_lr(coarse_results, metric=args.metric)
@@ -520,8 +413,6 @@ def main() -> None:
             procs_per_gpu=int(args.procs_per_gpu),
             workdir=workdir,
             run_id=run_id,
-            cleanup_artifacts=cleanup_artifacts,
-            cleanup_in_worker=bool(args.cleanup_in_worker),
         )
 
     all_results = coarse_results + fine_results
@@ -544,11 +435,8 @@ def main() -> None:
         mean_str = "N/A" if mean_obj is None else f"{mean_obj:.6f}"
         print(f"lr={lr:.0e}  mean_{args.metric}={mean_str}  ok={n_ok}/{n_total}", flush=True)
 
-    print("\n=== BEST LEARNING RATE (validation set) ===", flush=True)
+    print("\n=== BEST LEARNING RATE (test set) ===", flush=True)
     print(f"{final_best_lr:.6g}", flush=True)
-
-    if cleanup_artifacts and not bool(args.cleanup_in_worker):
-        _cleanup_results_artifacts(all_results, workdir=workdir, run_id=run_id)
 
 
 if __name__ == "__main__":

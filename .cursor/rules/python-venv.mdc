@@ -7,6 +7,8 @@ alwaysApply: true
 
 This repo’s Python tooling must run inside the project virtual environment at **`MultiLLMs/.venv`** (path relative to repository root: `.venv`).
 
+Treat this as mandatory for every agent action in this workspace, including quick checks, lint invocations, and one-line verification commands.
+
 ## Commands
 
 - **Interpreter**: use `.venv/bin/python` (from repo root), not bare `python` or `python3`, unless you have confirmed they resolve to this venv.
@@ -17,7 +19,6 @@ This repo’s Python tooling must run inside the project virtual environment at 
 If `.venv` is missing, create it from the repo root (e.g. `python3 -m venv .venv` then `.venv/bin/pip install -r requirements.txt` or the project’s documented setup) before running project commands.
 
 Do not assume a global or user-level Python when executing tooling for this workspace.
-
 
 ---
 description: Behavioral guidelines to reduce common LLM coding mistakes. Use when writing, reviewing, or refactoring code to avoid overcomplication, make surgical changes, surface assumptions, and define verifiable success criteria.

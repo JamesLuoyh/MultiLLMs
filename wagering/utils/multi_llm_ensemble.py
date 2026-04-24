@@ -15,7 +15,6 @@ Disk cache (logits + hidden states + labels, ``wagering_model_logits_states_cach
 """
 
 import hashlib
-import os
 import json
 import logging
 import pickle
@@ -122,31 +121,9 @@ class LogitCache:
         return logits, labels
 
 
-# Disk-based cache directory for logits and hidden states.
-# Can be overridden at runtime via configure_wagering_cache_dir().
-_DEFAULT_WAGERING_CACHE_DIR = Path(
-    os.environ.get(
-        "WAGERING_CACHE_DIR",
-        "/common/users/yl2310/MultiLLMs/wagering_model_logits_states_caches",
-    )
-)
-_WAGERING_CACHE_DIR = _DEFAULT_WAGERING_CACHE_DIR
+# Disk-based cache directory for logits and hidden states
+_WAGERING_CACHE_DIR = Path("/common/users/yl2310/MultiLLMs/wagering_model_logits_states_caches")
 _WAGERING_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-
-
-def configure_wagering_cache_dir(cache_dir: Optional[str]) -> Path:
-    """Configure the on-disk cache directory used for logits/hidden-state artifacts."""
-    global _WAGERING_CACHE_DIR
-
-    if cache_dir is None or str(cache_dir).strip() == "":
-        resolved = _DEFAULT_WAGERING_CACHE_DIR
-    else:
-        resolved = Path(str(cache_dir)).expanduser()
-
-    resolved.mkdir(parents=True, exist_ok=True)
-    _WAGERING_CACHE_DIR = resolved
-    log.info("Using wagering logits/hidden-state cache directory: %s", _WAGERING_CACHE_DIR)
-    return _WAGERING_CACHE_DIR
 
 
 def _get_model_path_key(model: WhiteboxModel) -> str:
@@ -167,6 +144,16 @@ def _get_dataset_signature(dataset: Dataset) -> Tuple:
         if isinstance(signature, str) and signature:
             return ("cfg", int(schema_version), signature)
 
+    return _get_legacy_dataset_signature(dataset)
+
+
+def _get_legacy_dataset_signature(dataset: Dataset) -> Tuple:
+    """Legacy cache signature based on content-derived heuristics.
+
+    Older cache files were written before dataset loaders attached deterministic
+    `cache_dataset_config` signatures. Keep this fallback so existing cache
+    artifacts remain reusable.
+    """
     dataset_size = len(dataset.x)
     # Create a hash from first 3 examples for uniqueness
     sample_text = "\n".join(dataset.x[:min(3, len(dataset.x))]) if dataset.x else ""
@@ -304,14 +291,7 @@ def resolve_hidden_state_layers_for_model(
     model_index: int,
     num_models: Optional[int] = None,
 ) -> Optional[List[int]]:
-    """Resolve hidden-state layer selection for a specific model index.
-
-    Supports two config styles:
-      - shared layers for all models: hidden_state_layers=[...]
-      - per-model layers: hidden_state_layers_per_model=[..., ...] or {idx: ...}
-
-    Per-model entries may be either a single int (one layer) or a list/tuple of ints.
-    """
+    """Resolve hidden-state layer selection for a specific model index."""
     selected: Any
     if hidden_state_layers_per_model is None:
         selected = hidden_state_layers
@@ -489,7 +469,6 @@ def assign_pubmedqa_context_model(
     model_paths: Sequence[str],
     random_seed: Optional[int] = None,
     dataset_index: Optional[int] = None,
-    context_policy: str = "single_with_context",
 ) -> Optional[Dict[str, object]]:
     """
     Assign mixed-context prompts (PubMedQA/RACE) per-example via balanced randomized routing.
@@ -514,21 +493,6 @@ def assign_pubmedqa_context_model(
     counts_attr = f"{dataset_type}_context_assignment_counts"
     hash_attr = f"{dataset_type}_context_assignment_hash"
     run_seed_attr = f"{dataset_type}_context_run_seed"
-    effective_seed_attr = f"{dataset_type}_context_effective_seed"
-    effective_secondary_seed_attr = f"{dataset_type}_context_only_effective_seed"
-    policy_attr = f"{dataset_type}_context_policy"
-
-    dataset_signature = _get_dataset_signature(dataset)
-    seed_components = [
-        f"{dataset_type}_balanced_context",
-        str(dataset_signature),
-        "||".join(paths),
-        f"policy={str(context_policy)}",
-    ]
-    if dataset_index is not None:
-        seed_components.append(f"dataset_index={int(dataset_index)}")
-    seed_input = "::".join(seed_components)
-    seed = int(hashlib.md5(seed_input.encode("utf-8")).hexdigest()[:8], 16)
 
     assignments: Optional[np.ndarray] = None
     existing = getattr(dataset, assignment_attr, None)
@@ -541,71 +505,29 @@ def assign_pubmedqa_context_model(
             assignments = None
 
     if assignments is None:
+        dataset_signature = _get_dataset_signature(dataset)
+        seed_components = [
+            f"{dataset_type}_balanced_context",
+            str(dataset_signature),
+            "||".join(paths),
+        ]
+        if dataset_index is not None:
+            seed_components.append(f"dataset_index={int(dataset_index)}")
+        seed_input = "::".join(seed_components)
+        seed = int(hashlib.md5(seed_input.encode("utf-8")).hexdigest()[:8], 16)
         assignments = _build_pubmedqa_balanced_assignments(
             num_examples=num_examples,
             num_models=num_models,
             seed=seed,
         )
 
-    context_only_assignments: Optional[np.ndarray] = None
-    secondary_seed: Optional[int] = None
-    if dataset_type == "pubmedqa" and str(context_policy) == "dual_context_and_long_answer":
-        if not isinstance(getattr(dataset, "pubmedqa_context_only_x", None), list):
-            raise ValueError(
-                "PubMedQA dual context policy requires dataset.pubmedqa_context_only_x prompt variants"
-            )
-
-        secondary_seed_components = [
-            "pubmedqa_balanced_context_only",
-            str(dataset_signature),
-            "||".join(paths),
-        ]
-        if dataset_index is not None:
-            secondary_seed_components.append(f"dataset_index={int(dataset_index)}")
-        secondary_seed = int(
-            hashlib.md5("::".join(secondary_seed_components).encode("utf-8")).hexdigest()[:8],
-            16,
-        )
-        context_only_assignments = _build_pubmedqa_balanced_assignments(
-            num_examples=num_examples,
-            num_models=num_models,
-            seed=secondary_seed,
-        )
-
-        # Enforce distinct privileged models per example.
-        collision_mask = context_only_assignments == assignments
-        if np.any(collision_mask):
-            rng = np.random.RandomState(secondary_seed + 17)
-            collision_indices = np.flatnonzero(collision_mask)
-            for idx in collision_indices:
-                candidates = np.arange(num_models, dtype=np.int32)
-                candidates = candidates[candidates != assignments[idx]]
-                context_only_assignments[idx] = int(rng.choice(candidates))
-
-    # Preserve legacy prompt-variant hash behavior for cache-key compatibility.
-    assignment_hash_source = assignments.tobytes()
-    if context_only_assignments is not None:
-        assignment_hash_source = assignment_hash_source + b"::" + context_only_assignments.tobytes()
-    assignment_hash = hashlib.md5(assignment_hash_source).hexdigest()[:12]
+    assignment_hash = hashlib.md5(assignments.tobytes()).hexdigest()[:12]
     context_counts = np.bincount(assignments, minlength=num_models).astype(np.int32).tolist()
 
     setattr(dataset, assignment_attr, assignments.tolist())
     setattr(dataset, counts_attr, context_counts)
     setattr(dataset, hash_attr, assignment_hash)
     setattr(dataset, run_seed_attr, normalized_seed)
-    setattr(dataset, effective_seed_attr, int(seed))
-    if secondary_seed is not None:
-        setattr(dataset, effective_secondary_seed_attr, int(secondary_seed))
-    setattr(dataset, policy_attr, str(context_policy))
-
-    if context_only_assignments is not None:
-        dataset.pubmedqa_context_plus_long_answer_assignment_by_example = assignments.tolist()
-        dataset.pubmedqa_context_only_assignment_by_example = context_only_assignments.tolist()
-        dataset.pubmedqa_context_plus_long_answer_assignment_counts = context_counts
-        dataset.pubmedqa_context_only_assignment_counts = np.bincount(
-            context_only_assignments,
-            minlength=num_models,
-        ).astype(np.int32).tolist()
 
     # Preserve existing PubMedQA fields for backwards compatibility.
     if dataset_type == "pubmedqa":
@@ -617,101 +539,14 @@ def assign_pubmedqa_context_model(
         "assignment_hash": assignment_hash,
         "num_examples": int(num_examples),
         "model_context_counts": context_counts,
-        "context_policy": str(context_policy),
         "routing_seed": normalized_seed,
     }
-
-
-def _get_balanced_split_full_size(dataset: Dataset) -> Optional[int]:
-    """Return pre-subset size for balanced-binary splits when metadata is available."""
-    counts = getattr(dataset, "binary_balanced_counts", None)
-    split_name = str(getattr(dataset, "binary_balanced_split", "")).strip().lower()
-    if not isinstance(counts, dict) or not split_name:
-        return None
-
-    train_per = counts.get("train_per_label")
-    val_per = counts.get("validation_per_label")
-    test_per = counts.get("test_per_label")
-    if not all(isinstance(v, (int, np.integer)) for v in [train_per, val_per, test_per]):
-        return None
-
-    train_per_int = int(train_per)
-    val_per_int = int(val_per)
-    test_per_int = int(test_per)
-    if split_name == "train":
-        return 2 * train_per_int
-    if split_name == "validation":
-        return 2 * val_per_int
-    if split_name == "test":
-        return 2 * test_per_int
-    if split_name == "train_val":
-        return 2 * (train_per_int + val_per_int)
-    return None
-
-
-def _get_legacy_full_split_prompt_variant(
-    dataset: Dataset,
-    model_index: int,
-    prompt_variant: Optional[str],
-) -> Optional[str]:
-    """Build legacy prompt_variant for the full split to reuse pre-subset caches."""
-    if not isinstance(prompt_variant, str) or "_" not in prompt_variant:
-        return None
-
-    dataset_type = _get_mixed_context_dataset_type(dataset)
-    if dataset_type is None:
-        return None
-
-    full_size = _get_balanced_split_full_size(dataset)
-    if full_size is None or full_size <= int(len(dataset.x)):
-        return None
-
-    context_counts = getattr(dataset, f"{dataset_type}_context_assignment_counts", None)
-    effective_seed = getattr(dataset, f"{dataset_type}_context_effective_seed", None)
-    if not isinstance(context_counts, list) or len(context_counts) == 0:
-        return None
-    if not isinstance(effective_seed, (int, np.integer)):
-        return None
-
-    num_models = len(context_counts)
-    full_assignments = _build_pubmedqa_balanced_assignments(
-        num_examples=int(full_size),
-        num_models=int(num_models),
-        seed=int(effective_seed),
-    )
-
-    assignment_hash_source = full_assignments.tobytes()
-    policy = str(getattr(dataset, "pubmedqa_context_policy", "single_with_context"))
-    if dataset_type == "pubmedqa" and policy == "dual_context_and_long_answer":
-        secondary_seed = getattr(dataset, f"{dataset_type}_context_only_effective_seed", None)
-        if isinstance(secondary_seed, (int, np.integer)):
-            context_only_assignments = _build_pubmedqa_balanced_assignments(
-                num_examples=int(full_size),
-                num_models=int(num_models),
-                seed=int(secondary_seed),
-            )
-            collision_mask = context_only_assignments == full_assignments
-            if np.any(collision_mask):
-                rng = np.random.RandomState(int(secondary_seed) + 17)
-                collision_indices = np.flatnonzero(collision_mask)
-                for idx in collision_indices:
-                    candidates = np.arange(num_models, dtype=np.int32)
-                    candidates = candidates[candidates != full_assignments[idx]]
-                    context_only_assignments[idx] = int(rng.choice(candidates))
-            assignment_hash_source = (
-                assignment_hash_source + b"::" + context_only_assignments.tobytes()
-            )
-
-    full_hash = hashlib.md5(assignment_hash_source).hexdigest()[:12]
-    prefix = prompt_variant.rsplit("_", 1)[0]
-    return f"{prefix}_{full_hash}"
 
 
 def assign_pubmedqa_context_models(
     datasets: Sequence[Dataset],
     model_paths: Sequence[str],
     random_seed: Optional[int] = None,
-    context_policy: str = "single_with_context",
 ) -> Dict[int, Dict[str, object]]:
     """Assign PubMedQA context routing metadata for all datasets that need it."""
     assignments: Dict[int, Dict[str, object]] = {}
@@ -721,7 +556,6 @@ def assign_pubmedqa_context_models(
             model_paths,
             random_seed=random_seed,
             dataset_index=idx,
-            context_policy=context_policy,
         )
         if selected is not None:
             assignments[idx] = selected
@@ -765,8 +599,7 @@ def get_model_prompt_variant(
         setattr(dataset, f"{dataset_type}_context_assignment_hash", assignment_hash)
 
     if dataset_type == "pubmedqa":
-        policy = str(getattr(dataset, "pubmedqa_context_policy", "single_with_context"))
-        return f"balanced_random_context_{policy}_m{model_index}_{assignment_hash}"
+        return f"balanced_random_context_m{model_index}_{assignment_hash}"
     return f"article_random_context_m{model_index}_{assignment_hash}"
 
 
@@ -782,34 +615,6 @@ def get_model_specific_prompts(
         with_context_prompts = getattr(dataset, with_context_attr, None)
         without_context_prompts = getattr(dataset, without_context_attr, None)
         assignments = _get_pubmedqa_context_assignments(dataset)
-        context_policy = str(getattr(dataset, "pubmedqa_context_policy", "single_with_context"))
-
-        if (
-            dataset_type == "pubmedqa"
-            and context_policy == "dual_context_and_long_answer"
-            and isinstance(with_context_prompts, list)
-            and isinstance(without_context_prompts, list)
-            and isinstance(getattr(dataset, "pubmedqa_context_only_x", None), list)
-        ):
-            context_only_prompts = getattr(dataset, "pubmedqa_context_only_x")
-            full_assignments = getattr(dataset, "pubmedqa_context_plus_long_answer_assignment_by_example", None)
-            context_only_assignments = getattr(dataset, "pubmedqa_context_only_assignment_by_example", None)
-            if (
-                isinstance(full_assignments, list)
-                and isinstance(context_only_assignments, list)
-                and len(full_assignments) == len(with_context_prompts)
-                and len(context_only_assignments) == len(with_context_prompts)
-                and len(context_only_prompts) == len(with_context_prompts)
-            ):
-                prompts: List[str] = []
-                for idx in range(len(with_context_prompts)):
-                    if int(full_assignments[idx]) == model_index:
-                        prompts.append(with_context_prompts[idx])
-                    elif int(context_only_assignments[idx]) == model_index:
-                        prompts.append(context_only_prompts[idx])
-                    else:
-                        prompts.append(without_context_prompts[idx])
-                return prompts
 
         if (
             isinstance(with_context_prompts, list)
@@ -949,47 +754,50 @@ def get_cached_logits_and_hidden_states_for_model(
                 "Mixed-context cache lookups require model_index to disambiguate repeated model paths"
             )
         model_key = f"{model_path}::idx={int(model_index)}"
-    prompt_variants_to_try: List[Optional[str]] = [prompt_variant]
-    full_split_variant = _get_legacy_full_split_prompt_variant(
+    cache_key = _wagering_logits_cache_key(
+        model_key,
         dataset,
-        model_index=int(model_index) if model_index is not None else 0,
-        prompt_variant=prompt_variant,
+        option_tokens,
+        prompt_variant,
+        hidden_state_layers=hidden_state_layers,
     )
-    if full_split_variant is not None:
-        prompt_variants_to_try.append(full_split_variant)
+    cache_path = _get_cache_path(cache_key)
 
-    # Backward-compatible fallback: older PubMedQA cache files did not include
-    # the explicit context-policy token in prompt_variant.
-    expanded_variants: List[Optional[str]] = []
-    for candidate in prompt_variants_to_try:
-        expanded_variants.append(candidate)
-        if isinstance(candidate, str):
-            legacy_marker = "balanced_random_context_single_with_context_m"
-            if legacy_marker in candidate:
-                expanded_variants.append(
-                    candidate.replace(legacy_marker, "balanced_random_context_m")
+    if not cache_path.exists():
+        # Backwards-compatible lookup: older cache artifacts were created before
+        # deterministic dataset config signatures existed. If we have a config-based
+        # signature but the corresponding file is missing, try the legacy heuristic
+        # signature as a secondary key before declaring a miss.
+        dataset_cache_config = getattr(dataset, "cache_dataset_config", None)
+        if isinstance(dataset_cache_config, dict):
+            legacy_dataset_key = _get_legacy_dataset_signature(dataset)
+            option_key = tuple(option_tokens)
+            pv = prompt_variant or "default"
+            mixed_context_type = _get_mixed_context_dataset_type(dataset)
+            if mixed_context_type == "pubmedqa":
+                legacy_key: Tuple[Any, ...] = (
+                    model_key,
+                    legacy_dataset_key,
+                    option_key,
+                    pv,
+                    PUBMEDQA_LOGITS_CACHE_NAMESPACE,
                 )
+            elif mixed_context_type == "race":
+                legacy_key = (
+                    model_key,
+                    legacy_dataset_key,
+                    option_key,
+                    pv,
+                    RACE_LOGITS_CACHE_NAMESPACE,
+                )
+            else:
+                legacy_key = (model_key, legacy_dataset_key, option_key, pv)
 
-    deduped_variants: List[Optional[str]] = []
-    seen_variants: set[Optional[str]] = set()
-    for candidate in expanded_variants:
-        if candidate in seen_variants:
-            continue
-        seen_variants.add(candidate)
-        deduped_variants.append(candidate)
+            legacy_path = _get_cache_path(legacy_key)
+            if legacy_path.exists():
+                cache_path = legacy_path
 
-    for prompt_variant_candidate in deduped_variants:
-        cache_key = _wagering_logits_cache_key(
-            model_key,
-            dataset,
-            option_tokens,
-            prompt_variant_candidate,
-            hidden_state_layers=hidden_state_layers,
-        )
-        cache_path = _get_cache_path(cache_key)
-        if not cache_path.exists():
-            continue
-
+    if cache_path.exists():
         try:
             data = np.load(cache_path, allow_pickle=True)
             logits = data["logits"] if "logits" in data else None
@@ -1005,22 +813,6 @@ def get_cached_logits_and_hidden_states_for_model(
             if "hidden_states_pickle" in data:
                 hidden_states = pickle.loads(data["hidden_states_pickle"].item())
 
-            required_examples = int(len(dataset.x))
-            if logits is not None and getattr(logits, "shape", (0,))[0] < required_examples:
-                continue
-            if labels is not None and getattr(labels, "shape", (0,))[0] < required_examples:
-                continue
-            if hidden_states is not None and getattr(hidden_states, "shape", (0,))[0] < required_examples:
-                continue
-
-            # Reuse larger caches for debug-sized runs by slicing to current dataset size.
-            if logits is not None and logits.shape[0] > required_examples:
-                logits = logits[:required_examples]
-            if labels is not None and labels.shape[0] > required_examples:
-                labels = labels[:required_examples]
-            if hidden_states is not None and hasattr(hidden_states, "shape") and hidden_states.shape[0] > required_examples:
-                hidden_states = hidden_states[:required_examples]
-
             try:
                 hidden_states = extract_hidden_state_features(
                     hidden_states,
@@ -1034,98 +826,18 @@ def get_cached_logits_and_hidden_states_for_model(
                     prompt_variant or "default",
                     layer_err,
                 )
-                # Keep logits/labels cache usable even when hidden-state layer
-                # selection is incompatible with this cache artifact.
-                return logits, None, labels
+                return None, None, None
 
             log.debug(
                 "Cache hit for model %s and dataset size %d (prompt_variant=%s)",
                 model_key,
                 len(dataset.x),
-                prompt_variant_candidate or "default",
+                prompt_variant or "default",
             )
             return logits, hidden_states, labels
         except Exception as e:
             raise Exception(f"Error loading cache from {cache_path}: {e}")
-
     return None, None, None
-
-
-def has_cached_logits_and_hidden_states_for_model(
-    model_path: str,
-    dataset: Dataset,
-    option_tokens: List[str],
-    prompt_variant: Optional[str] = None,
-    model_index: Optional[int] = None,
-    hidden_state_layers: Optional[Sequence[int]] = None,
-    require_hidden_states: bool = True,
-) -> bool:
-    """Fast cache check that avoids loading large arrays into memory.
-
-    This only verifies that a compatible cache file exists and contains the
-    expected keys. Full integrity/shape checks still happen when the cache is
-    actually loaded during training.
-    """
-    model_key: str = model_path
-    if _requires_slot_specific_cache(dataset):
-        if model_index is None:
-            raise ValueError(
-                "Mixed-context cache lookups require model_index to disambiguate repeated model paths"
-            )
-        model_key = f"{model_path}::idx={int(model_index)}"
-
-    prompt_variants_to_try: List[Optional[str]] = [prompt_variant]
-    full_split_variant = _get_legacy_full_split_prompt_variant(
-        dataset,
-        model_index=int(model_index) if model_index is not None else 0,
-        prompt_variant=prompt_variant,
-    )
-    if full_split_variant is not None:
-        prompt_variants_to_try.append(full_split_variant)
-
-    expanded_variants: List[Optional[str]] = []
-    for candidate in prompt_variants_to_try:
-        expanded_variants.append(candidate)
-        if isinstance(candidate, str):
-            legacy_marker = "balanced_random_context_single_with_context_m"
-            if legacy_marker in candidate:
-                expanded_variants.append(
-                    candidate.replace(legacy_marker, "balanced_random_context_m")
-                )
-
-    deduped_variants: List[Optional[str]] = []
-    seen_variants: set[Optional[str]] = set()
-    for candidate in expanded_variants:
-        if candidate in seen_variants:
-            continue
-        seen_variants.add(candidate)
-        deduped_variants.append(candidate)
-
-    for prompt_variant_candidate in deduped_variants:
-        cache_key = _wagering_logits_cache_key(
-            model_key,
-            dataset,
-            option_tokens,
-            prompt_variant_candidate,
-            hidden_state_layers=hidden_state_layers,
-        )
-        cache_path = _get_cache_path(cache_key)
-        if not cache_path.exists():
-            continue
-
-        try:
-            with np.load(cache_path, allow_pickle=True) as data:
-                has_logits = "logits" in data
-                has_hidden_states = ("hidden_states" in data) or ("hidden_states_pickle" in data)
-                if not has_logits:
-                    continue
-                if require_hidden_states and not has_hidden_states:
-                    continue
-                return True
-        except Exception:
-            continue
-
-    return False
 
 
 def set_cached_logits_and_hidden_states_for_model(
@@ -1189,49 +901,17 @@ def set_cached_logits_and_hidden_states_for_model(
     # Merge with existing cache entry
     cache_dict = {}
     if logits is not None:
-        new_logits = logits.copy() if isinstance(logits, np.ndarray) else logits
-        existing_logits = existing_data.get("logits")
-        if (
-            isinstance(existing_logits, np.ndarray)
-            and isinstance(new_logits, np.ndarray)
-            and existing_logits.ndim >= 1
-            and new_logits.ndim >= 1
-            and existing_logits.shape[0] >= new_logits.shape[0]
-        ):
-            cache_dict["logits"] = existing_logits
-        else:
-            cache_dict["logits"] = new_logits
+        cache_dict["logits"] = logits.copy() if isinstance(logits, np.ndarray) else logits
     elif "logits" in existing_data:
         cache_dict["logits"] = existing_data["logits"]
     
     if hidden_states is not None:
-        existing_hidden_states = existing_data.get("hidden_states")
-        if (
-            isinstance(existing_hidden_states, np.ndarray)
-            and isinstance(hidden_states, np.ndarray)
-            and existing_hidden_states.ndim >= 1
-            and hidden_states.ndim >= 1
-            and existing_hidden_states.shape[0] >= hidden_states.shape[0]
-        ):
-            cache_dict["hidden_states"] = existing_hidden_states
-        else:
-            cache_dict["hidden_states"] = hidden_states
+        cache_dict["hidden_states"] = hidden_states
     elif "hidden_states" in existing_data:
         cache_dict["hidden_states"] = existing_data["hidden_states"]
     
     if labels is not None:
-        new_labels = labels.copy() if isinstance(labels, np.ndarray) else labels
-        existing_labels = existing_data.get("labels")
-        if (
-            isinstance(existing_labels, np.ndarray)
-            and isinstance(new_labels, np.ndarray)
-            and existing_labels.ndim >= 1
-            and new_labels.ndim >= 1
-            and existing_labels.shape[0] >= new_labels.shape[0]
-        ):
-            cache_dict["labels"] = existing_labels
-        else:
-            cache_dict["labels"] = new_labels
+        cache_dict["labels"] = labels.copy() if isinstance(labels, np.ndarray) else labels
     elif "labels" in existing_data:
         cache_dict["labels"] = existing_data["labels"]
     
@@ -1249,15 +929,7 @@ def set_cached_logits_and_hidden_states_for_model(
             else:
                 save_dict["hidden_states"] = cache_dict["hidden_states"].astype(np.float32) if isinstance(cache_dict["hidden_states"], np.ndarray) else cache_dict["hidden_states"]
         normalized_requested_layers = _normalize_hidden_state_layers(hidden_state_layers)
-        # Only persist requested-layer metadata when cache actually stores a
-        # selected subset. For full-layer caches, omit this metadata so reads use
-        # positional layer resolution against the cached layer axis.
-        if (
-            normalized_requested_layers is not None
-            and isinstance(cache_dict.get("hidden_states"), np.ndarray)
-            and cache_dict["hidden_states"].ndim == 3
-            and cache_dict["hidden_states"].shape[1] == len(normalized_requested_layers)
-        ):
+        if normalized_requested_layers is not None:
             save_dict["requested_hidden_state_layers"] = np.asarray(normalized_requested_layers, dtype=np.int32)
         
         np.savez_compressed(cache_path, **save_dict)
@@ -1441,9 +1113,17 @@ def _resolve_option_token_ids(
                 if len(opt_token_ids) == 1:
                     token_ids.append(opt_token_ids[0])
                 else:  # len(opt_token_ids) > 1
-                    # log.warning(f"Option '{opt}' spans {len(opt_token_ids)} tokens. Using first token.")
-                    raise ValueError(f"Option '{opt}' spans multiple tokens.")
-                    # token_ids.append(opt_token_ids[0])
+                    # We score only the first generation step, so use the first
+                    # token when an option is split into multiple sub-tokens.
+                    log.warning(
+                        "Option '%s' spans %d tokens in context. "
+                        "Using first token id=%s from %s.",
+                        opt,
+                        len(opt_token_ids),
+                        opt_token_ids[0],
+                        opt_token_ids,
+                    )
+                    token_ids.append(opt_token_ids[0])
             else:
                 # Fallback: context extraction failed, use standalone tokenization
                 ids = model.tokenizer.encode(opt, add_special_tokens=False)
@@ -1480,7 +1160,7 @@ def collect_option_logits_and_hidden_states_for_model(
         
     Returns:
         logits: np.ndarray, shape [num_examples, num_options]
-        hidden_states: np.ndarray, shape [num_examples, num_cached_layers, hidden_dim] or None
+        hidden_states: np.ndarray, shape [num_examples, num_selected_layers, hidden_dim] or None
         labels: np.ndarray, shape [num_examples]
     """
     model_device = model.device()
@@ -1510,6 +1190,7 @@ def collect_option_logits_and_hidden_states_for_model(
     all_log_probs: List[np.ndarray] = []
     all_hidden_states: List[np.ndarray] = []
     all_labels: List[int] = []
+    selected_layer_indices: Optional[Tuple[int, ...]] = None
     
     if len(model_prompts) == 0:
         raise ValueError("Dataset is empty (0 examples).")
@@ -1543,37 +1224,26 @@ def collect_option_logits_and_hidden_states_for_model(
         # Extract hidden states when requested.
         if collect_hidden_states and hasattr(generation, 'hidden_states') and generation.hidden_states is not None:
             try:
-                hidden_state_steps = generation.hidden_states
-                selected_step_idx = 1 if len(hidden_state_steps) > len(scores) else 0
-                selected_step_hidden = hidden_state_steps[selected_step_idx]
-
-                if len(hidden_state_steps) > 1:
-                    # Some model backends expose richer per-layer tuples on a
-                    # different generation step. Prefer the requested step, but
-                    # if another step has more layer entries, use that one.
-                    def _layer_tuple_len(step_hidden):
-                        return len(step_hidden) if isinstance(step_hidden, tuple) else 1
-
-                    richest_step_hidden = max(hidden_state_steps, key=_layer_tuple_len)
-                    if _layer_tuple_len(richest_step_hidden) > _layer_tuple_len(selected_step_hidden):
-                        log.warning(
-                            "Model %s returned fewer layers at step %d than another step; "
-                            "using richer hidden-state tuple for caching.",
-                            model.model_path,
-                            selected_step_idx,
-                        )
-                        selected_step_hidden = richest_step_hidden
+                if len(generation.hidden_states) > 1:
+                    selected_step_hidden = generation.hidden_states[1]
+                else:
+                    selected_step_hidden = generation.hidden_states[0]
 
                 if isinstance(selected_step_hidden, tuple):
-                    # Exclude embedding slot and cache all returned transformer
-                    # layers so later runs can reuse cache for different layer
-                    # selections without recollection.
+                    # Exclude embedding slot; keep only requested transformer layers.
                     transformer_hidden_states = selected_step_hidden[1:] if len(selected_step_hidden) > 1 else selected_step_hidden
                     if len(transformer_hidden_states) == 0:
                         raise ValueError("Model returned an empty transformer hidden-state tuple")
 
+                    if selected_layer_indices is None:
+                        selected_layer_indices = _resolve_transformer_layer_indices(
+                            hidden_state_layers,
+                            len(transformer_hidden_states),
+                        )
+
                     per_layer_last_token = []
-                    for layer_hidden in transformer_hidden_states:
+                    for layer_idx in selected_layer_indices:
+                        layer_hidden = transformer_hidden_states[layer_idx]
                         if layer_hidden.dim() == 3:
                             per_layer_last_token.append(layer_hidden[:, -1, :])
                         elif layer_hidden.dim() == 2:

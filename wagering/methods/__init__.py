@@ -19,12 +19,12 @@ from .mse_br_wagers_v3_augmented import MSEBrWagersV3Augmented
 from .pre_inference_mse_br_wagers_v2 import PreInferenceMSEBrWagersV2
 from .route_llm_bert import RouteLLMBertWagers
 from .router_dc import RouterDCWagers
+from .packllm_perplexity_wagers import PackLLMPerplexityWagers
+from .kl_uniform_wagers import KLUniformWagers
 from .nirt_router import NIRTRouterWagers
 from .weighted_score_wagers import WeightedScoreWagers
 from .one_zero_wagers import OneZeroWagers
 from .zero_one_wagers import ZeroOneWagers
-from .kl_uniform_wagers import KLUniformWagers
-from .packllm_perplexity_wagers import PackLLMPerplexityWagers
 
 __all__ = [
     "WageringMethod",
@@ -41,10 +41,10 @@ __all__ = [
     "PreInferenceMSEBrWagersV2",
     "RouteLLMBertWagers",
     "RouterDCWagers",
+    "PackLLMPerplexityWagers",
+    "KLUniformWagers",
     "NIRTRouterWagers",
     "WeightedScoreWagers",
     "OneZeroWagers",
     "ZeroOneWagers",
-    "KLUniformWagers",
-    "PackLLMPerplexityWagers",
 ]

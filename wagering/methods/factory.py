@@ -40,7 +40,6 @@ def load_wagering_method(
     from .zero_one_wagers import ZeroOneWagers
     from .one_zero_wagers import OneZeroWagers
     from .moe_wagers import MoEWagers
-    from .kl_uniform_wagers import KLUniformWagers
     from .mse_br_wagers import MSEBrWagers
     from .mse_br_wagers_v2 import MSEBrWagersV2
     from .mse_br_wagers_v3 import MSEBrWagersV3
@@ -49,9 +48,9 @@ def load_wagering_method(
     from .pre_inference_mse_br_wagers_v2 import PreInferenceMSEBrWagersV2
     from .route_llm_bert import RouteLLMBertWagers
     from .router_dc import RouterDCWagers
-    from .nirt_router import NIRTRouterWagers
     from .packllm_perplexity_wagers import PackLLMPerplexityWagers
-
+    from .kl_uniform_wagers import KLUniformWagers
+    from .nirt_router import NIRTRouterWagers
     
     # Built-in methods mapping
     methods = {
@@ -65,9 +64,6 @@ def load_wagering_method(
         "kelly_wagers": KellyWagers,
         "br_regret_wagers": BrRegretWagers,
         "moe_wagers": MoEWagers,
-        "kl_uniform_wagers": KLUniformWagers,
-        "kl_uniform": KLUniformWagers,
-        "kl_wagers": KLUniformWagers,
         "mse_br_wagers": MSEBrWagers,
         "mse_br_wagers_v2": MSEBrWagersV2,
         "mse_br_wagers_v3": MSEBrWagersV3,
@@ -79,17 +75,9 @@ def load_wagering_method(
         "router_dc": RouterDCWagers,
         "routerDC": RouterDCWagers,
         "routerdc": RouterDCWagers,
-        "nirt_router": NIRTRouterWagers,
-        "nirt-router": NIRTRouterWagers,
-        "nirt": NIRTRouterWagers,
-        "irt_router": NIRTRouterWagers,
-        "irt-router": NIRTRouterWagers,
-        "irtrouter": NIRTRouterWagers,
         "packllm_perplexity_wagers": PackLLMPerplexityWagers,
-        "packllm_perplexity": PackLLMPerplexityWagers,
-        "packllm_sim": PackLLMPerplexityWagers,
-        "perplexity_wagers": PackLLMPerplexityWagers,
-        "inverse_perplexity_wagers": PackLLMPerplexityWagers,
+        "kl_uniform_wagers": KLUniformWagers,
+        "nirt_router": NIRTRouterWagers,
     }
     
     if method_name in methods:

@@ -859,17 +859,10 @@ def fit_or_load_logit_calibrator(
     log.info("Loaded %d calibration datasets: %s", len(datasets), dataset_names)
 
     pubmedqa_context_seed = dataset_split_seed
-    pubmedqa_context_policy = str(
-        calibration_config.get(
-            "pubmedqa_context_policy",
-            args.get("pubmedqa_context_policy", "single_with_context"),
-        )
-    )
     pubmedqa_assignments = assign_pubmedqa_context_models(
         datasets,
         [model_cfg["path"] for model_cfg in args["models"]],
         random_seed=pubmedqa_context_seed,
-        context_policy=pubmedqa_context_policy,
     )
     for dataset_idx, assignment_info in pubmedqa_assignments.items():
         dataset_name = dataset_names[dataset_idx] if dataset_idx < len(dataset_names) else f"dataset_{dataset_idx}"

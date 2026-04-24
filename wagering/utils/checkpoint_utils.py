@@ -10,7 +10,10 @@ import re
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 
-from wagering.utils.dataset_utils import calibration_dataset_configs_include_pubmedqa
+from wagering.utils.dataset_utils import (
+    calibration_dataset_configs_include_pubmedqa,
+    datasets_for_checkpoint_hash,
+)
 
 
 def sanitize_name(name: str, max_length: int = 20) -> str:
@@ -181,8 +184,9 @@ def generate_checkpoint_dir(
     
     # Add hash for uniqueness if requested
     if create_hash:
-        # Create hash from full config for uniqueness
-        config_str = f"{models}_{datasets}_{wagering_method}_{aggregation}_{calibration}"
+        # Create hash from full config for uniqueness (omit training-only dataset fields).
+        datasets_hashed = datasets_for_checkpoint_hash(datasets)
+        config_str = f"{models}_{datasets_hashed}_{wagering_method}_{aggregation}_{calibration}"
         config_hash = hashlib.md5(config_str.encode()).hexdigest()[:8]
         dir_name = f"{dir_name}_{config_hash}"
     
@@ -326,7 +330,7 @@ def generate_calibration_dir(
 
     normalized_payload = {
         "models": models_for_hash,
-        "datasets": _stable_json_value(datasets),
+        "datasets": _stable_json_value(datasets_for_checkpoint_hash(datasets)),
         "calibration": _stable_json_value(_strip_shuffle_seed_fields(calibration_config)),
     }
     serialized = json.dumps(normalized_payload, sort_keys=True, separators=(",", ":"), default=str)

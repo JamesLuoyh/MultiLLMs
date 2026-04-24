@@ -3,7 +3,7 @@
 
 # Include model configs (must match training)
 _include_models:
-  - models/llama3_aloe_8b_alpha.yaml
+  - models/biomistral_7b.yaml
 
 # Checkpoint path (for equal_wagers, this can be a dummy path since no training is needed)
 checkpoint_path: /common/users/yl2310/MultiLLMs/checkpoints/dummy_equal_wagers

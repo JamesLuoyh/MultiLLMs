@@ -6,6 +6,7 @@ import logging
 import os
 import shutil
 import sys
+import hashlib
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
 from collections import deque
@@ -31,6 +32,7 @@ from wagering.utils.multi_llm_ensemble import (
     collect_option_logits_and_hidden_states_for_model,
     extract_hidden_state_features,
     get_concatenated_router_prompts,
+    get_model_specific_prompts,
     get_model_prompt_variant,
     get_cached_logits_and_hidden_states_for_model,
     resolve_hidden_state_layers_for_model,
@@ -357,6 +359,8 @@ class WageringTrainer:
         save_epoch_checkpoints: bool = True,
         max_epoch_checkpoints: Optional[int] = None,
         enable_artifact_outputs: bool = True,
+        reuse_prompt_perplexities_for_identical_models: bool = False,
+        max_training_batches: Optional[int] = None,
     ):
         """
         Initialize the trainer.
@@ -389,6 +393,12 @@ class WageringTrainer:
                 If set, older transition checkpoints are removed after each save.
             enable_artifact_outputs: If False, skip non-essential artifact writes
                 (analytics CSVs and plot files) to reduce I/O overhead.
+            reuse_prompt_perplexities_for_identical_models: If True, reuse prompt
+                perplexities across ensemble slots when the same loaded model sees
+                an identical prompt list (common in mixed-context PubMedQA setups).
+            max_training_batches: If set, stop after this many training-loop batches
+                (optimizer steps) across epochs. The cap counts batches executed in
+                the current ``train()`` call from the resume point onward.
         """
         self.models = models
         self.datasets = datasets
@@ -452,12 +462,34 @@ class WageringTrainer:
         if not self.enable_artifact_outputs:
             self.wager_score_plot_every = None
         self.logit_calibrator = logit_calibrator
+        self.max_training_batches: Optional[int] = None
+        if max_training_batches is not None:
+            try:
+                mtb = int(max_training_batches)
+                if mtb > 0:
+                    self.max_training_batches = mtb
+                else:
+                    log.warning(
+                        "Ignoring non-positive max_training_batches=%s.",
+                        max_training_batches,
+                    )
+            except (TypeError, ValueError):
+                log.warning(
+                    "Ignoring invalid max_training_batches=%s.",
+                    max_training_batches,
+                )
+        self.reuse_prompt_perplexities_for_identical_models = bool(
+            reuse_prompt_perplexities_for_identical_models
+        )
         self.requires_hidden_states = bool(getattr(self.wagering_method, "requires_hidden_states", True))
         self.use_concatenated_prompt_context = bool(
             getattr(self.wagering_method, "use_concatenated_prompt_context", False)
         )
         self.hidden_state_layers = getattr(self.wagering_method, "hidden_state_layers", None)
         self.hidden_state_layers_per_model = getattr(self.wagering_method, "hidden_state_layers_per_model", None)
+        self.method_requires_model_perplexities = bool(
+            getattr(self.wagering_method, "requires_model_perplexities", False)
+        )
         self._router_concatenated_prompts_by_dataset: Dict[int, List[str]] = {}
         
         if self.checkpoint_dir:
@@ -495,6 +527,17 @@ class WageringTrainer:
 
         if self.resume_from_checkpoint:
             self._load_checkpoint(Path(self.resume_from_checkpoint))
+
+        # If logging into an already-active wandb run (for example phase2 after
+        # phase1), ensure training steps never move backward relative to run.step.
+        run_step = self._get_wandb_run_step()
+        if run_step is not None and self.current_step < run_step:
+            log.info(
+                "Aligning trainer current_step from %d to active wandb run step %d to keep logging monotonic",
+                self.current_step,
+                run_step,
+            )
+            self.current_step = int(run_step)
         
         # Collect per-dataset cached logits/hidden states first, then combine datasets and shuffle
         self._collect_logits()
@@ -525,6 +568,150 @@ class WageringTrainer:
                         f"({self.all_hidden_states.shape[1]})."
                     )
         self._apply_shuffling()
+        self._prepare_model_perplexities()
+
+    @staticmethod
+    def _compute_prompt_perplexities_for_model(
+        model: WhiteboxModel,
+        prompts: List[str],
+        batch_size: int,
+    ) -> np.ndarray:
+        """
+        Compute true prompt perplexity per example using teacher-forced next-token loss.
+
+        Returns:
+            np.ndarray of shape [num_examples], where lower values indicate better
+            prompt modeling by this model.
+        """
+        if len(prompts) == 0:
+            return np.empty((0,), dtype=np.float32)
+
+        model_device = model.device()
+        ppl_batches: List[np.ndarray] = []
+        pad_token_id = getattr(model.tokenizer, "pad_token_id", None)
+
+        for batch_start in range(0, len(prompts), batch_size):
+            batch_end = min(batch_start + batch_size, len(prompts))
+            batch_prompts = prompts[batch_start:batch_end]
+
+            batch = model.tokenize(batch_prompts)
+            input_ids = batch["input_ids"].to(model_device)
+            attention_mask = batch.get("attention_mask", None)
+            if attention_mask is not None:
+                attention_mask = attention_mask.to(model_device)
+
+            with torch.no_grad():
+                outputs = model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    return_dict=True,
+                    use_cache=False,
+                )
+                logits = outputs.logits
+
+            if logits.size(1) < 2:
+                # Degenerate short prompt; assign neutral perplexity.
+                ppl_batches.append(np.ones((input_ids.size(0),), dtype=np.float32))
+                continue
+
+            shift_logits = logits[:, :-1, :]
+            shift_labels = input_ids[:, 1:]
+            token_log_probs = torch.log_softmax(shift_logits, dim=-1)
+            token_nll = -torch.gather(token_log_probs, dim=-1, index=shift_labels.unsqueeze(-1)).squeeze(-1)
+
+            if attention_mask is not None:
+                token_mask = attention_mask[:, 1:].to(dtype=token_nll.dtype)
+            else:
+                token_mask = torch.ones_like(token_nll, dtype=token_nll.dtype)
+
+            if pad_token_id is not None:
+                token_mask = token_mask * (shift_labels != pad_token_id).to(dtype=token_nll.dtype)
+
+            token_count = torch.clamp(token_mask.sum(dim=1), min=1.0)
+            mean_nll = (token_nll * token_mask).sum(dim=1) / token_count
+            perplexity = torch.exp(mean_nll)
+            ppl_batches.append(perplexity.detach().to(dtype=torch.float32).cpu().numpy())
+
+        return np.concatenate(ppl_batches, axis=0).astype(np.float32, copy=False)
+
+    def _compute_prompt_perplexities(self, dataset: Dataset) -> np.ndarray:
+        """
+        Compute prompt perplexities for all models.
+
+        Returns:
+            np.ndarray with shape [num_examples, num_models].
+        """
+        num_examples = len(dataset.x)
+        num_models = len(self.models)
+        all_perplexities = np.empty((num_examples, num_models), dtype=np.float32)
+        reused_columns = 0
+        computed_columns = 0
+        prompt_perplexity_cache: Dict[Tuple[int, str], np.ndarray] = {}
+
+        for model_index, model in enumerate(self.models):
+            if isinstance(model, str):
+                raise RuntimeError(
+                    "PackLLM prompt-perplexity wagering requires loaded model objects, "
+                    f"but model at index {model_index} is a string path: {model}"
+                )
+
+            model_prompts = get_model_specific_prompts(dataset, model_index=model_index)
+            if len(model_prompts) != num_examples:
+                raise ValueError(
+                    "Prompt/label length mismatch while computing prompt perplexities. "
+                    f"prompts={len(model_prompts)}, examples={num_examples}"
+                )
+
+            cache_key: Optional[Tuple[int, str]] = None
+            if self.reuse_prompt_perplexities_for_identical_models:
+                digest = hashlib.md5()
+                for prompt_text in model_prompts:
+                    digest.update(str(prompt_text).encode("utf-8"))
+                    digest.update(b"\x1e")
+                cache_key = (id(model.model), digest.hexdigest())
+                if cache_key in prompt_perplexity_cache:
+                    all_perplexities[:, model_index] = prompt_perplexity_cache[cache_key]
+                    reused_columns += 1
+                    continue
+
+            all_perplexities[:, model_index] = self._compute_prompt_perplexities_for_model(
+                model=model,
+                prompts=model_prompts,
+                batch_size=max(1, int(dataset.batch_size)),
+            )
+            computed_columns += 1
+            if cache_key is not None:
+                prompt_perplexity_cache[cache_key] = all_perplexities[:, model_index].copy()
+
+        if self.reuse_prompt_perplexities_for_identical_models and reused_columns > 0:
+            log.info(
+                "Reused prompt-perplexity columns for %d/%d models (computed=%d) using identical model+prompt variants",
+                reused_columns,
+                num_models,
+                computed_columns,
+            )
+
+        return all_perplexities
+
+    def _prepare_model_perplexities(self) -> None:
+        """Precompute train/validation prompt perplexities when required by method."""
+        self.model_prompt_perplexities = None
+        self.validation_model_prompt_perplexities = None
+
+        if not self.method_requires_model_perplexities:
+            return
+
+        self.model_prompt_perplexities = self._compute_prompt_perplexities(self.combined_dataset)
+        if self.validation_dataset is not None:
+            self.validation_model_prompt_perplexities = self._compute_prompt_perplexities(
+                self.validation_dataset
+            )
+
+        log.info(
+            "Computed prompt perplexities for training method: train_shape=%s%s",
+            None if self.model_prompt_perplexities is None else self.model_prompt_perplexities.shape,
+            "" if self.validation_model_prompt_perplexities is None else f", val_shape={self.validation_model_prompt_perplexities.shape}",
+        )
 
     def _get_wandb_run_step(self) -> Optional[int]:
         """Return current wandb run step if available and parseable."""
@@ -1432,12 +1619,22 @@ class WageringTrainer:
             
             # Compute wagers for batch
                 # Variable hidden dimensions per model - use batch heterogeneous processing
-            res_dict = self.wagering_method.compute_wagers(
-                model_logits=batch_logits_transposed,
-                gold_label=batch_labels,
-                hidden_states_list=batch_hidden_states,
-                questions=batch_questions,
-            )  # [batch_size, num_models]
+            wagering_kwargs = {
+                "model_logits": batch_logits_transposed,
+                "gold_label": batch_labels,
+                "hidden_states_list": batch_hidden_states,
+                "questions": batch_questions,
+            }
+            if self.method_requires_model_perplexities:
+                if self.validation_model_prompt_perplexities is None:
+                    raise RuntimeError(
+                        "Wagering method requires model_perplexities but validation perplexities are unavailable"
+                    )
+                wagering_kwargs["model_perplexities"] = self.validation_model_prompt_perplexities[
+                    batch_start:batch_end
+                ]
+
+            res_dict = self.wagering_method.compute_wagers(**wagering_kwargs)  # [batch_size, num_models]
             batch_wagers = res_dict["wagers"]  # [batch_size, num_models]
             batch_sigmoid_wagers = res_dict.get("sigmoid_wagers", None)  # [batch_size, num_models]
             batch_nash_gap = res_dict.get("nash_gap", None)
@@ -1663,12 +1860,22 @@ class WageringTrainer:
                             for i in range(batch_hidden_states_array.shape[0])
                         ]
 
-                res_dict = self.wagering_method.compute_wagers(
-                    model_logits=batch_logits_transposed,
-                    gold_label=batch_labels,
-                    hidden_states_list=batch_hidden_states,
-                    questions=batch_questions,
-                )
+                wagering_kwargs = {
+                    "model_logits": batch_logits_transposed,
+                    "gold_label": batch_labels,
+                    "hidden_states_list": batch_hidden_states,
+                    "questions": batch_questions,
+                }
+                if self.method_requires_model_perplexities:
+                    if self.validation_model_prompt_perplexities is None:
+                        raise RuntimeError(
+                            "Wagering method requires model_perplexities but validation perplexities are unavailable"
+                        )
+                    wagering_kwargs["model_perplexities"] = self.validation_model_prompt_perplexities[
+                        batch_start:batch_end
+                    ]
+
+                res_dict = self.wagering_method.compute_wagers(**wagering_kwargs)
                 batch_score_diff = res_dict.get("score_diff", None)
                 if batch_score_diff is None:
                     return None
@@ -2039,9 +2246,46 @@ class WageringTrainer:
             Dictionary with training results and metrics
         """
         self.wagering_method.train_mode()
+
+        requested_num_epochs = int(num_epochs)
+        effective_num_epochs = requested_num_epochs
+        reuse_static_epoch_results = False
+
+        # Inference-only methods with no trainable parameters produce identical
+        # per-batch outputs on repeated epochs over the same frozen cached logits.
+        # Run one epoch and reuse those metrics for remaining epochs.
+        if requested_num_epochs > 1:
+            has_trainable_params = False
+            try:
+                trainable_params = self.wagering_method.get_trainable_parameters()
+                has_trainable_params = bool(trainable_params)
+            except Exception as exc:
+                log.debug(
+                    "Could not inspect trainable parameters for epoch reuse optimization: %s",
+                    exc,
+                )
+
+            if not has_trainable_params:
+                effective_num_epochs = 1
+                reuse_static_epoch_results = self.max_training_batches is None
+                log.info(
+                    "Method %s has no trainable parameters: running one epoch%s.",
+                    type(self.wagering_method).__name__,
+                    (
+                        f" and reusing results for {requested_num_epochs - 1} additional epoch(s)"
+                        if reuse_static_epoch_results
+                        else " (max_training_batches set; skipping synthetic multi-epoch metric reuse)"
+                    ),
+                )
         
         num_examples = len(self.combined_dataset.x)
         num_batches = (num_examples + self.batch_size - 1) // self.batch_size
+        if self.max_training_batches is not None:
+            log.info(
+                "max_training_batches=%d (dataset yields %d batches per epoch).",
+                self.max_training_batches,
+                num_batches,
+            )
         
         # Training loop
         batch_metrics = []
@@ -2085,7 +2329,7 @@ class WageringTrainer:
                 "(capped at 1000 validation samples per plot).",
                 self.wager_score_plot_every,
             )
-            estimated_total_batches = num_epochs * num_batches
+            estimated_total_batches = effective_num_epochs * num_batches
             if self.wager_score_plot_every > estimated_total_batches:
                 log.warning(
                     "wager_score_plot_every=%d exceeds estimated total batches=%d; "
@@ -2120,9 +2364,12 @@ class WageringTrainer:
                 )
         
         epoch_start = self.start_epoch
-        epoch_stop = self.start_epoch + int(num_epochs)
+        epoch_stop = self.start_epoch + effective_num_epochs
+        batches_processed = 0
         for epoch in range(epoch_start, epoch_stop):
-            log.debug(f"Epoch {epoch - epoch_start + 1}/{num_epochs} (absolute epoch {epoch + 1})")
+            log.debug(
+                f"Epoch {epoch - epoch_start + 1}/{effective_num_epochs} (absolute epoch {epoch + 1})"
+            )
             
             # Reset predictions/probs/wagers at start of each epoch
             # We only want to keep the final epoch's predictions for evaluation
@@ -2188,12 +2435,22 @@ class WageringTrainer:
                 
                 # Compute wagers for entire batch
                     # Variable hidden dimensions per model - use batch  processing
-                res_dict = self.wagering_method.compute_wagers(
-                    model_logits=batch_logits_transposed,
-                    gold_label=batch_labels,
-                    hidden_states_list=batch_hidden_states,
-                    questions=batch_questions,
-                )  # [batch_size, num_models]
+                wagering_kwargs = {
+                    "model_logits": batch_logits_transposed,
+                    "gold_label": batch_labels,
+                    "hidden_states_list": batch_hidden_states,
+                    "questions": batch_questions,
+                }
+                if self.method_requires_model_perplexities:
+                    if self.model_prompt_perplexities is None:
+                        raise RuntimeError(
+                            "Wagering method requires model_perplexities but training perplexities are unavailable"
+                        )
+                    wagering_kwargs["model_perplexities"] = self.model_prompt_perplexities[
+                        batch_start:batch_end
+                    ]
+
+                res_dict = self.wagering_method.compute_wagers(**wagering_kwargs)  # [batch_size, num_models]
                 
                 batch_wagers = res_dict["wagers"]
                 batch_sigmoid_wagers = res_dict.get("sigmoid_wagers", None)
@@ -2527,6 +2784,14 @@ class WageringTrainer:
                 else:
                     # Update current_step even without wandb logger
                     self.current_step = global_step
+
+                batches_processed += 1
+                if self.max_training_batches is not None and batches_processed >= self.max_training_batches:
+                    log.info(
+                        "Stopping after %d training batch(es) (max_training_batches).",
+                        self.max_training_batches,
+                    )
+                    stop_training_now = True
 
                 if self.wager_score_plot_every is not None and self.validation_dataset is not None:
                     completed_batches = epoch * num_batches + (batch_idx + 1)
@@ -2961,6 +3226,8 @@ class WageringTrainer:
                 hyperparams["training/save_every"] = self.save_every
                 hyperparams["training/batch_size"] = self.batch_size
                 hyperparams["training/validation_split_ratio"] = self.validation_split_ratio
+                if self.max_training_batches is not None:
+                    hyperparams["training/max_training_batches"] = int(self.max_training_batches)
                 
                 # Aggregation method
                 hyperparams["aggregation/name"] = type(self.aggregation_function).__name__
@@ -3038,6 +3305,33 @@ class WageringTrainer:
                 log.warning(
                     "Could not collect validation arrays for final wager plots; no final wager plot images were logged."
                 )
+
+        if (
+            reuse_static_epoch_results
+            and requested_num_epochs > effective_num_epochs
+            and self.batch_metrics_history
+            and self.max_training_batches is None
+        ):
+            base_epoch_rows = copy.deepcopy(self.batch_metrics_history)
+            base_epoch_count = len(base_epoch_rows)
+            epochs_to_reuse = requested_num_epochs - effective_num_epochs
+
+            for epoch_offset in range(1, epochs_to_reuse + 1):
+                step_offset = int(epoch_offset * num_examples)
+                for row_idx, row in enumerate(base_epoch_rows):
+                    cloned_row = copy.deepcopy(row)
+                    cloned_row["epoch"] = int(cloned_row.get("epoch", 1) + epoch_offset)
+                    cloned_row["batch_index_in_epoch"] = int(row_idx + 1)
+                    cloned_row["global_step"] = int(cloned_row.get("global_step", 0) + step_offset)
+                    self.batch_metrics_history.append(cloned_row)
+
+            self.current_step = int(self.current_step + (epochs_to_reuse * num_examples))
+            log.info(
+                "Reused %d cached batch-metric epoch(s) for inference-only method (%d base rows -> %d total rows).",
+                epochs_to_reuse,
+                base_epoch_count,
+                len(self.batch_metrics_history),
+            )
 
         # Convert to arrays
         all_predictions = np.array(all_predictions, dtype=np.int32)

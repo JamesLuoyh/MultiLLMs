@@ -40,7 +40,7 @@ class WageringAnalytics:
         checkpoint_dir: Optional[Path] = None,
         dataset_size: Optional[int] = None,
         early_stopping_criterion: str = "validation",
-        use_brier_d_regret_for_early_stopping: bool = True,
+        use_brier_d_regret_for_early_stopping: bool = False,
     ) -> pd.DataFrame:
         """
         Create analytics dataframe for training results.
@@ -257,8 +257,6 @@ class WageringAnalytics:
             row["meta_auc"] = results.get("meta_auc") if results.get("meta_auc") is not None and not np.isnan(results.get("meta_auc", np.nan)) else None
             row["kendall_tau"] = results.get("kendall_tau") if results.get("kendall_tau") is not None and not np.isnan(results.get("kendall_tau", np.nan)) else None
             row["best_model_mrr"] = results.get("best_model_mrr") if results.get("best_model_mrr") is not None and not np.isnan(results.get("best_model_mrr", np.nan)) else None
-            row["kl_divergence"] = results.get("kl_divergence") if results.get("kl_divergence") is not None and not np.isnan(results.get("kl_divergence", np.nan)) else None
-            row["tv_distance"] = results.get("tv_distance") if results.get("tv_distance") is not None and not np.isnan(results.get("tv_distance", np.nan)) else None
             row["num_examples"] = results.get("num_examples")
         
         # Mark as evaluation results
@@ -315,7 +313,7 @@ class WageringAnalytics:
                 if (col.startswith('final_') or col in [
                     'accuracy', 'nll', 'brier', 'auc', 'ece', 'num_examples',
                     'd_regret', 'brier_d_regret', 'meta_acc', 'meta_nll', 'meta_auc',
-                    'kendall_tau', 'best_model_mrr', 'kl_divergence', 'tv_distance',
+                    'kendall_tau', 'best_model_mrr',
                 ])
                 or (col not in settings_columns and pd.api.types.is_numeric_dtype(combined_df[col]))
             ]

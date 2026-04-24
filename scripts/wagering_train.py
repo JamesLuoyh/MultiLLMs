@@ -10,10 +10,9 @@ Usage: python wagering_train.py <config_file.yaml>
 import logging
 import os
 import sys
-import time
 import yaml
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Optional
 
 # Ensure the local src/ tree and wagering package are importable
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -33,11 +32,8 @@ from wagering.utils import (
 from wagering.calibration import calibration_enabled, fit_or_load_logit_calibrator
 from wagering.utils.multi_llm_ensemble import (
     assign_pubmedqa_context_models,
-    configure_wagering_cache_dir,
     get_cached_logits_and_hidden_states_for_model,
-    has_cached_logits_and_hidden_states_for_model,
     get_model_prompt_variant,
-    resolve_hidden_state_layers_for_model,
 )
 from wagering.core.dataset import Dataset
 from wagering.methods.factory import load_wagering_method
@@ -85,7 +81,6 @@ def main(config_path: Optional[str] = None, calibration_path: Optional[str] = No
     
     # Load config
     args = load_and_merge_configs(config_path)
-    configure_wagering_cache_dir(args.get("cache_path"))
     
     # Set up logging
     logging.basicConfig(level=logging.INFO, format='%(name)s - %(levelname)s - %(message)s')
@@ -190,12 +185,10 @@ def main(config_path: Optional[str] = None, calibration_path: Optional[str] = No
     # For PubMedQA mixed-context prompts, assign context on a balanced randomized
     # per-example basis across model indices.
     pubmedqa_context_seed = dataset_split_seed
-    pubmedqa_context_policy = str(args.get("pubmedqa_context_policy", "single_with_context"))
     pubmedqa_assignments = assign_pubmedqa_context_models(
         train_datasets,
         [model_cfg["path"] for model_cfg in args["models"]],
         random_seed=pubmedqa_context_seed,
-        context_policy=pubmedqa_context_policy,
     )
     for dataset_idx, assignment_info in pubmedqa_assignments.items():
         dataset_name = dataset_names[dataset_idx] if dataset_idx < len(dataset_names) else f"dataset_{dataset_idx}"
@@ -231,26 +224,29 @@ def main(config_path: Optional[str] = None, calibration_path: Optional[str] = No
         num_models=num_models,
         config=wagering_config.get("config", {}),
     )
-    method_requires_hidden_states = bool(getattr(wagering_method, "requires_hidden_states", True))
-    hidden_state_layers = None
-    hidden_state_layers_per_model = None
-    if method_requires_hidden_states:
-        hidden_state_layers = getattr(
-            wagering_method,
-            "hidden_state_layers",
-            wagering_config.get("config", {}).get("hidden_state_layers"),
-        )
-        hidden_state_layers_per_model = getattr(
-            wagering_method,
-            "hidden_state_layers_per_model",
-            wagering_config.get("config", {}).get("hidden_state_layers_per_model"),
-        )
-        # Keep cache checks and trainer runtime on the same layer selection.
-        setattr(wagering_method, "hidden_state_layers", hidden_state_layers)
-        setattr(wagering_method, "hidden_state_layers_per_model", hidden_state_layers_per_model)
+    hidden_state_layers = getattr(
+        wagering_method,
+        "hidden_state_layers",
+        wagering_config.get("config", {}).get("hidden_state_layers"),
+    )
+    # Keep cache checks and trainer runtime on the same layer selection, even
+    # for methods that don't explicitly expose hidden_state_layers.
+    setattr(wagering_method, "hidden_state_layers", hidden_state_layers)
     log.info(f"Loaded wagering method: {wagering_config['name']}")
 
-    needs_hidden_states = method_requires_hidden_states or logit_calibrator is not None
+    wagering_method_name = type(wagering_method).__name__
+    needs_hidden_states = (
+        wagering_method_name not in ["EqualWagers", "ZeroOneWagers", "OneZeroWagers"]
+        or logit_calibrator is not None
+    )
+    needs_model_objects_for_perplexity = bool(
+        getattr(wagering_method, "requires_model_perplexities", False)
+    )
+    if needs_model_objects_for_perplexity:
+        log.info(
+            "Wagering method %s requires model perplexities; forcing model object loading for all models.",
+            wagering_method_name,
+        )
 
     # Determine which models need to be loaded based on cache
     option_tokens = args.get("option_tokens", ["A", "B", "C", "D"])
@@ -258,52 +254,52 @@ def main(config_path: Optional[str] = None, calibration_path: Optional[str] = No
 
     cache_miss_indices = []
     cached_model_names = []
-    cache_probe_start = time.perf_counter()
     for idx, model_cfg in enumerate(model_cfgs):
         model_path = model_cfg["path"]
         cached_model_names.append(model_path.replace("/", "_"))
-        model_hidden_layers = resolve_hidden_state_layers_for_model(
-            hidden_state_layers,
-            hidden_state_layers_per_model,
-            model_index=idx,
-            num_models=num_models,
-        )
 
         model_cache_ok = True
         for dataset in train_datasets:
             prompt_variant = get_model_prompt_variant(dataset, model_index=idx)
-            cache_ok = has_cached_logits_and_hidden_states_for_model(
+            cached_logits, cached_hidden_states, _ = get_cached_logits_and_hidden_states_for_model(
                 model_path,
                 dataset,
                 option_tokens,
                 prompt_variant=prompt_variant,
                 model_index=idx,
-                hidden_state_layers=model_hidden_layers,
-                require_hidden_states=needs_hidden_states,
+                hidden_state_layers=hidden_state_layers,
             )
-            if not cache_ok:
+            if cached_logits is None or (needs_hidden_states and cached_hidden_states is None):
                 model_cache_ok = False
                 break
 
         if not model_cache_ok:
             cache_miss_indices.append(idx)
 
-    cache_probe_seconds = time.perf_counter() - cache_probe_start
-    log.info("Cache probe completed in %.1fs", cache_probe_seconds)
-
     models = []
     model_names = cached_model_names[:]
-    if cache_miss_indices:
-        log.info(f"Cache miss for {len(cache_miss_indices)}/{num_models} models. Loading missing models...")
-        missing_cfgs = [model_cfgs[i] for i in cache_miss_indices]
+    indices_to_load = set(cache_miss_indices)
+    if needs_model_objects_for_perplexity:
+        indices_to_load = set(range(num_models))
+
+    if indices_to_load:
+        sorted_indices_to_load = sorted(indices_to_load)
+        log.info(
+            "Loading %d/%d models as objects (cache misses=%d, requires_perplexity=%s).",
+            len(sorted_indices_to_load),
+            num_models,
+            len(cache_miss_indices),
+            needs_model_objects_for_perplexity,
+        )
+        missing_cfgs = [model_cfgs[i] for i in sorted_indices_to_load]
         missing_models, missing_names = load_models_from_config(
             missing_cfgs,
             cache_kwargs={"cache_dir": args.get("cache_path", "./workdir/cache")} if args.get("cache_path") else {},
         )
-        missing_name_map = {idx: name for idx, name in zip(cache_miss_indices, missing_names)}
+        missing_name_map = {idx: name for idx, name in zip(sorted_indices_to_load, missing_names)}
         missing_iter = iter(missing_models)
         for i in range(num_models):
-            if i in cache_miss_indices:
+            if i in indices_to_load:
                 models.append(next(missing_iter))
                 model_names[i] = missing_name_map.get(i, model_names[i])
             else:
@@ -342,28 +338,6 @@ def main(config_path: Optional[str] = None, calibration_path: Optional[str] = No
             log.info(f"Auto-resuming from: {latest_checkpoint}")
             resume_checkpoint = str(latest_checkpoint)
     
-    # Enforce global checkpoint policy across all configs:
-    # only final checkpoint is kept; no epoch/batch transition checkpoints.
-    configured_save_every = args.get("save_every", 0)
-    try:
-        configured_save_every_nonzero = int(configured_save_every) != 0
-    except Exception:
-        configured_save_every_nonzero = configured_save_every not in (None, 0, "0")
-    if "save_every" in args and configured_save_every_nonzero:
-        log.info("Overriding config save_every=%s -> 0 (globally disabled)", configured_save_every)
-    if bool(args.get("save_epoch_checkpoints", False)):
-        log.info("Overriding config save_epoch_checkpoints=%s -> False (globally disabled)", args.get("save_epoch_checkpoints"))
-    if args.get("max_epoch_checkpoints", None) is not None:
-        log.info("Ignoring config max_epoch_checkpoints=%s because epoch checkpoints are globally disabled", args.get("max_epoch_checkpoints"))
-
-    forced_save_every = 0
-    forced_save_epoch_checkpoints = False
-
-    search_mode_raw = args.get("search_mode", False)
-    search_mode = str(search_mode_raw).strip().lower() in {"1", "true", "yes", "on"}
-    if search_mode:
-        log.info("Search mode enabled: disabling non-essential artifact outputs (analytics/plots).")
-
     # Create trainer
     trainer = WageringTrainer(
         models=models,
@@ -373,69 +347,34 @@ def main(config_path: Optional[str] = None, calibration_path: Optional[str] = No
         option_tokens=args.get("option_tokens", ["A", "B", "C", "D"]),
         checkpoint_dir=checkpoint_dir,
         wandb_logger=wandb_logger,
-        save_every=forced_save_every,
+        save_every=args.get("save_every", 100),
         metadata=checkpoint_metadata,
         resume_from_checkpoint=resume_checkpoint,
         shuffle_data=args.get("shuffle_data", True),
         shuffle_seed=args.get("shuffle_seed", 42),
         early_stopping_patience=args.get("early_stopping_patience", 10),
         early_stopping_criterion=args.get("early_stopping_criterion", "validation"),
-        use_brier_d_regret_for_early_stopping=args.get("use_brier_d_regret_for_early_stopping", True),
+        use_brier_d_regret_for_early_stopping=args.get("use_brier_d_regret_for_early_stopping", False),
         batch_size=args.get("training_batch_size", 100),
         validation_split_ratio=validation_split_ratio,
         balance_training_datasets=args.get("balance_training_datasets", True),
         wager_score_plot_every=args.get("wager_score_plot_every", None),
         logit_calibrator=logit_calibrator,
-        save_epoch_checkpoints=forced_save_epoch_checkpoints,
-        max_epoch_checkpoints=None,
-        enable_artifact_outputs=(not search_mode),
+        max_training_batches=args.get("max_training_batches"),
     )
     
     # Train
     log.info("Starting training...")
     results = trainer.train(num_epochs=args.get("num_epochs", 100))
-
-    # Optionally emit a single resumable checkpoint even when periodic checkpoints
-    # are globally disabled. This is required by the two-phase pipeline transition.
-    if bool(args.get("emit_resume_checkpoint", False)):
-        try:
-            last_epoch = max(0, int(args.get("num_epochs", 1)) - 1)
-        except Exception:
-            last_epoch = 0
-        trainer._save_checkpoint(epoch=last_epoch)
-        log.info("Emitted explicit resume checkpoint for phase transition")
-
-    # Expose final validation metrics for downstream hyperparameter search.
-    final_validation_metrics: Optional[Dict[str, Any]] = None
-    if getattr(trainer, "validation_dataset", None) is not None:
-        try:
-            final_validation_metrics, _, _, _, _ = trainer._evaluate_validation()
-        except Exception as e:
-            log.warning(f"Could not compute final validation metrics after training: {e}")
-
-    if final_validation_metrics:
-        results["final_validation_metrics"] = final_validation_metrics
-        if "accuracy" in final_validation_metrics:
-            results["final_validation_accuracy"] = final_validation_metrics.get("accuracy")
     
     log.info(f"Training complete! Final accuracy: {results['final_accuracy']:.4f}")
     
-    # Save final checkpoint unless explicitly disabled (useful for LR sweeps).
-    if bool(args.get("save_final_checkpoint", True)):
-        final_checkpoint_dir = Path(checkpoint_dir) / "final"
-        trainer.save_final_checkpoint(str(final_checkpoint_dir))
+    # Save final checkpoint
+    final_checkpoint_dir = Path(checkpoint_dir) / "final"
+    trainer.save_final_checkpoint(str(final_checkpoint_dir))
     
     # Return results (wandb run stays active)
     results["checkpoint_path"] = str(checkpoint_dir)
-    transition_checkpoints = list(checkpoint_dir.glob("checkpoint_epoch_*_step_*.pt"))
-    if len(transition_checkpoints) > 0:
-        # Prefer the checkpoint produced most recently in this run; filename
-        # ordering can select stale checkpoints from prior runs with larger steps.
-        latest_transition_checkpoint = max(
-            transition_checkpoints,
-            key=lambda p: p.stat().st_mtime,
-        )
-        results["phase_transition_checkpoint_path"] = str(latest_transition_checkpoint)
     if calibration_artifact_path is not None:
         results["calibration_path"] = calibration_artifact_path
     if wandb_logger and hasattr(wandb_logger, 'run') and wandb_logger.run is not None:

@@ -11,8 +11,8 @@ reference implementation's use of per-expert scores without requiring task/clust
 
 from __future__ import annotations
 
-import os
 import sys
+import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -25,14 +25,13 @@ SRC_PATH = PROJECT_ROOT / "src"
 if str(SRC_PATH) not in sys.path:
     sys.path.insert(0, str(SRC_PATH))
 
-# Must be set before tokenizer/protobuf modules are imported.
-os.environ.setdefault("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "python")
-
 from transformers import AutoModel, AutoTokenizer
 
 from .base import WageringMethod
 from .utils import preprocess_pubmedqa_prompts_for_embedding
 from wagering.aggregation.linear_pooling import LinearPooling
+
+logger = logging.getLogger("wagering")
 
 
 class RouterDCWagers(WageringMethod):
@@ -49,23 +48,18 @@ class RouterDCWagers(WageringMethod):
         super().__init__(num_models, config or {})
         cfg = self.config
 
-        # RouterDC routes from prompt text embeddings only.
-        self.requires_hidden_states = False
-
         self.encoder_model_name = str(
             cfg.get("encoder_model_name", cfg.get("bert_model_name", "microsoft/mdeberta-v3-base"))
         )
         self.max_seq_length = int(cfg.get("max_seq_length", 512))
         self.learning_rate = float(cfg.get("learning_rate", 5e-5))
         self.temperature = float(cfg.get("temperature", 1.0))
-        self.wager_floor = float(cfg.get("wager_floor", 1e-16))
+        if not np.isfinite(self.temperature) or self.temperature <= 0.0:
+            raise ValueError("temperature must be finite and > 0 for router_dc")
         self.grad_clip_norm = float(cfg.get("grad_clip_norm", 1.0))
         self.weight_decay = float(cfg.get("weight_decay", 0.01))
         self.freeze_encoder = bool(cfg.get("freeze_encoder", False))
         self.pubmedqa_strip_context = bool(cfg.get("pubmedqa_strip_context", True))
-        self.use_concatenated_prompt_context = bool(
-            cfg.get("use_concatenated_prompt_context", True)
-        )
         self.similarity_function = str(cfg.get("similarity_function", "cos")).lower()
         if self.similarity_function not in ("cos", "dot"):
             raise ValueError("similarity_function must be 'cos' or 'dot'")
@@ -74,6 +68,13 @@ class RouterDCWagers(WageringMethod):
         self.last_k = int(cfg.get("last_k", 3))
         self.min_pos_p = float(cfg.get("min_pos_p", 0.01))
         self.neg_mask_threshold = float(cfg.get("neg_mask_threshold", 0.5))
+        self.inactive_model_indices = {int(i) for i in cfg.get("inactive_model_indices", [])}
+        if any(i < 0 or i >= num_models for i in self.inactive_model_indices):
+            raise ValueError(
+                f"inactive_model_indices must be within [0, {num_models - 1}], got {sorted(self.inactive_model_indices)}"
+            )
+        if len(self.inactive_model_indices) >= num_models:
+            raise ValueError("router_dc requires at least one active model")
 
         self.lr_decay_factor = float(cfg.get("lr_decay_factor", 1.0))
         self.lr_decay_steps = int(cfg.get("lr_decay_steps", 100))
@@ -81,64 +82,11 @@ class RouterDCWagers(WageringMethod):
         self.device_str = str(cfg.get("device", "cuda" if torch.cuda.is_available() else "cpu"))
         self.device = torch.device(self.device_str)
 
-        tokenizer_use_fast_cfg = cfg.get("tokenizer_use_fast", None)
-        if tokenizer_use_fast_cfg is None:
-            model_name_l = self.encoder_model_name.lower()
-            # DeBERTa-v2/v3 tokenizers are SentencePiece-backed and can hit
-            # protobuf compatibility issues during fast tokenizer conversion.
-            tokenizer_use_fast = not any(
-                marker in model_name_l for marker in ("deberta-v2", "deberta-v3", "mdeberta")
-            )
-        else:
-            tokenizer_use_fast = bool(tokenizer_use_fast_cfg)
+        self.hidden_state_layers = cfg.get("hidden_state_layers", [-1])
 
-        # Some SentencePiece-based models can fail to initialize a fast tokenizer
-        # when protobuf/sentencepiece versions are incompatible in the environment.
-        # Fall back to the slow tokenizer so training/eval can proceed.
-        try:
-            self.tokenizer = AutoTokenizer.from_pretrained(
-                self.encoder_model_name,
-                truncation_side="left",
-                padding=True,
-                use_fast=tokenizer_use_fast,
-            )
-        except Exception as exc:
-            err = str(exc)
-            recoverable_errors = (
-                "Descriptors cannot be created directly",
-                "duplicate file name sentencepiece_model.proto",
-                "sentencepiece_model.proto",
-                "Error parsing line",
-                "spm.model",
-                "convert_slow_tokenizer",
-                "tiktoken",
-            )
-            if not any(msg in err for msg in recoverable_errors):
-                raise
-
-            # Fallback for protobuf/sentencepiece compatibility issues in some envs.
-            os.environ.setdefault("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "python")
-            try:
-                self.tokenizer = AutoTokenizer.from_pretrained(
-                    self.encoder_model_name,
-                    truncation_side="left",
-                    padding=True,
-                    use_fast=False,
-                )
-            except Exception as slow_exc:
-                # Some transformers versions still route through fast-tokenizer
-                # conversion paths; bypass AutoTokenizer for DeBERTa-based models.
-                model_name_l = self.encoder_model_name.lower()
-                if any(marker in model_name_l for marker in ("deberta-v2", "deberta-v3", "mdeberta")):
-                    from transformers.models.deberta_v2.tokenization_deberta_v2 import DebertaV2Tokenizer
-
-                    self.tokenizer = DebertaV2Tokenizer.from_pretrained(
-                        self.encoder_model_name,
-                        truncation_side="left",
-                        padding=True,
-                    )
-                else:
-                    raise slow_exc
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            self.encoder_model_name, truncation_side="left", padding=True
+        )
         self.encoder = AutoModel.from_pretrained(self.encoder_model_name).to(self.device)
         hidden_size = int(self.encoder.config.hidden_size)
 
@@ -167,11 +115,35 @@ class RouterDCWagers(WageringMethod):
         self._cached_wagers: Optional[torch.Tensor] = None
         self._cached_router_logits: Optional[torch.Tensor] = None
 
+    def _active_model_mask(self) -> Optional[torch.Tensor]:
+        if not self.inactive_model_indices:
+            return None
+        mask = torch.ones((1, self.num_models), dtype=torch.float32, device=self.device)
+        inactive = sorted(self.inactive_model_indices)
+        mask[:, inactive] = 0.0
+        return mask
+
+    def _normalize_wagers_safe(self, wagers: torch.Tensor) -> torch.Tensor:
+        """Ensure finite, non-negative, row-normalized wagers (no fallback)."""
+        active_mask = self._active_model_mask()
+        if active_mask is not None:
+            wagers = wagers * active_mask.to(dtype=wagers.dtype)
+
+        if torch.any(~torch.isfinite(wagers)):
+            raise ValueError("router_dc produced non-finite wagers before normalization")
+        if torch.any(wagers < 0):
+            raise ValueError("router_dc produced negative wagers before normalization")
+
+        row_sums = wagers.sum(dim=1, keepdim=True)
+        if torch.any(~torch.isfinite(row_sums)) or torch.any(row_sums <= 1e-12):
+            raise ValueError("router_dc produced invalid wager row sums during normalization")
+        normalized = wagers / row_sums
+        return normalized
+
     def _encode_questions_batch(self, questions: List[str]) -> torch.Tensor:
-        strip_context = self.pubmedqa_strip_context and (not self.use_concatenated_prompt_context)
         processed = preprocess_pubmedqa_prompts_for_embedding(
             questions,
-            strip_context=strip_context,
+            strip_context=self.pubmedqa_strip_context,
         )
         inputs = self.tokenizer(
             processed,
@@ -186,13 +158,13 @@ class RouterDCWagers(WageringMethod):
             outputs = self.encoder(**inputs)
         # First token representation (matches RouterDC reference code)
         hidden = outputs.last_hidden_state[:, 0, :]
-        hidden = hidden.to(dtype=self.expert_embeddings.weight.dtype)
         return hidden
 
     def _compute_similarity(self, query_emb: torch.Tensor) -> torch.Tensor:
         """query_emb: [B, H], returns logits [B, M] before temperature scaling."""
         expert_w = self.expert_embeddings.weight  # [M, H]
-        query_emb = query_emb.to(dtype=expert_w.dtype)
+        if query_emb.dtype != expert_w.dtype:
+            query_emb = query_emb.to(dtype=expert_w.dtype)
         if self.similarity_function == "cos":
             q = F.normalize(query_emb, dim=-1)
             e = F.normalize(expert_w, dim=-1)
@@ -221,8 +193,7 @@ class RouterDCWagers(WageringMethod):
             logits = self._compute_similarity(query_emb)
             logits = logits / self.temperature
             wagers = torch.softmax(logits, dim=1)
-            wagers = torch.clamp(wagers, min=self.wager_floor, max=1.0 - self.wager_floor)
-            wagers = wagers / wagers.sum(dim=1, keepdim=True)
+            wagers = self._normalize_wagers_safe(wagers)
 
         if self._training:
             self._cached_wagers = wagers
@@ -241,6 +212,14 @@ class RouterDCWagers(WageringMethod):
         """
         B, M = router_logits.shape
         device = router_logits.device
+        router_logits = torch.nan_to_num(router_logits, nan=0.0, posinf=50.0, neginf=-50.0)
+        p_gold = torch.nan_to_num(p_gold, nan=0.0, posinf=1.0, neginf=0.0).clamp(min=0.0, max=1.0)
+
+        if self.inactive_model_indices:
+            inactive = sorted(self.inactive_model_indices)
+            p_gold[:, inactive] = -1.0
+            router_logits[:, inactive] = float("-inf")
+
         k_pos = min(self.top_k, M)
         k_neg = min(self.last_k, M)
 
@@ -309,6 +288,21 @@ class RouterDCWagers(WageringMethod):
         p_gold = torch.gather(probs, dim=2, index=idx).squeeze(2)
 
         loss = self._sample_llm_contrastive_loss(router_logits, p_gold)
+        if not torch.isfinite(loss):
+            logger.warning("[router_dc] Non-finite loss detected; skipping optimizer step")
+            batch_aggregated_probs = LinearPooling.aggregate_torch(model_logits_tensor, wagers)
+            batch_aggregated_probs_np = batch_aggregated_probs.detach().cpu().numpy()
+            batch_accuracy = float(np.mean(np.argmax(batch_aggregated_probs_np, axis=1) == gold_label))
+            avg_prob_correct = float(
+                np.mean(batch_aggregated_probs_np[np.arange(batch_size), gold_label])
+            )
+            return {
+                "loss": float("nan"),
+                "batch_accuracy": batch_accuracy,
+                "avg_prob_correct": avg_prob_correct,
+                "batch_size": batch_size,
+                "skipped_update_nonfinite_loss": True,
+            }
 
         self.optimizer.zero_grad()
         loss.backward()
@@ -316,12 +310,29 @@ class RouterDCWagers(WageringMethod):
         trainable_params = list(self.expert_embeddings.parameters())
         if not self.freeze_encoder:
             trainable_params.extend(list(self.encoder.parameters()))
-        torch.nn.utils.clip_grad_norm_(trainable_params, self.grad_clip_norm)
-        self.optimizer.step()
-        self.scheduler.step()
+
+        grads_finite = True
+        for p in trainable_params:
+            if p.grad is not None and not torch.isfinite(p.grad).all():
+                grads_finite = False
+                break
+        if not grads_finite:
+            logger.warning("[router_dc] Non-finite gradients detected; skipping optimizer step")
+            self.optimizer.zero_grad(set_to_none=True)
+        else:
+            torch.nn.utils.clip_grad_norm_(trainable_params, self.grad_clip_norm)
+            self.optimizer.step()
+            self.scheduler.step()
+
+            # Fail fast if optimizer produced invalid parameters (common with unstable Adam updates).
+            for p in trainable_params:
+                if not torch.isfinite(p).all():
+                    raise RuntimeError(
+                        "router_dc parameters became non-finite after optimizer step; "
+                        "consider reducing learning_rate / grad_clip_norm"
+                    )
 
         batch_aggregated_probs = LinearPooling.aggregate_torch(model_logits_tensor, wagers)
-        batch_indices = torch.arange(batch_size, device=self.device)
         batch_aggregated_probs_np = batch_aggregated_probs.detach().cpu().numpy()
         batch_accuracy = float(np.mean(np.argmax(batch_aggregated_probs_np, axis=1) == gold_label))
         avg_prob_correct = float(
@@ -367,19 +378,19 @@ class RouterDCWagers(WageringMethod):
                 "max_seq_length": self.max_seq_length,
                 "learning_rate": self.learning_rate,
                 "temperature": self.temperature,
-                "wager_floor": self.wager_floor,
                 "grad_clip_norm": self.grad_clip_norm,
                 "weight_decay": self.weight_decay,
                 "freeze_encoder": self.freeze_encoder,
                 "pubmedqa_strip_context": self.pubmedqa_strip_context,
-                "use_concatenated_prompt_context": self.use_concatenated_prompt_context,
                 "similarity_function": self.similarity_function,
                 "top_k": self.top_k,
                 "last_k": self.last_k,
                 "min_pos_p": self.min_pos_p,
                 "neg_mask_threshold": self.neg_mask_threshold,
+                "inactive_model_indices": sorted(self.inactive_model_indices),
                 "lr_decay_factor": self.lr_decay_factor,
                 "lr_decay_steps": self.lr_decay_steps,
+                "hidden_state_layers": self.hidden_state_layers,
                 "device": self.device_str,
             },
         }

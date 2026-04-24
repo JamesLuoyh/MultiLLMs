@@ -10,12 +10,9 @@ import tempfile
 from unittest.mock import Mock, MagicMock, patch
 
 from wagering.methods import EqualWagers
-from wagering.methods.kl_uniform_wagers import KLUniformWagers
-from wagering.methods.packllm_perplexity_wagers import PackLLMPerplexityWagers
 from wagering.methods.factory import load_wagering_method
 from wagering.methods.route_llm_bert import RouteLLMBertWagers
 from wagering.methods.router_dc import RouterDCWagers
-from wagering.methods.nirt_router import NIRTRouterWagers
 from wagering.aggregation import LinearPooling
 from wagering.training import WageringTrainer
 from wagering.training.trainer import compute_meta_metrics
@@ -224,7 +221,6 @@ class TestRouteLLMBertWagers:
         }
         m = load_wagering_method("route_llm_bert", num_models=2, config=config)
         assert isinstance(m, RouteLLMBertWagers)
-        assert m.requires_hidden_states is False
 
         m.train_mode()
         batch_size = 2
@@ -281,7 +277,6 @@ class TestRouterDCWagers:
         }
         m = load_wagering_method("router_dc", num_models=2, config=config)
         assert isinstance(m, RouterDCWagers)
-        assert m.requires_hidden_states is False
         m_alias = load_wagering_method("routerDC", num_models=2, config=config)
         assert isinstance(m_alias, RouterDCWagers)
 
@@ -319,74 +314,6 @@ class TestRouterDCWagers:
         assert "expert_embeddings_state_dict" in state
         assert "scheduler_state_dict" in state
         m2 = load_wagering_method("routerdc", num_models=2, config=config)
-        m2.load_state_dict(state)
-        m2.eval_mode()
-
-
-class TestNIRTRouterWagers:
-    """NIRT-Router: neural IRT routing with model ability and query item parameters."""
-
-    def test_factory_compute_update_state_dict(self):
-        pytest.importorskip("transformers")
-        config = {
-            "encoder_model_name": "hf-internal-testing/tiny-random-bert",
-            "max_seq_length": 32,
-            "learning_rate": 1e-3,
-            "temperature": 1.0,
-            "grad_clip_norm": 1.0,
-            "freeze_encoder": True,
-            "device": "cpu",
-            "knowledge_dim": 8,
-            "model_embedding_dim": 16,
-            "router_hidden_dim": 32,
-            "lr_decay_factor": 1.0,
-            "lr_decay_steps": 10,
-            "mixture_ce_weight": 0.1,
-        }
-        m = load_wagering_method("nirt_router", num_models=2, config=config)
-        assert isinstance(m, NIRTRouterWagers)
-        assert m.requires_hidden_states is False
-
-        m_alias = load_wagering_method("irt_router", num_models=2, config=config)
-        assert isinstance(m_alias, NIRTRouterWagers)
-
-        m.train_mode()
-        batch_size = 2
-        num_models = 2
-        num_options = 2
-        questions = ["Question: test one?", "Question: test two?"]
-        model_logits = np.random.randn(batch_size, num_models, num_options).astype(np.float32)
-        gold_label = np.array([0, 1], dtype=np.int64)
-
-        res = m.compute_wagers(questions=questions, model_logits=model_logits)
-        w = res["wagers"]
-        assert w.shape == (batch_size, num_models)
-        assert np.allclose(w.sum(axis=1), 1.0, atol=1e-5)
-
-        max_logits = np.max(model_logits, axis=2, keepdims=True)
-        stabilized = model_logits - max_logits
-        model_probs = np.exp(stabilized) / (np.sum(np.exp(stabilized), axis=2, keepdims=True) + 1e-20)
-        agg = np.ones((batch_size, num_options), dtype=np.float32) * 0.5
-        pred = np.zeros(batch_size, dtype=np.int64)
-
-        info = m.update(
-            aggregated_probs=agg,
-            aggregated_pred=pred,
-            gold_label=gold_label,
-            model_probs=model_probs,
-            model_logits=model_logits,
-        )
-        assert "loss" in info
-        assert np.isfinite(info["loss"])
-        assert info["batch_size"] == batch_size
-
-        state = m.state_dict()
-        assert "model_embeddings_state_dict" in state
-        assert "k_difficulty_state_dict" in state
-        assert "prednet_full3_state_dict" in state
-        assert "scheduler_state_dict" in state
-
-        m2 = load_wagering_method("nirt", num_models=2, config=config)
         m2.load_state_dict(state)
         m2.eval_mode()
 
@@ -436,136 +363,6 @@ class TestMetaMetrics:
         # One concordant and zero discordant out of 3 total model pairs.
         assert metrics["kendall_tau"] == pytest.approx(1.0 / 3.0, abs=1e-9)
         assert metrics["best_model_mrr"] == pytest.approx(1.0, abs=1e-9)
-
-
-class TestKLUniformWagers:
-    """KL-to-uniform inference-only wagering method."""
-
-    def test_factory_and_aliases(self):
-        m = load_wagering_method("kl_uniform_wagers", num_models=3)
-        assert isinstance(m, KLUniformWagers)
-        assert m.requires_hidden_states is False
-
-        m_alias = load_wagering_method("kl_uniform", num_models=3)
-        assert isinstance(m_alias, KLUniformWagers)
-
-    def test_single_sample_wagers_follow_confidence(self):
-        m = KLUniformWagers(num_models=3)
-        # Model 0: near uniform, Model 1: somewhat confident, Model 2: very confident.
-        logits = np.array(
-            [
-                [0.0, 0.0, 0.0, 0.0],
-                [2.0, 0.0, 0.0, 0.0],
-                [8.0, 0.0, 0.0, 0.0],
-            ],
-            dtype=np.float32,
-        )
-
-        w = m.compute_wagers(model_logits=logits)["wagers"]
-        assert w.shape == (3,)
-        assert np.all(w >= 0.0)
-        assert np.allclose(w.sum(), 1.0, atol=1e-6)
-        assert w[2] > w[1] > w[0]
-
-    def test_batch_mode_shape_and_normalization(self):
-        m = KLUniformWagers(num_models=2)
-        logits = np.array(
-            [
-                [[0.0, 0.0], [2.0, 0.0]],
-                [[4.0, 0.0], [0.0, 0.0]],
-            ],
-            dtype=np.float32,
-        )
-
-        w = m.compute_wagers(model_logits=logits)["wagers"]
-        assert w.shape == (2, 2)
-        assert np.all(w >= 0.0)
-        assert np.allclose(w.sum(axis=1), 1.0, atol=1e-6)
-
-    def test_missing_logits_falls_back_to_uniform(self):
-        m = KLUniformWagers(num_models=4)
-        w = m.compute_wagers(model_logits=None)["wagers"]
-        assert w.shape == (4,)
-        assert np.allclose(w, 0.25)
-
-    def test_update_is_noop(self):
-        m = KLUniformWagers(num_models=2)
-        info = m.update(
-            aggregated_probs=np.array([[0.5, 0.5]], dtype=np.float32),
-            aggregated_pred=np.array([0], dtype=np.int64),
-            gold_label=np.array([0], dtype=np.int64),
-            model_probs=np.array([[[0.5, 0.5], [0.5, 0.5]]], dtype=np.float32),
-            model_logits=np.array([[[0.0, 0.0], [0.0, 0.0]]], dtype=np.float32),
-        )
-        assert info == {}
-
-
-class TestPackLLMPerplexityWagers:
-    """PackLLM-style inverse-perplexity inference-only wagering method."""
-
-    def test_factory_and_aliases(self):
-        m = load_wagering_method("packllm_perplexity_wagers", num_models=3)
-        assert isinstance(m, PackLLMPerplexityWagers)
-        assert m.requires_hidden_states is False
-
-        m_alias = load_wagering_method("packllm_sim", num_models=3)
-        assert isinstance(m_alias, PackLLMPerplexityWagers)
-
-    def test_explicit_perplexities_lower_is_higher_wager(self):
-        m = PackLLMPerplexityWagers(num_models=3)
-        ppl = np.array([12.0, 4.0, 2.0], dtype=np.float32)
-        w = m.compute_wagers(model_perplexities=ppl)["wagers"]
-
-        assert w.shape == (3,)
-        assert np.all(w >= 0.0)
-        assert np.allclose(w.sum(), 1.0, atol=1e-6)
-        assert w[2] > w[1] > w[0]
-
-    def test_batch_mode_from_explicit_perplexities(self):
-        m = PackLLMPerplexityWagers(num_models=2)
-        ppl = np.array(
-            [
-                [2.0, 8.0],
-                [10.0, 2.0],
-            ],
-            dtype=np.float32,
-        )
-        w = m.compute_wagers(model_perplexities=ppl)["wagers"]
-
-        assert w.shape == (2, 2)
-        assert np.all(w >= 0.0)
-        assert np.allclose(w.sum(axis=1), 1.0, atol=1e-6)
-        assert w[0, 0] > w[0, 1]
-        assert w[1, 1] > w[1, 0]
-
-    def test_missing_perplexities_with_logits_raises_error(self):
-        m = PackLLMPerplexityWagers(num_models=3)
-        logits = np.array(
-            [
-                [0.0, 0.0, 0.0, 0.0],
-                [2.0, 0.0, 0.0, 0.0],
-                [8.0, 0.0, 0.0, 0.0],
-            ],
-            dtype=np.float32,
-        )
-        with pytest.raises(ValueError, match="requires `model_perplexities`"):
-            m.compute_wagers(model_logits=logits)
-
-    def test_missing_inputs_raises_error(self):
-        m = PackLLMPerplexityWagers(num_models=4)
-        with pytest.raises(ValueError, match="requires `model_perplexities`"):
-            m.compute_wagers(model_logits=None)
-
-    def test_update_is_noop(self):
-        m = PackLLMPerplexityWagers(num_models=2)
-        info = m.update(
-            aggregated_probs=np.array([[0.5, 0.5]], dtype=np.float32),
-            aggregated_pred=np.array([0], dtype=np.int64),
-            gold_label=np.array([0], dtype=np.int64),
-            model_probs=np.array([[[0.5, 0.5], [0.5, 0.5]]], dtype=np.float32),
-            model_logits=np.array([[[0.0, 0.0], [0.0, 0.0]]], dtype=np.float32),
-        )
-        assert info == {}
 
 
 if __name__ == "__main__":
