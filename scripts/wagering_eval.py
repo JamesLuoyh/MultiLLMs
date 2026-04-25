@@ -137,12 +137,18 @@ def main(
     # Load test datasets
     # Keep eval dataset composition stable across shuffle-seed sweeps.
     dataset_split_seed = int(args.get("dataset_split_seed", 42))
+    sst = bool(args.get("shared_source_tripartition", False))
+    tr_peer = args.get("datasets") or None
     test_datasets = []
     if "test_datasets" in args:
         test_ds, test_names = load_datasets_from_config(
             args["test_datasets"],
             split="test",
             random_seed=dataset_split_seed,
+            shared_source_tripartition=sst,
+            tripartition_peer_dataset_configs=tr_peer,
+            infer_eval_split_train_without_peer=False,
+            force_shared_source_tripartition=sst,
         )
         test_datasets = [(ds, name) for ds, name in zip(test_ds, test_names)]
 
@@ -153,6 +159,9 @@ def main(
             args["ood_datasets"],
             split="test",
             random_seed=dataset_split_seed,
+            shared_source_tripartition=sst,
+            tripartition_peer_dataset_configs=tr_peer,
+            infer_eval_split_train_without_peer=False,
         )
         ood_datasets.extend((ds, name) for ds, name in zip(ood_ds, ood_names))
     elif "ood_dataset" in args and args["ood_dataset"]:
@@ -161,6 +170,9 @@ def main(
             ood_configs,
             split="test",
             random_seed=dataset_split_seed,
+            shared_source_tripartition=sst,
+            tripartition_peer_dataset_configs=tr_peer,
+            infer_eval_split_train_without_peer=False,
         )
         ood_datasets.extend((ds, name) for ds, name in zip(ood_ds, ood_names))
 

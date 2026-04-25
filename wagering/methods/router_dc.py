@@ -59,7 +59,8 @@ class RouterDCWagers(WageringMethod):
         self.grad_clip_norm = float(cfg.get("grad_clip_norm", 1.0))
         self.weight_decay = float(cfg.get("weight_decay", 0.01))
         self.freeze_encoder = bool(cfg.get("freeze_encoder", False))
-        self.pubmedqa_strip_context = bool(cfg.get("pubmedqa_strip_context", True))
+        # Default to keeping context (caller can disable it explicitly).
+        self.pubmedqa_strip_context = bool(cfg.get("pubmedqa_strip_context", False))
         self.similarity_function = str(cfg.get("similarity_function", "cos")).lower()
         if self.similarity_function not in ("cos", "dot"):
             raise ValueError("similarity_function must be 'cos' or 'dot'")
@@ -78,11 +79,24 @@ class RouterDCWagers(WageringMethod):
 
         self.lr_decay_factor = float(cfg.get("lr_decay_factor", 1.0))
         self.lr_decay_steps = int(cfg.get("lr_decay_steps", 100))
+        # Optional stability knobs.
+        self.encoder_lr_mult = float(cfg.get("encoder_lr_mult", 1.0))
+        if not np.isfinite(self.encoder_lr_mult) or self.encoder_lr_mult <= 0.0:
+            raise ValueError("encoder_lr_mult must be finite and > 0 for router_dc")
+        self.expert_weight_decay = float(cfg.get("expert_weight_decay", self.weight_decay))
+        self.max_grad_norm_before_skip = float(cfg.get("max_grad_norm_before_skip", 1.0e6))
+        if not np.isfinite(self.max_grad_norm_before_skip) or self.max_grad_norm_before_skip <= 0.0:
+            raise ValueError("max_grad_norm_before_skip must be finite and > 0 for router_dc")
 
         self.device_str = str(cfg.get("device", "cuda" if torch.cuda.is_available() else "cpu"))
         self.device = torch.device(self.device_str)
 
         self.hidden_state_layers = cfg.get("hidden_state_layers", [-1])
+        # When pubmedqa_strip_context is False, we build one encoder embedding per model prompt
+        # (context/no-context variants) and concatenate them in model order.
+        self.concat_prompt_embeddings = not self.pubmedqa_strip_context
+        # Used by trainer/evaluator to decide whether to pass per-model prompt variants.
+        self.expects_per_model_router_prompts = True
 
         self.tokenizer = AutoTokenizer.from_pretrained(
             self.encoder_model_name, truncation_side="left", padding=True
@@ -90,8 +104,9 @@ class RouterDCWagers(WageringMethod):
         self.encoder = AutoModel.from_pretrained(self.encoder_model_name).to(self.device)
         hidden_size = int(self.encoder.config.hidden_size)
 
+        expert_dim = hidden_size * num_models if self.concat_prompt_embeddings else hidden_size
         std_dev = float(cfg.get("expert_embedding_std", 0.78))
-        self.expert_embeddings = torch.nn.Embedding(num_models, hidden_size).to(self.device)
+        self.expert_embeddings = torch.nn.Embedding(num_models, expert_dim).to(self.device)
         with torch.no_grad():
             torch.nn.init.normal_(self.expert_embeddings.weight, mean=0.0, std=std_dev)
 
@@ -100,11 +115,24 @@ class RouterDCWagers(WageringMethod):
                 p.requires_grad = False
             self.encoder.eval()
 
-        trainable: List[torch.nn.Parameter] = list(self.expert_embeddings.parameters())
+        # Use param groups so the encoder LR can be tuned separately.
+        optimizer_param_groups: List[Dict[str, Any]] = [
+            {
+                "params": list(self.expert_embeddings.parameters()),
+                "lr": self.learning_rate,
+                "weight_decay": self.expert_weight_decay,
+            }
+        ]
         if not self.freeze_encoder:
-            trainable.extend(list(self.encoder.parameters()))
+            optimizer_param_groups.append(
+                {
+                    "params": list(self.encoder.parameters()),
+                    "lr": self.learning_rate * self.encoder_lr_mult,
+                    "weight_decay": self.weight_decay,
+                }
+            )
 
-        self.optimizer = torch.optim.AdamW(trainable, lr=self.learning_rate, weight_decay=self.weight_decay)
+        self.optimizer = torch.optim.AdamW(optimizer_param_groups)
         self.scheduler = torch.optim.lr_scheduler.StepLR(
             self.optimizer,
             step_size=max(1, self.lr_decay_steps),
@@ -160,6 +188,54 @@ class RouterDCWagers(WageringMethod):
         hidden = outputs.last_hidden_state[:, 0, :]
         return hidden
 
+    def _encode_questions_per_model_batch(self, questions_per_model: List[List[str]]) -> torch.Tensor:
+        """
+        Encode per-model prompt variants, then concatenate embeddings in model order.
+
+        questions_per_model: list length M, each element is a list of B strings.
+        returns: [B, M*H] (or [B, H] if concat_prompt_embeddings is False).
+        """
+        if not isinstance(questions_per_model, list) or len(questions_per_model) != self.num_models:
+            raise ValueError(
+                "router_dc expects questions_per_model as a list of length num_models "
+                f"(expected {self.num_models})."
+            )
+        batch_size = len(questions_per_model[0]) if self.num_models > 0 else 0
+        for mi, prompts in enumerate(questions_per_model):
+            if len(prompts) != batch_size:
+                raise ValueError(
+                    "router_dc questions_per_model batch mismatch: "
+                    f"model_index={mi}, len={len(prompts)}, expected={batch_size}"
+                )
+
+        if not self.concat_prompt_embeddings:
+            # Use model 0 prompts as the single router prompt stream.
+            return self._encode_questions_batch(list(questions_per_model[0]))
+
+        # Deduplicate by prompt text to save encoder calls.
+        flat_prompts: List[str] = []
+        for mi in range(self.num_models):
+            flat_prompts.extend([str(p) for p in questions_per_model[mi]])
+        unique_prompts: List[str] = []
+        index_by_prompt: Dict[str, int] = {}
+        for p in flat_prompts:
+            if p in index_by_prompt:
+                continue
+            index_by_prompt[p] = len(unique_prompts)
+            unique_prompts.append(p)
+
+        unique_emb = self._encode_questions_batch(unique_prompts)  # [U, H]
+        # Reconstruct per-model embeddings and concatenate in model order.
+        per_model_emb: List[torch.Tensor] = []
+        for mi in range(self.num_models):
+            idx = torch.as_tensor(
+                [index_by_prompt[str(p)] for p in questions_per_model[mi]],
+                device=self.device,
+                dtype=torch.long,
+            )
+            per_model_emb.append(unique_emb.index_select(0, idx))  # [B, H]
+        return torch.cat(per_model_emb, dim=1)  # [B, M*H]
+
     def _compute_similarity(self, query_emb: torch.Tensor) -> torch.Tensor:
         """query_emb: [B, H], returns logits [B, M] before temperature scaling."""
         expert_w = self.expert_embeddings.weight  # [M, H]
@@ -186,7 +262,15 @@ class RouterDCWagers(WageringMethod):
                 "RouterDCWagers.compute_wagers() requires `questions` (batch of prompt strings)."
             )
 
-        query_emb = self._encode_questions_batch(questions)
+        questions_per_model = kwargs.get("questions_per_model", None)
+        if questions_per_model is not None:
+            query_emb = self._encode_questions_per_model_batch(questions_per_model)
+        elif self.concat_prompt_embeddings:
+            # Fallback: replicate the same prompt stream across models.
+            replicated = [list(questions) for _ in range(self.num_models)]
+            query_emb = self._encode_questions_per_model_batch(replicated)
+        else:
+            query_emb = self._encode_questions_batch(questions)
         self.expert_embeddings.train() if self._training else self.expert_embeddings.eval()
 
         with torch.set_grad_enabled(self._training):
@@ -320,17 +404,24 @@ class RouterDCWagers(WageringMethod):
             logger.warning("[router_dc] Non-finite gradients detected; skipping optimizer step")
             self.optimizer.zero_grad(set_to_none=True)
         else:
-            torch.nn.utils.clip_grad_norm_(trainable_params, self.grad_clip_norm)
-            self.optimizer.step()
-            self.scheduler.step()
+            grad_norm = torch.nn.utils.clip_grad_norm_(trainable_params, self.grad_clip_norm)
+            if not torch.isfinite(grad_norm) or float(grad_norm) > self.max_grad_norm_before_skip:
+                logger.warning(
+                    "[router_dc] Abnormal grad norm (%.4e) detected; skipping optimizer step",
+                    float(grad_norm) if torch.isfinite(grad_norm) else float("nan"),
+                )
+                self.optimizer.zero_grad(set_to_none=True)
+            else:
+                self.optimizer.step()
+                self.scheduler.step()
 
-            # Fail fast if optimizer produced invalid parameters (common with unstable Adam updates).
-            for p in trainable_params:
-                if not torch.isfinite(p).all():
-                    raise RuntimeError(
-                        "router_dc parameters became non-finite after optimizer step; "
-                        "consider reducing learning_rate / grad_clip_norm"
-                    )
+                # Fail fast if optimizer produced invalid parameters (common with unstable Adam updates).
+                for p in trainable_params:
+                    if not torch.isfinite(p).all():
+                        raise RuntimeError(
+                            "router_dc parameters became non-finite after optimizer step; "
+                            "consider reducing learning_rate / grad_clip_norm"
+                        )
 
         batch_aggregated_probs = LinearPooling.aggregate_torch(model_logits_tensor, wagers)
         batch_aggregated_probs_np = batch_aggregated_probs.detach().cpu().numpy()

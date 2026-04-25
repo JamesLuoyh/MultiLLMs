@@ -68,6 +68,8 @@ DEFAULT_AGGREGATE_METRICS = [
     "kendall_tau",
     "best_model_mrr",
     "ece",
+    "inverse_hhi",
+    "avg_inference_time_per_batch_s",
 ]
 
 # Printed as (value * scale); e.g. accuracy 0.76 -> "76.12" with scale 100.

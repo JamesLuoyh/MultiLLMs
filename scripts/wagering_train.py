@@ -164,23 +164,30 @@ def main(config_path: Optional[str] = None, calibration_path: Optional[str] = No
         args["datasets"],
         split="train",
         random_seed=dataset_split_seed,
+        shared_source_tripartition=bool(args.get("shared_source_tripartition", False)),
+        tripartition_peer_dataset_configs=args.get("test_datasets") or None,
     )
     log.info(f"Loaded {len(train_datasets)} training datasets: {dataset_names}")
 
     validation_split_ratio = args.get("validation_split_ratio", 0.1)
-    pubmedqa_val_split_ratio = None
+    derived_val_split_ratio = None
     for dataset in train_datasets:
         ratio = getattr(dataset, "pubmedqa_train_val_split_ratio", None)
         if ratio is not None:
-            pubmedqa_val_split_ratio = float(ratio)
+            derived_val_split_ratio = float(ratio)
             break
-    if pubmedqa_val_split_ratio is not None and abs(validation_split_ratio - pubmedqa_val_split_ratio) > 1e-12:
+        ratio = getattr(dataset, "source_tripartition_val_ratio", None)
+        if ratio is not None and len(train_datasets) == 1:
+            derived_val_split_ratio = float(ratio)
+            break
+    if derived_val_split_ratio is not None and abs(validation_split_ratio - derived_val_split_ratio) > 1e-12:
         log.info(
-            "Overriding validation_split_ratio from %.4f to %.4f to enforce PubMedQA 6:2:2 train:val:test split.",
+            "Overriding validation_split_ratio from %.4f to %.4f to match disjoint train/val "
+            "partitioning (e.g. shared-source tripartition 8:1:1 or PubMedQA balanced splits).",
             float(validation_split_ratio),
-            float(pubmedqa_val_split_ratio),
+            float(derived_val_split_ratio),
         )
-        validation_split_ratio = pubmedqa_val_split_ratio
+        validation_split_ratio = derived_val_split_ratio
 
     # For PubMedQA mixed-context prompts, assign context on a balanced randomized
     # per-example basis across model indices.

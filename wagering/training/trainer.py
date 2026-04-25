@@ -37,6 +37,7 @@ from wagering.utils.multi_llm_ensemble import (
     get_cached_logits_and_hidden_states_for_model,
     resolve_hidden_state_layers_for_model,
     set_cached_logits_and_hidden_states_for_model,
+    _get_mixed_context_dataset_type,
 )
 
 log = logging.getLogger("wagering")
@@ -327,6 +328,48 @@ def compute_meta_metrics(
     }
 
 
+def compute_normalized_wager_probability_stats(
+    wagers: np.ndarray,
+    brier_best_model_ids: np.ndarray,
+) -> Dict[str, Any]:
+    """
+    Summary stats for wager weights normalized to a probability simplex (w / sum w),
+    matching LinearPooling / LogarithmicPooling.
+
+    Args:
+        wagers: [num_examples, num_models] non-negative wagers with positive row sums.
+        brier_best_model_ids: [num_examples] index of the lowest per-example multiclass
+            Brier score among experts (same tie-break as ``np.argmin`` on Brier).
+
+    Returns:
+        Per-model mean/variance of normalized wager mass across examples, and mean/variance
+        of the normalized wager placed on the Brier-best expert on each example.
+    """
+    w = np.asarray(wagers, dtype=np.float64)
+    best_ids = np.asarray(brier_best_model_ids, dtype=np.int64)
+    if w.ndim != 2:
+        raise ValueError(f"wagers must be 2D [N, M], got shape {w.shape}")
+    if best_ids.ndim != 1 or best_ids.shape[0] != w.shape[0]:
+        raise ValueError(
+            "brier_best_model_ids must be shape [N] matching wagers rows "
+            f"got {best_ids.shape} vs N={w.shape[0]}"
+        )
+    row_sums = w.sum(axis=1, keepdims=True)
+    if np.any(row_sums <= 1e-10):
+        raise ValueError("Each row of wagers must have positive sum for normalization")
+    norm = w / row_sums
+    per_mean = norm.mean(axis=0)
+    per_var = norm.var(axis=0, ddof=0)
+    n = norm.shape[0]
+    at_best = norm[np.arange(n, dtype=np.int64), best_ids]
+    return {
+        "wager_prob_mean_per_model": [float(x) for x in per_mean.tolist()],
+        "wager_prob_var_per_model": [float(x) for x in per_var.tolist()],
+        "brier_best_wager_prob_mean": float(np.mean(at_best)),
+        "brier_best_wager_prob_var": float(np.var(at_best, ddof=0)),
+    }
+
+
 class WageringTrainer:
     """
     Trainer for multi-LLM wagering methods.
@@ -491,6 +534,7 @@ class WageringTrainer:
             getattr(self.wagering_method, "requires_model_perplexities", False)
         )
         self._router_concatenated_prompts_by_dataset: Dict[int, List[str]] = {}
+        self._router_prompts_per_model_by_dataset: Dict[int, List[List[str]]] = {}
         
         if self.checkpoint_dir:
             self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -978,6 +1022,76 @@ class WageringTrainer:
 
         return router_questions
 
+    def _get_router_questions_per_model_for_batch(
+        self,
+        base_questions: List[str],
+        batch_start: int,
+        batch_end: int,
+        *,
+        validation: bool,
+    ) -> Optional[List[List[str]]]:
+        """
+        Return per-model prompt variants for mixed-context datasets (PubMedQA/RACE and
+        CSV datasets configured with mixed_context_routing=pubmedqa).
+
+        Output format: list length num_models; each element is a list of batch_size prompt strings.
+        """
+        if not bool(getattr(self.wagering_method, "expects_per_model_router_prompts", False)):
+            return None
+
+        if validation:
+            dataset_indices = getattr(self, "validation_dataset_indices", None)
+            local_indices = getattr(self, "validation_example_local_indices", None)
+        else:
+            dataset_indices = getattr(self, "dataset_indices", None)
+            local_indices = getattr(self, "example_local_indices", None)
+
+        if dataset_indices is None or local_indices is None:
+            return None
+
+        batch_dataset_indices = np.asarray(dataset_indices[batch_start:batch_end], dtype=np.int32)
+        batch_local_indices = np.asarray(local_indices[batch_start:batch_end], dtype=np.int32)
+        if (
+            batch_dataset_indices.shape[0] != len(base_questions)
+            or batch_local_indices.shape[0] != len(base_questions)
+        ):
+            return None
+
+        num_models = len(self.models)
+        if num_models <= 0:
+            return None
+
+        out: List[List[str]] = [[] for _ in range(num_models)]
+        for row_idx, fallback_question in enumerate(base_questions):
+            dataset_idx = int(batch_dataset_indices[row_idx])
+            local_idx = int(batch_local_indices[row_idx])
+            if dataset_idx < 0 or dataset_idx >= len(self.datasets):
+                for mi in range(num_models):
+                    out[mi].append(fallback_question)
+                continue
+
+            ds = self.datasets[dataset_idx]
+            if _get_mixed_context_dataset_type(ds) is None:
+                for mi in range(num_models):
+                    out[mi].append(fallback_question)
+                continue
+
+            if dataset_idx not in self._router_prompts_per_model_by_dataset:
+                self._router_prompts_per_model_by_dataset[dataset_idx] = [
+                    get_model_specific_prompts(ds, model_index=mi) for mi in range(num_models)
+                ]
+
+            per_model_lists = self._router_prompts_per_model_by_dataset[dataset_idx]
+            if local_idx < 0 or local_idx >= len(per_model_lists[0]):
+                for mi in range(num_models):
+                    out[mi].append(fallback_question)
+                continue
+
+            for mi in range(num_models):
+                out[mi].append(per_model_lists[mi][local_idx])
+
+        return out
+
     def _apply_shuffling(self):
         """Apply shuffling to cached arrays and create train/validation splits.
         
@@ -988,10 +1102,30 @@ class WageringTrainer:
         - all_hidden_states (if exists)
         Then creates train/validation splits.
         """
+        contiguous_tri_split = (
+            len(self.datasets) == 1
+            and bool(getattr(self.datasets[0], "source_tripartition_contiguous_train_val", False))
+        )
+        tri_boundary = int(
+            getattr(self.datasets[0], "source_tripartition_train_val_boundary", 0) or 0
+        )
+
         if not self.shuffle_data:
             # No shuffling requested - just create train/validation splits in original order
             log.debug("Shuffling disabled - using original order")
             indices = np.arange(len(self.combined_dataset.x))
+        elif contiguous_tri_split and tri_boundary > 0:
+            rng = np.random.RandomState(self.shuffle_seed)
+            n = len(self.combined_dataset.x)
+            idx_train = rng.permutation(tri_boundary)
+            idx_val = tri_boundary + rng.permutation(max(n - tri_boundary, 0))
+            indices = np.concatenate([idx_train, idx_val]) if idx_val.size else idx_train
+            log.info(
+                "Shuffling within MedMCQA HF train partitions only (boundary=%d of %d examples; seed=%d)",
+                tri_boundary,
+                n,
+                int(self.shuffle_seed),
+            )
         else:
             # Generate shuffle indices
             rng = np.random.RandomState(self.shuffle_seed)
@@ -1033,9 +1167,13 @@ class WageringTrainer:
         log.debug(f"Creating train/validation split: validation_split_ratio={self.validation_split_ratio}, total_size={total_size}")
         
         if self.validation_split_ratio > 0 and self.validation_split_ratio < 1:
-            val_size = int(total_size * self.validation_split_ratio)
-            train_size = total_size - val_size
-            
+            if contiguous_tri_split and tri_boundary > 0:
+                train_size = tri_boundary
+                val_size = total_size - train_size
+            else:
+                val_size = int(total_size * self.validation_split_ratio)
+                train_size = total_size - val_size
+
             # Split the shuffled data
             train_x = shuffled_x[:train_size]
             train_y = shuffled_y[:train_size]
@@ -1603,6 +1741,12 @@ class WageringTrainer:
                 batch_end,
                 validation=True,
             )
+            batch_questions_per_model = self._get_router_questions_per_model_for_batch(
+                batch_questions,
+                batch_start,
+                batch_end,
+                validation=True,
+            )
             
             # Get hidden states for batch if available
             batch_hidden_states = None
@@ -1625,6 +1769,8 @@ class WageringTrainer:
                 "hidden_states_list": batch_hidden_states,
                 "questions": batch_questions,
             }
+            if batch_questions_per_model is not None:
+                wagering_kwargs["questions_per_model"] = batch_questions_per_model
             if self.method_requires_model_perplexities:
                 if self.validation_model_prompt_perplexities is None:
                     raise RuntimeError(
@@ -1845,6 +1991,12 @@ class WageringTrainer:
                     batch_end,
                     validation=True,
                 )
+                batch_questions_per_model = self._get_router_questions_per_model_for_batch(
+                    batch_questions,
+                    batch_start,
+                    batch_end,
+                    validation=True,
+                )
 
                 batch_hidden_states = None
                 if hasattr(self, 'all_val_hidden_states') and self.all_val_hidden_states is not None:
@@ -1866,6 +2018,8 @@ class WageringTrainer:
                     "hidden_states_list": batch_hidden_states,
                     "questions": batch_questions,
                 }
+                if batch_questions_per_model is not None:
+                    wagering_kwargs["questions_per_model"] = batch_questions_per_model
                 if self.method_requires_model_perplexities:
                     if self.validation_model_prompt_perplexities is None:
                         raise RuntimeError(
@@ -2414,6 +2568,12 @@ class WageringTrainer:
                     batch_end,
                     validation=False,
                 )
+                batch_questions_per_model = self._get_router_questions_per_model_for_batch(
+                    batch_questions,
+                    batch_start,
+                    batch_end,
+                    validation=False,
+                )
                 
                 # Get hidden states for batch if available
                 batch_hidden_states = None
@@ -2441,6 +2601,8 @@ class WageringTrainer:
                     "hidden_states_list": batch_hidden_states,
                     "questions": batch_questions,
                 }
+                if batch_questions_per_model is not None:
+                    wagering_kwargs["questions_per_model"] = batch_questions_per_model
                 if self.method_requires_model_perplexities:
                     if self.model_prompt_perplexities is None:
                         raise RuntimeError(

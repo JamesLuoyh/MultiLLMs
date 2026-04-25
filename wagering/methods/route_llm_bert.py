@@ -54,7 +54,8 @@ class RouteLLMBertWagers(WageringMethod):
         self.grad_clip_norm = float(cfg.get("grad_clip_norm", 1.0))
         self.weight_decay = float(cfg.get("weight_decay", 0.01))
         self.freeze_bert = bool(cfg.get("freeze_bert", False))
-        self.pubmedqa_strip_context = bool(cfg.get("pubmedqa_strip_context", True))
+        # Default to keeping context (caller can disable it explicitly).
+        self.pubmedqa_strip_context = bool(cfg.get("pubmedqa_strip_context", False))
         self.router_dropout_p = float(cfg.get("router_dropout", 0.1))
         self.ranking_loss_weight = float(cfg.get("ranking_loss_weight", 0.0))
         self.ranking_margin = float(cfg.get("ranking_margin", 0.1))
@@ -66,12 +67,15 @@ class RouteLLMBertWagers(WageringMethod):
 
         # Match centralized configs that pass hidden_state_layers for cache/trainer
         self.hidden_state_layers = cfg.get("hidden_state_layers", [-1])
+        self.concat_prompt_embeddings = not self.pubmedqa_strip_context
+        self.expects_per_model_router_prompts = True
 
         self.tokenizer = AutoTokenizer.from_pretrained(self.bert_model_name)
         self.bert = AutoModel.from_pretrained(self.bert_model_name).to(self.device)
         hidden_size = int(self.bert.config.hidden_size)
+        router_in_dim = hidden_size * num_models if self.concat_prompt_embeddings else hidden_size
         self.dropout = nn.Dropout(self.router_dropout_p)
-        self.router_head = nn.Linear(hidden_size, num_models).to(self.device)
+        self.router_head = nn.Linear(router_in_dim, num_models).to(self.device)
 
         if self.freeze_bert:
             for p in self.bert.parameters():
@@ -116,6 +120,45 @@ class RouteLLMBertWagers(WageringMethod):
             pooled = outputs.last_hidden_state[:, 0, :]
         return pooled
 
+    def _encode_questions_per_model_batch(self, questions_per_model: List[List[str]]) -> torch.Tensor:
+        if not isinstance(questions_per_model, list) or len(questions_per_model) != self.num_models:
+            raise ValueError(
+                "route_llm_bert expects questions_per_model as a list of length num_models "
+                f"(expected {self.num_models})."
+            )
+        batch_size = len(questions_per_model[0]) if self.num_models > 0 else 0
+        for mi, prompts in enumerate(questions_per_model):
+            if len(prompts) != batch_size:
+                raise ValueError(
+                    "route_llm_bert questions_per_model batch mismatch: "
+                    f"model_index={mi}, len={len(prompts)}, expected={batch_size}"
+                )
+
+        if not self.concat_prompt_embeddings:
+            return self._encode_questions_batch(list(questions_per_model[0]))
+
+        flat_prompts: List[str] = []
+        for mi in range(self.num_models):
+            flat_prompts.extend([str(p) for p in questions_per_model[mi]])
+        unique_prompts: List[str] = []
+        index_by_prompt: Dict[str, int] = {}
+        for p in flat_prompts:
+            if p in index_by_prompt:
+                continue
+            index_by_prompt[p] = len(unique_prompts)
+            unique_prompts.append(p)
+
+        unique_emb = self._encode_questions_batch(unique_prompts)  # [U, H]
+        per_model_emb: List[torch.Tensor] = []
+        for mi in range(self.num_models):
+            idx = torch.as_tensor(
+                [index_by_prompt[str(p)] for p in questions_per_model[mi]],
+                device=self.device,
+                dtype=torch.long,
+            )
+            per_model_emb.append(unique_emb.index_select(0, idx))
+        return torch.cat(per_model_emb, dim=1)
+
     def compute_wagers(
         self,
         questions: Optional[List[str]] = None,
@@ -131,7 +174,14 @@ class RouteLLMBertWagers(WageringMethod):
                 "RouteLLMBertWagers.compute_wagers() requires `questions` (batch of prompt strings)."
             )
 
-        pooled = self._encode_questions_batch(questions)
+        questions_per_model = kwargs.get("questions_per_model", None)
+        if questions_per_model is not None:
+            pooled = self._encode_questions_per_model_batch(questions_per_model)
+        elif self.concat_prompt_embeddings:
+            replicated = [list(questions) for _ in range(self.num_models)]
+            pooled = self._encode_questions_per_model_batch(replicated)
+        else:
+            pooled = self._encode_questions_batch(questions)
         self.router_head.train() if self._training else self.router_head.eval()
 
         with torch.set_grad_enabled(self._training):

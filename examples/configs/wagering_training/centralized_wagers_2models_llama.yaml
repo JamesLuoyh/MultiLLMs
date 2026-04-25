@@ -40,6 +40,7 @@ aggregation:
 # Common options
 option_tokens: ["A", "B", "C", "D"]
 
+
 # ============================================================================
 # TRAINING CONFIGURATION
 # ============================================================================
@@ -57,7 +58,7 @@ datasets:
 # Training parameters
 num_epochs: 50  # Default: 100 epochs
 # Base directory for checkpoints (unique subdirectory will be generated)
-checkpoint_base_dir: /common/users/yl2310/MultiLLMs/checkpoints
+checkpoint_base_dir: /research/projects/ecoai/yl2310/MultiLLMs/checkpoints
 save_every: 100  # Save checkpoint every 100 batches
 training_batch_size: 100  # Batch size for training loop (different from batch size for collecting hidden states)
 
@@ -83,6 +84,12 @@ wandb_name: centralized_wagers_linear_pooling
 # For testing, this will be set by the pipeline script automatically
 
 # Test datasets
+
+# When a training and test entry use the same HF ``name`` and the same split (e.g. both ``train``),
+# load that split once logically and partition 6:2:2 (train/val/held-out test) so eval does not
+# repeat training rows. Logits cache follows the *full* unpartitioned split.
+shared_source_tripartition: true
+
 _include_test_datasets:
   - datasets/mmlu_full.yaml
   - datasets/medmcqa.yaml
@@ -90,9 +97,9 @@ _include_test_datasets:
 # Override dataset-specific settings for evaluation
 test_datasets:
   - display_name: mmlu_full_test
-    eval_split: test
+    eval_split: auxiliary_train
   - display_name: medmcqa_test
-    eval_split: validation  # MedMCQA test split has no labels, use validation
+    eval_split: train
 
 # OOD dataset
 _include_ood_datasets:

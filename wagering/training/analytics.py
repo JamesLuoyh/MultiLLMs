@@ -250,6 +250,13 @@ class WageringAnalytics:
             row["brier"] = results.get("brier") if results.get("brier") is not None and not np.isnan(results.get("brier", np.nan)) else None
             row["auc"] = results.get("auc") if results.get("auc") is not None and not np.isnan(results.get("auc", np.nan)) else None
             row["ece"] = results.get("ece") if results.get("ece") is not None and not np.isnan(results.get("ece", np.nan)) else None
+            row["inverse_hhi"] = results.get("inverse_hhi") if results.get("inverse_hhi") is not None and not np.isnan(results.get("inverse_hhi", np.nan)) else None
+            row["avg_inference_time_per_batch_s"] = (
+                results.get("avg_inference_time_per_batch_s")
+                if results.get("avg_inference_time_per_batch_s") is not None
+                and not np.isnan(results.get("avg_inference_time_per_batch_s", np.nan))
+                else None
+            )
             row["d_regret"] = results.get("d_regret") if results.get("d_regret") is not None and not np.isnan(results.get("d_regret", np.nan)) else None
             row["brier_d_regret"] = results.get("brier_d_regret") if results.get("brier_d_regret") is not None and not np.isnan(results.get("brier_d_regret", np.nan)) else None
             row["meta_acc"] = results.get("meta_acc") if results.get("meta_acc") is not None and not np.isnan(results.get("meta_acc", np.nan)) else None
@@ -257,6 +264,14 @@ class WageringAnalytics:
             row["meta_auc"] = results.get("meta_auc") if results.get("meta_auc") is not None and not np.isnan(results.get("meta_auc", np.nan)) else None
             row["kendall_tau"] = results.get("kendall_tau") if results.get("kendall_tau") is not None and not np.isnan(results.get("kendall_tau", np.nan)) else None
             row["best_model_mrr"] = results.get("best_model_mrr") if results.get("best_model_mrr") is not None and not np.isnan(results.get("best_model_mrr", np.nan)) else None
+            row["brier_best_wager_prob_mean"] = results.get("brier_best_wager_prob_mean")
+            row["brier_best_wager_prob_var"] = results.get("brier_best_wager_prob_var")
+            means = results.get("wager_prob_mean_per_model") or []
+            vars_ = results.get("wager_prob_var_per_model") or []
+            for i, val in enumerate(means):
+                row[f"wager_prob_mean_model_{i}"] = val
+            for i, val in enumerate(vars_):
+                row[f"wager_prob_var_model_{i}"] = val
             row["num_examples"] = results.get("num_examples")
         
         # Mark as evaluation results
@@ -312,9 +327,11 @@ class WageringAnalytics:
                 col for col in combined_df.columns
                 if (col.startswith('final_') or col in [
                     'accuracy', 'nll', 'brier', 'auc', 'ece', 'num_examples',
+                    'inverse_hhi', 'avg_inference_time_per_batch_s',
                     'd_regret', 'brier_d_regret', 'meta_acc', 'meta_nll', 'meta_auc',
                     'kendall_tau', 'best_model_mrr',
-                ])
+                    'brier_best_wager_prob_mean', 'brier_best_wager_prob_var',
+                ] or col.startswith('wager_prob_mean_model_') or col.startswith('wager_prob_var_model_'))
                 or (col not in settings_columns and pd.api.types.is_numeric_dtype(combined_df[col]))
             ]
         

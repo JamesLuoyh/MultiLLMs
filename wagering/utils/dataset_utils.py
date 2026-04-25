@@ -37,6 +37,14 @@ _DATASET_CONFIG_EPHEMERAL_KEYS = frozenset(
     }
 )
 
+# Strips from cache signatures for shared-source 6:2:2 view so on-disk cache matches
+# a plain load of the same HF split (no tripartition metadata in the key).
+_TRIPARTITION_EXCLUDED_CACHE_KEYS = frozenset(
+    {
+        "source_tripartition_ratios",
+    }
+)
+
 
 def datasets_for_checkpoint_hash(dataset_configs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Shallow copies of dataset dicts with training-only keys removed for stable directory hashes."""
@@ -97,6 +105,153 @@ def _build_dataset_cache_config_signature(
     }
 
 
+def _resolve_hf_identity_and_split(dataset_cfg: Dict[str, Any], *, load_split: str) -> Tuple[str, str]:
+    """
+    Resolve a stable HF identity + the exact HF split string used by ``Dataset.load`` for this cfg.
+
+    This mirrors the resolution logic in ``load_datasets_from_config`` (config_name +
+    actual_split selection) but does not load any data.
+    """
+    dataset_path = dataset_cfg.get("name")
+    if dataset_path is None:
+        return "", ""
+
+    is_pubmedqa = _is_pubmedqa_dataset_config(dataset_cfg)
+    is_race = _is_race_dataset_config(dataset_cfg)
+
+    if is_pubmedqa:
+        config_name = dataset_cfg.get(
+            "pubmedqa_source_config_name",
+            dataset_cfg.get(
+                "train_config_name",
+                dataset_cfg.get(
+                    "eval_config_name",
+                    dataset_cfg.get("config_name", "pqa_artificial"),
+                ),
+            ),
+        )
+        actual_split = dataset_cfg.get("pubmedqa_source_split", "train")
+    elif is_race:
+        config_name = dataset_cfg.get(
+            "race_source_config_name",
+            dataset_cfg.get(
+                "train_config_name",
+                dataset_cfg.get(
+                    "eval_config_name",
+                    dataset_cfg.get("config_name"),
+                ),
+            ),
+        )
+        actual_split = dataset_cfg.get(
+            "race_source_split",
+            dataset_cfg.get("train_split", dataset_cfg.get("eval_split", "test")),
+        )
+    elif str(load_split) == "train":
+        config_name = dataset_cfg.get("train_config_name", dataset_cfg.get("config_name"))
+        actual_split = dataset_cfg.get("train_split", "train")
+    else:
+        config_name = dataset_cfg.get(
+            "eval_config_name",
+            dataset_cfg.get("test_config_name", dataset_cfg.get("config_name")),
+        )
+        actual_split = dataset_cfg.get("eval_split", "test")
+
+    if isinstance(dataset_path, (list, tuple)) and dataset_path:
+        path0 = str(dataset_path[0])
+        cfg0 = str(dataset_path[1]) if len(dataset_path) > 1 else ""
+        hf_id = f"{path0},{cfg0}"
+    else:
+        hf_id = str(dataset_path)
+        if config_name:
+            hf_id = f"{hf_id},{str(config_name)}"
+
+    return hf_id, str(actual_split)
+
+
+def _shared_source_tripartition_peer_matched(
+    dataset_cfg: Dict[str, Any],
+    *,
+    load_split: str,
+    tripartition_peer_dataset_configs: Optional[Sequence[Dict[str, Any]]],
+    infer_eval_split_train_without_peer: bool,
+) -> bool:
+    """
+    True when shared-source 8:1:1 should apply.
+
+    Either an explicit training peer matches (same resolved HF identity and aligned split strings),
+    or (eval-only) ``infer_eval_split_train_without_peer`` is True, ``load_split`` is
+    ``test``, and ``eval_split`` is ``train`` (common when the official test split has
+    no labels and eval reuses HF ``train``).
+    """
+    h1, s1 = _resolve_hf_identity_and_split(dataset_cfg, load_split=str(load_split))
+    if not h1:
+        return False
+    if tripartition_peer_dataset_configs:
+        peer_split = "test" if str(load_split) == "train" else "train"
+        for peer in tripartition_peer_dataset_configs:
+            if not isinstance(peer, dict):
+                continue
+            h2, s2 = _resolve_hf_identity_and_split(peer, load_split=peer_split)
+            if not h2 or h1 != h2:
+                continue
+            if str(s1) == str(s2):
+                return True
+        return False
+    if infer_eval_split_train_without_peer and str(load_split) == "test":
+        return str(dataset_cfg.get("eval_split", "test")).lower() == "train"
+    return False
+
+
+def _build_tripartition_full_source_cache_config(
+    dataset_cfg: Dict[str, Any],
+    *,
+    cache_dataset_name: str,
+    resolved_path: Any,
+    resolved_huggingface_split: str,
+    resolved_config_name: Optional[str],
+    random_seed: Optional[int],
+) -> Dict[str, Any]:
+    """
+    Logits/hidden-states cache identity for the *full* HF source split, aligned with
+    a normal (non-tripartition) training load of that split in ``load_split: train`` mode.
+    """
+    for_sig: Dict[str, Any] = {}
+    for k, v in dataset_cfg.items():
+        if k in _DATASET_CONFIG_EPHEMERAL_KEYS or k in _TRIPARTITION_EXCLUDED_CACHE_KEYS:
+            continue
+        for_sig[k] = v
+    # Align with a normal training-stub config: a single train_split for the source HF split.
+    for_sig.pop("train_split", None)
+    for_sig.pop("eval_split", None)
+    for_sig["train_split"] = str(resolved_huggingface_split)
+    for_sig["display_name"] = str(cache_dataset_name)
+
+    signature_payload: Dict[str, Any] = {
+        "dataset_name": cache_dataset_name,
+        "load_split": "train",
+        "resolved_path": resolved_path,
+        "resolved_split": resolved_huggingface_split,
+        "resolved_config_name": resolved_config_name,
+        "dataset_target_split": None,
+        "split_seed": dataset_cfg.get("split_seed") if "split_seed" in dataset_cfg else None,
+        "dataset_config": for_sig,
+    }
+    if "split_seed" not in dataset_cfg:
+        signature_payload["runtime_random_seed"] = None
+    else:
+        signature_payload["runtime_random_seed"] = random_seed
+
+    normalized_payload = _stable_cache_value(signature_payload)
+    serialized = json.dumps(
+        normalized_payload, sort_keys=True, separators=(",", ":"), default=str
+    )
+    return {
+        "schema_version": 2,
+        "payload": normalized_payload,
+        "signature": hashlib.md5(serialized.encode("utf-8")).hexdigest(),
+    }
+
+
 def _is_pubmedqa_dataset_config(dataset_cfg: Dict[str, Any]) -> bool:
     """Return True when a dataset config targets PubMedQA."""
     fields = [
@@ -139,7 +294,7 @@ def calibration_dataset_configs_include_pubmedqa(dataset_configs: Sequence[Dict[
 
 def _normalize_pubmedqa_split_ratios(raw_ratios: Any) -> Tuple[float, float, float]:
     """Normalize PubMedQA split ratios to a valid (train, val, test) tuple."""
-    default_ratios = (0.6, 0.2, 0.2)
+    default_ratios = (0.8, 0.1, 0.1)
     if raw_ratios is None:
         return default_ratios
 
@@ -200,6 +355,42 @@ def _normalize_race_split_ratios(raw_ratios: Any) -> Tuple[float, float, float]:
     if np.any(ratio_array < 0) or not np.any(ratio_array > 0):
         log.warning(
             "Non-positive race_split_ratios=%s. Falling back to default ratios %s.",
+            raw_ratios,
+            default_ratios,
+        )
+        return default_ratios
+
+    ratio_array = ratio_array / ratio_array.sum()
+    return tuple(float(v) for v in ratio_array.tolist())
+
+
+def _normalize_shared_source_tripartition_ratios(raw_ratios: Any) -> Tuple[float, float, float]:
+    """Normalize shared-source tripartition ratios to a valid (train, val, test) tuple."""
+    default_ratios = (0.8, 0.1, 0.1)
+    if raw_ratios is None:
+        return default_ratios
+
+    if not isinstance(raw_ratios, Sequence) or len(raw_ratios) != 3:
+        log.warning(
+            "Invalid source_tripartition_ratios=%s. Falling back to default ratios %s.",
+            raw_ratios,
+            default_ratios,
+        )
+        return default_ratios
+
+    try:
+        ratio_array = np.array([float(v) for v in raw_ratios], dtype=np.float64)
+    except (TypeError, ValueError):
+        log.warning(
+            "Could not parse source_tripartition_ratios=%s. Falling back to default ratios %s.",
+            raw_ratios,
+            default_ratios,
+        )
+        return default_ratios
+
+    if np.any(ratio_array < 0) or not np.any(ratio_array > 0):
+        log.warning(
+            "Non-positive source_tripartition_ratios=%s. Falling back to default ratios %s.",
             raw_ratios,
             default_ratios,
         )
@@ -326,6 +517,134 @@ def _apply_race_split(
     log.info(
         "RACE deterministic split for %s: split=%s, seed=%d, source=%d, "
         "counts(train/val/test)=(%d/%d/%d), selected=%d",
+        dataset_name,
+        normalized_target,
+        int(split_seed),
+        int(total_examples),
+        train_count,
+        val_count,
+        test_count,
+        int(len(dataset.x)),
+    )
+
+    return dataset
+
+
+def _apply_shared_source_tripartition(
+    dataset: Dataset,
+    dataset_name: str,
+    target_split: str,
+    split_seed: int,
+    split_ratios: Tuple[float, float, float],
+    requested_size: Optional[int],
+) -> Dataset:
+    """
+    Deterministically partition a single loaded HF split into train/val/test (default 8:1:1),
+    with ``cache_source_row_indices`` mapping each view row to a row in the *full* source
+    (so option-logit caches can stay keyed as the unpartitioned split).
+    """
+    split_aliases = {
+        "train": "train",
+        "val": "validation",
+        "validation": "validation",
+        "test": "test",
+        "train_val": "train_val",
+        "train+val": "train_val",
+    }
+    normalized_target = split_aliases.get(str(target_split).strip().lower())
+    if normalized_target is None:
+        raise ValueError(
+            f"Unsupported shared-source tripartition target '{target_split}'. "
+            "Use one of: train, validation, test, train_val."
+        )
+
+    total_examples = len(dataset.x)
+    if total_examples <= 0:
+        raise ValueError(f"Dataset '{dataset_name}' is empty before tripartition")
+
+    rng = np.random.RandomState(int(split_seed))
+    all_indices = np.arange(total_examples, dtype=np.int64)
+    rng.shuffle(all_indices)
+
+    ratio_array = np.array(split_ratios, dtype=np.float64)
+    raw_counts = ratio_array * float(total_examples)
+    split_counts = np.floor(raw_counts).astype(np.int64)
+    remainder = int(total_examples - split_counts.sum())
+    if remainder > 0:
+        residual_order = np.argsort(-(raw_counts - split_counts))
+        for idx in residual_order[:remainder]:
+            split_counts[idx] += 1
+
+    train_count, val_count, test_count = [int(v) for v in split_counts.tolist()]
+
+    train_indices = np.array(all_indices[:train_count], copy=True)
+    val_start = train_count
+    val_end = train_count + val_count
+    val_indices = np.array(all_indices[val_start:val_end], copy=True)
+    test_indices = np.array(all_indices[val_end:], copy=True)
+
+    split_indices_map = {
+        "train": train_indices,
+        "validation": val_indices,
+        "test": test_indices,
+        "train_val": np.concatenate([train_indices, val_indices]),
+    }
+    selected_indices = np.array(split_indices_map[normalized_target], copy=True).astype(np.int64, copy=True)
+
+    preserve_contiguous = normalized_target == "train_val"
+    if not preserve_contiguous:
+        rng.shuffle(selected_indices)
+
+    if requested_size is not None:
+        requested_size_int = int(requested_size)
+        if requested_size_int <= 0:
+            raise ValueError(
+                f"Invalid size={requested_size_int} for shared-source tripartition on '{dataset_name}'."
+            )
+        if requested_size_int < selected_indices.shape[0]:
+            if preserve_contiguous:
+                log.warning(
+                    "Ignoring size=%d for '%s' train_val to preserve train|val contiguity.",
+                    requested_size_int,
+                    dataset_name,
+                )
+            else:
+                selected_indices = selected_indices[:requested_size_int].astype(
+                    np.int64, copy=True
+                )
+
+    as_list = [int(i) for i in selected_indices.tolist()]
+    dataset.select(as_list)
+    # Row i of the view reads/writes full-split cache at global row selected_indices[i].
+    dataset.cache_source_num_examples = int(total_examples)
+    dataset.cache_source_row_indices = selected_indices
+
+    dataset.source_tripartition_target = normalized_target
+    dataset.source_tripartition_split_seed = int(split_seed)
+    dataset.source_tripartition_split_ratios = tuple(float(v) for v in ratio_array.tolist())
+    dataset.source_tripartition_counts = {
+        "source_examples": int(total_examples),
+        "train_examples": train_count,
+        "validation_examples": val_count,
+        "test_examples": test_count,
+        "selected_examples": int(len(dataset.x)),
+    }
+
+    if preserve_contiguous:
+        dataset.source_tripartition_contiguous_train_val = True
+        dataset.source_tripartition_train_val_boundary = int(train_indices.shape[0])
+        tv = float(train_indices.shape[0] + val_indices.shape[0])
+        dataset.source_tripartition_val_ratio = (
+            float(val_indices.shape[0]) / tv if tv > 0 else 0.0
+        )
+    else:
+        dataset.source_tripartition_contiguous_train_val = False
+        dataset.source_tripartition_train_val_boundary = 0
+        dataset.source_tripartition_val_ratio = None
+
+    log.info(
+        "Shared-source 8:1:1 for %s: target=%s, seed=%d, source=%d, "
+        "counts(train/val/test)=(%d/%d/%d), view=%d",
         dataset_name,
         normalized_target,
         int(split_seed),
@@ -507,6 +826,10 @@ def load_datasets_from_config(
     dataset_configs: List[Dict[str, Any]],
     split: str = "train",
     random_seed: Optional[int] = None,
+    shared_source_tripartition: bool = False,
+    tripartition_peer_dataset_configs: Optional[Sequence[Dict[str, Any]]] = None,
+    infer_eval_split_train_without_peer: bool = False,
+    force_shared_source_tripartition: bool = False,
 ) -> Tuple[List[Dataset], List[str]]:
     """
     Load multiple datasets from configuration.
@@ -536,14 +859,27 @@ def load_datasets_from_config(
                             (default "train_val")
                         - pubmedqa_eval_target_split: PubMedQA target split for evaluation phase
                             (default "test")
-                        - pubmedqa_split_ratios: PubMedQA train/val/test ratios (default [0.6, 0.2, 0.2])
+                        - pubmedqa_split_ratios: PubMedQA train/val/test ratios (default [0.8, 0.1, 0.1])
                         - split_seed: Seed for deterministic PubMedQA splitting (optional)
+            - source_tripartition_ratios: optional (train, val, test) for shared-source 8:1:1
             - size: Number of examples to load (optional, loads all if None)
-                        - source_size: Source cap before PubMedQA split (optional)
+            - source_size: Source cap before PubMedQA split (optional)
             - load_from_disk: Whether to load from disk (optional, default False)
             - trust_remote_code: Whether to trust remote code (optional, default False)
+        shared_source_tripartition: When True and a training row matches a test row
+            (same ``name`` and the same train/eval split string), the HF source split is
+            partitioned 8:1:1. Logits cache keys follow the *unpartitioned* full split.
+        tripartition_peer_dataset_configs: The other side's dataset list (``test_datasets`` when
+            ``split`` is train, and ``datasets`` when ``split`` is test) for pair detection.
+        infer_eval_split_train_without_peer: When True and the peer list is empty, still apply
+            shared-source tripartition on ``split=test`` rows with ``eval_split: train`` so
+            eval-only configs align with training caches (OOD loads should pass False).
+        force_shared_source_tripartition: When True, apply shared-source 8:1:1 whenever
+            ``shared_source_tripartition`` is enabled (except PubMedQA/RACE). This is intended
+            for in-distribution evaluation configs that want test_datasets to always be the
+            held-out slice of an 8:1:1 partition, even without a training peer.
         split: Split to load ("train" or "test")
-                random_seed: Optional global seed used by split-sensitive dataset loaders.
+        random_seed: Optional global seed used by split-sensitive dataset loaders.
         
     Returns:
         Tuple of (list of Dataset instances, list of dataset names)
@@ -565,6 +901,20 @@ def load_datasets_from_config(
         is_pubmedqa = _is_pubmedqa_dataset_config(dataset_cfg)
         is_race = _is_race_dataset_config(dataset_cfg)
         requested_size = dataset_cfg.get("size", None)
+        is_shared_tripartition = (
+            bool(shared_source_tripartition)
+            and (
+                bool(force_shared_source_tripartition)
+                or _shared_source_tripartition_peer_matched(
+                    dataset_cfg,
+                    load_split=split,
+                    tripartition_peer_dataset_configs=tripartition_peer_dataset_configs,
+                    infer_eval_split_train_without_peer=bool(infer_eval_split_train_without_peer),
+                )
+            )
+            and not is_pubmedqa
+            and not is_race
+        )
 
         if is_pubmedqa:
             config_name = dataset_cfg.get(
@@ -618,6 +968,14 @@ def load_datasets_from_config(
             split_key = "eval_split"
             actual_split = dataset_cfg.get(split_key, split)
             dataset_target_split = None
+
+        shared_tripartition_target: Optional[str] = None
+        if is_shared_tripartition and split == "train":
+            shared_tripartition_target = "train_val"
+        elif is_shared_tripartition and split == "test":
+            shared_tripartition_target = "test"
+        else:
+            shared_tripartition_target = None
 
         if config_name and isinstance(dataset_path, str):
             dataset_path = [dataset_path, config_name]
@@ -699,17 +1057,77 @@ def load_datasets_from_config(
                     split_ratios=split_ratios,
                     requested_size=requested_size,
                 )
+            elif is_shared_tripartition and shared_tripartition_target is not None:
+                seed_candidate = dataset_cfg.get(
+                    "split_seed", random_seed if random_seed is not None else 42
+                )
+                try:
+                    split_seed = int(seed_candidate)
+                except (TypeError, ValueError) as e:
+                    raise ValueError(
+                        f"Invalid split_seed for shared-source tripartition on '{dataset_name}': {seed_candidate}"
+                    ) from e
+                raw_ratios = dataset_cfg.get("source_tripartition_ratios")
+                split_ratios = _normalize_shared_source_tripartition_ratios(raw_ratios)
+                dataset = _apply_shared_source_tripartition(
+                    dataset=dataset,
+                    dataset_name=dataset_name,
+                    target_split=str(shared_tripartition_target),
+                    split_seed=split_seed,
+                    split_ratios=split_ratios,
+                    requested_size=requested_size,
+                )
 
-            dataset.cache_dataset_config = _build_dataset_cache_config_signature(
-                dataset_cfg=dataset_cfg,
-                dataset_name=dataset_name,
-                load_split=split,
-                resolved_path=dataset_path,
-                resolved_split=actual_split,
-                resolved_config_name=config_name,
-                dataset_target_split=dataset_target_split,
-                random_seed=random_seed,
-            )
+            if is_shared_tripartition and shared_tripartition_target is not None:
+                def _display_or_slug(c: Dict[str, Any]) -> str:
+                    d = c.get("display_name")
+                    if d:
+                        return str(d).replace("/", "_").replace("[", "").replace("]", "")
+                    p = c.get("name", "")
+                    return str(p).replace("/", "_").replace("[", "").replace("]", "")
+
+                tripartition_cache_dataset_name = _display_or_slug(dataset_cfg)
+                if str(split) == "test" and tripartition_peer_dataset_configs:
+                    for peer in tripartition_peer_dataset_configs:
+                        h_peer, _ = _resolve_hf_identity_and_split(peer, load_split="train")
+                        h_self, _ = _resolve_hf_identity_and_split(dataset_cfg, load_split="test")
+                        if (
+                            isinstance(peer, dict)
+                            and h_peer
+                            and h_self
+                            and h_peer == h_self
+                        ):
+                            tripartition_cache_dataset_name = _display_or_slug(peer)
+                            break
+                elif str(split) == "test" and not tripartition_peer_dataset_configs:
+                    dn = dataset_cfg.get("display_name")
+                    if isinstance(dn, str) and dn.endswith("_test"):
+                        tripartition_cache_dataset_name = str(dn[:-5]).replace(
+                            "/", "_"
+                        ).replace("[", "").replace("]", "")
+                    else:
+                        tripartition_cache_dataset_name = _display_or_slug(
+                            {**dataset_cfg, "display_name": None}
+                        )
+                dataset.cache_dataset_config = _build_tripartition_full_source_cache_config(
+                    dataset_cfg,
+                    cache_dataset_name=tripartition_cache_dataset_name,
+                    resolved_path=dataset_path,
+                    resolved_huggingface_split=str(actual_split),
+                    resolved_config_name=config_name,
+                    random_seed=random_seed,
+                )
+            else:
+                dataset.cache_dataset_config = _build_dataset_cache_config_signature(
+                    dataset_cfg=dataset_cfg,
+                    dataset_name=dataset_name,
+                    load_split=split,
+                    resolved_path=dataset_path,
+                    resolved_split=actual_split,
+                    resolved_config_name=config_name,
+                    dataset_target_split=dataset_target_split,
+                    random_seed=random_seed,
+                )
             dataset.cache_dataset_name = dataset_name
             dataset.cache_dataset_split = actual_split
         except Exception as e:
@@ -734,6 +1152,11 @@ def load_datasets_from_config(
             log.info(
                 f"Loaded dataset {i+1}/{len(dataset_configs)}: {dataset_name} "
                 f"(source_split: {actual_split}, target_split: {dataset_target_split}, size: {len(dataset.x)})"
+            )
+        elif is_shared_tripartition and shared_tripartition_target is not None:
+            log.info(
+                f"Loaded dataset {i+1}/{len(dataset_configs)}: {dataset_name} "
+                f"(shared 8:1:1 of split {actual_split}, size: {len(dataset.x)})"
             )
         else:
             log.info(

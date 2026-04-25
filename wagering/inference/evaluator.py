@@ -5,6 +5,7 @@ Inference/evaluation pipeline for multi-LLM wagering methods.
 import logging
 import pickle
 import sys
+import time
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
 import numpy as np
@@ -28,6 +29,7 @@ from wagering.training.trainer import (
     compute_brier_dynamic_regret,
     compute_dynamic_regret,
     compute_meta_metrics,
+    compute_normalized_wager_probability_stats,
 )
 from wagering.aggregation.base import AggregationFunction
 from wagering.utils.multi_llm_ensemble import (
@@ -37,6 +39,7 @@ from wagering.utils.multi_llm_ensemble import (
     get_model_specific_prompts,
     get_cached_logits_and_hidden_states_for_model,
     set_cached_logits_and_hidden_states_for_model,
+    _get_mixed_context_dataset_type,
 )
 
 log = logging.getLogger("wagering")
@@ -520,6 +523,9 @@ class WageringEvaluator:
         all_predictions = []
         all_aggregated_probs = []
         wagers_history = []  # Track wagers for each example
+
+        # Per-batch inference timing (seconds) for compute_wagers + aggregation.
+        inference_times_s: List[float] = []
         
         # Running metrics for per-step logging
         running_correct = 0
@@ -538,6 +544,13 @@ class WageringEvaluator:
             
             # Get questions for batch (for wagering methods that need them)
             batch_questions = dataset.x[batch_start:batch_end]  # List of question strings
+            batch_questions_per_model = None
+            if bool(getattr(self.wagering_method, "expects_per_model_router_prompts", False)):
+                if _get_mixed_context_dataset_type(dataset) is not None:
+                    batch_questions_per_model = [
+                        get_model_specific_prompts(dataset, model_index=mi)[batch_start:batch_end]
+                        for mi in range(len(self.models))
+                    ]
             
             # Prepare hidden states for batch if available
             batch_hidden_states = None
@@ -559,11 +572,13 @@ class WageringEvaluator:
             if model_perplexities is not None:
                 wagering_kwargs["model_perplexities"] = model_perplexities[batch_start:batch_end]
 
+            t0 = time.perf_counter()
             res_dict = self.wagering_method.compute_wagers(
                 model_logits=batch_logits_transposed,
                 gold_label=batch_labels,
                 hidden_states_list=batch_hidden_states,
                 questions=batch_questions,
+                questions_per_model=batch_questions_per_model,
                 **wagering_kwargs,
             )  # [batch_size, num_models]
             batch_wagers = res_dict["wagers"]
@@ -571,6 +586,7 @@ class WageringEvaluator:
             batch_aggregated_log_probs, batch_aggregated_probs = self.aggregation_function.aggregate(
                 batch_logits_transposed, batch_wagers
             )  # [batch_size, num_options] each
+            inference_times_s.append(float(time.perf_counter() - t0))
             
             batch_predictions = np.argmax(batch_aggregated_probs, axis=1)  # [batch_size]
             
@@ -592,12 +608,26 @@ class WageringEvaluator:
             if self.wandb_logger:
                 log_prefix = "test" if not dataset_name.startswith("ood_") else "ood"
                 
+                # Inverse HHI (effective number of models) per example, then averaged over the batch.
+                # N_eff = (sum_i w_i)^2 / (sum_i w_i^2). For normalized weights, this is 1 / sum_i w_i^2.
+                try:
+                    w = np.asarray(batch_wagers, dtype=np.float64)
+                    sum_w = np.sum(w, axis=1)
+                    sum_w2 = np.sum(w * w, axis=1)
+                    with np.errstate(divide="ignore", invalid="ignore"):
+                        n_eff = np.divide(sum_w * sum_w, sum_w2)
+                    batch_inverse_hhi = float(np.nanmean(n_eff))
+                except Exception:
+                    batch_inverse_hhi = float("nan")
+
                 # Log batch average metrics
                 wandb_log_dict = {
                     f"{log_prefix}/{dataset_name}/batch/accuracy": float(np.mean(batch_correct)),
                     f"{log_prefix}/{dataset_name}/batch/nll": float(np.mean(batch_nll)),
                     f"{log_prefix}/{dataset_name}/batch/running_accuracy": running_accuracy,
                     f"{log_prefix}/{dataset_name}/batch/running_nll": running_nll,
+                    f"{log_prefix}/{dataset_name}/batch/inference_time_s": float(inference_times_s[-1]),
+                    f"{log_prefix}/{dataset_name}/batch/inverse_hhi": batch_inverse_hhi,
                 }
                 
                 # Add average wager statistics
@@ -619,6 +649,26 @@ class WageringEvaluator:
         all_predictions = np.array(all_predictions, dtype=np.int32)
         all_aggregated_probs = np.stack(all_aggregated_probs, axis=0)
         wagers_history = np.stack(wagers_history, axis=0)  # [num_examples, num_models]
+
+        # Effective number of models / inverse HHI over examples.
+        inverse_hhi = float("nan")
+        try:
+            w = np.asarray(wagers_history, dtype=np.float64)
+            sum_w = np.sum(w, axis=1)
+            sum_w2 = np.sum(w * w, axis=1)
+            with np.errstate(divide="ignore", invalid="ignore"):
+                n_eff = np.divide(sum_w * sum_w, sum_w2)
+            inverse_hhi = float(np.nanmean(n_eff))
+        except Exception as e:
+            log.warning("Could not compute inverse HHI: %s", e)
+
+        # Average inference time per batch in seconds (compute_wagers + aggregation).
+        avg_inference_time_per_batch_s = float("nan")
+        if inference_times_s:
+            try:
+                avg_inference_time_per_batch_s = float(np.mean(np.asarray(inference_times_s, dtype=np.float64)))
+            except Exception:
+                avg_inference_time_per_batch_s = float("nan")
         
         # Compute metrics
         accuracy = np.mean(all_predictions == labels)
@@ -683,6 +733,10 @@ class WageringEvaluator:
         meta_auc = None
         kendall_tau = None
         best_model_mrr = None
+        wager_prob_mean_per_model = None
+        wager_prob_var_per_model = None
+        brier_best_wager_prob_mean = None
+        brier_best_wager_prob_var = None
         try:
             # Get model logits in the right format [num_examples, num_models, num_options]
             model_logits = np.transpose(all_model_logits, (1, 0, 2))
@@ -704,6 +758,18 @@ class WageringEvaluator:
             meta_auc = meta_metrics["meta_auc"]
             kendall_tau = meta_metrics["kendall_tau"]
             best_model_mrr = meta_metrics["best_model_mrr"]
+
+            try:
+                brier_best_model_ids = np.argmin(model_brier_scores, axis=1)
+                wager_prob_stats = compute_normalized_wager_probability_stats(
+                    wagers_history, brier_best_model_ids
+                )
+                wager_prob_mean_per_model = wager_prob_stats["wager_prob_mean_per_model"]
+                wager_prob_var_per_model = wager_prob_stats["wager_prob_var_per_model"]
+                brier_best_wager_prob_mean = wager_prob_stats["brier_best_wager_prob_mean"]
+                brier_best_wager_prob_var = wager_prob_stats["brier_best_wager_prob_var"]
+            except Exception as e_wps:
+                log.warning("Could not compute normalized wager probability stats: %s", e_wps)
         except Exception as e:
             log.warning(f"Could not compute d_regret/meta metrics: {e}")
         
@@ -714,6 +780,8 @@ class WageringEvaluator:
             "aggregated_probs": all_aggregated_probs,
             "labels": labels,
             "wagers_history": wagers_history,
+            "inverse_hhi": inverse_hhi,
+            "avg_inference_time_per_batch_s": avg_inference_time_per_batch_s,
             "accuracy": accuracy,
             "nll": nll,
             "brier": brier,
@@ -726,6 +794,10 @@ class WageringEvaluator:
             "meta_auc": meta_auc,
             "kendall_tau": kendall_tau,
             "best_model_mrr": best_model_mrr,
+            "wager_prob_mean_per_model": wager_prob_mean_per_model,
+            "wager_prob_var_per_model": wager_prob_var_per_model,
+            "brier_best_wager_prob_mean": brier_best_wager_prob_mean,
+            "brier_best_wager_prob_var": brier_best_wager_prob_var,
         }
         
         brier_str = f"{brier:.4f}" if brier is not None and not np.isnan(brier) else "N/A"
@@ -744,6 +816,18 @@ class WageringEvaluator:
         avg_wagers = np.mean(wagers_history, axis=0)
         wager_info = ", ".join([f"Model {i}: {wager:.4f}" for i, wager in enumerate(avg_wagers)])
         log.info(f"{dataset_name} - Average Wagers: {wager_info}")
+        if wager_prob_mean_per_model is not None and wager_prob_var_per_model is not None:
+            n_models_wp = len(wager_prob_mean_per_model)
+            wp_parts = [
+                f"Model {i}: mean={wager_prob_mean_per_model[i]:.4f}, var={wager_prob_var_per_model[i]:.4f}"
+                for i in range(n_models_wp)
+            ]
+            log.info(f"{dataset_name} - Normalized wager prob (mean, var over examples): {', '.join(wp_parts)}")
+        if brier_best_wager_prob_mean is not None and brier_best_wager_prob_var is not None:
+            log.info(
+                f"{dataset_name} - Wager prob on Brier-best expert: "
+                f"mean={brier_best_wager_prob_mean:.4f}, var={brier_best_wager_prob_var:.4f}"
+            )
         
         # Create analytics dataframe for this evaluation
         training_datasets = self.metadata.get("training_datasets", [])
@@ -781,6 +865,8 @@ class WageringEvaluator:
             # Use global step counter to ensure final metrics appear after all batch metrics
             final_step = self._advance_wandb_step()
             metric_values = {
+                "inverse_hhi": inverse_hhi,
+                "avg_inference_time_per_batch_s": avg_inference_time_per_batch_s,
                 "accuracy": accuracy,
                 "nll": nll,
                 "brier": brier if brier is not None and not np.isnan(brier) else None,
@@ -793,6 +879,8 @@ class WageringEvaluator:
                 "meta_auc": meta_auc if meta_auc is not None and not np.isnan(meta_auc) else None,
                 "kendall_tau": kendall_tau if kendall_tau is not None and not np.isnan(kendall_tau) else None,
                 "best_model_mrr": best_model_mrr if best_model_mrr is not None and not np.isnan(best_model_mrr) else None,
+                "brier_best_wager_prob_mean": brier_best_wager_prob_mean,
+                "brier_best_wager_prob_var": brier_best_wager_prob_var,
             }
 
             primary_final_prefix = f"{log_prefix}/{dataset_name}/final"
@@ -806,6 +894,15 @@ class WageringEvaluator:
                 wager_value = float(avg_wager)
                 wandb_metrics[f"{primary_final_prefix}/avg_wager_model_{model_idx}"] = wager_value
                 wandb_metrics[f"{alias_final_prefix}/avg_wager_model_{model_idx}"] = wager_value
+
+            if wager_prob_mean_per_model is not None and wager_prob_var_per_model is not None:
+                for model_idx in range(len(wager_prob_mean_per_model)):
+                    m = float(wager_prob_mean_per_model[model_idx])
+                    v = float(wager_prob_var_per_model[model_idx])
+                    wandb_metrics[f"{primary_final_prefix}/wager_prob_mean_model_{model_idx}"] = m
+                    wandb_metrics[f"{alias_final_prefix}/wager_prob_mean_model_{model_idx}"] = m
+                    wandb_metrics[f"{primary_final_prefix}/wager_prob_var_model_{model_idx}"] = v
+                    wandb_metrics[f"{alias_final_prefix}/wager_prob_var_model_{model_idx}"] = v
             
             try:
                 final_plot_step = final_step + 1

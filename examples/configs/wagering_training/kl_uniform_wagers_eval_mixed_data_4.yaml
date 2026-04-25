@@ -6,7 +6,7 @@ _include_models:
   - models/llama3_aloe_8b_alpha.yaml
   - models/llama3_1_8b_instruct.yaml
 # Checkpoint path (for inference-only method, this can be a dummy path)
-checkpoint_path: /common/users/yl2310/MultiLLMs/checkpoints/dummy_kl_uniform_wagers
+checkpoint_path: /research/projects/ecoai/yl2310/MultiLLMs/checkpoints/dummy_kl_uniform_wagers
 
 # Apply adaptive temperature scaling to cached option logits before wagering.
 calibrated: true
@@ -61,26 +61,31 @@ wandb_entity: null
 wandb_name: kl_uniform_wagers_mixed_data_4_eval
 
 # Include test dataset configs
+# Include test dataset configs
 _include_test_datasets:
   - datasets/mmlu_full.yaml
   - datasets/medmcqa.yaml
 
+# Aligns MedMCQA-style eval (HF ``train`` when ``eval_split: train``) with training runs:
+# same 6:2:2 held-out test slice and logits cache, even without a ``datasets`` peer block.
+shared_source_tripartition: true
 # Override dataset-specific settings for evaluation with 1000 samples each
 test_datasets:
   - display_name: mmlu_full_test
-    eval_split: test
+    eval_split: auxiliary_train
   - display_name: medmcqa_test
-    eval_split: validation  
-# Include OOD dataset configs
+    eval_split: train  # MedMCQA test split has no labels, use validation
+# # Include OOD dataset configs
 _include_ood_datasets:
   - datasets/arc_challenge.yaml
   - datasets/forecastqa.yaml
+
 # Override OOD dataset-specific settings
 ood_datasets:
   - display_name: arc_challenge_ood
     eval_split: test
   - display_name: forecastqa_ood
-    eval_split: test
+    eval_split: train
 
 
 # Evaluation parameters

@@ -1,16 +1,15 @@
-# Evaluation configuration for equal wagers on MMLU, MedMCQA, and ARC Easy with 1000 samples each
-# No training is necessary for equal wagers
+# Evaluation configuration for one-zero wagers on MMLU, MedMCQA, and ARC Easy with 1000 samples each
+# No training is necessary for one-zero wagers
 
 # Include model configs (must match training)
 _include_models:
-    - models/llama3_aloe_8b_alpha.yaml
     - models/llama3_1_8b_instruct.yaml
-    
+    - models/llama3_aloe_8b_alpha.yaml
     
     
 
-# Checkpoint path (for equal_wagers, this can be a dummy path since no training is needed)
-checkpoint_path: /common/users/yl2310/MultiLLMs/checkpoints/dummy_equal_wagers
+# Checkpoint path (for one_zero_wagers, this can be a dummy path since no training is needed)
+checkpoint_path: /research/projects/ecoai/yl2310/MultiLLMs/checkpoints/dummy_one_zero_wagers
 
 # Apply adaptive temperature scaling to cached option logits before wagering.
 calibrated: true
@@ -67,12 +66,14 @@ _include_test_datasets:
   - datasets/mmlu_full.yaml
   - datasets/medmcqa.yaml
 
+shared_source_tripartition: true
+
 # Override dataset-specific settings for evaluation with 1000 samples each
 test_datasets:
   - display_name: mmlu_full_test
-    eval_split: test
+    eval_split: auxiliary_train
   - display_name: medmcqa_test
-    eval_split: validation  # MedMCQA test split has no labels, use validation
+    eval_split: train  # MedMCQA test split has no labels, use validation
 # Include OOD dataset configs
 _include_ood_datasets:
   - datasets/arc_challenge.yaml
@@ -96,4 +97,4 @@ resume_eval: false  # Set to true to resume from checkpoint
 report_to_wandb: true
 wandb_project: multi-llm-wagering
 wandb_entity: null
-wandb_name: equal_wagers_linear_pooling_eval
+wandb_name: one_zero_wagers_linear_pooling_eval

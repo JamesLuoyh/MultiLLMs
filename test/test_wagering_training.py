@@ -15,7 +15,7 @@ from wagering.methods.route_llm_bert import RouteLLMBertWagers
 from wagering.methods.router_dc import RouterDCWagers
 from wagering.aggregation import LinearPooling
 from wagering.training import WageringTrainer
-from wagering.training.trainer import compute_meta_metrics
+from wagering.training.trainer import compute_meta_metrics, compute_normalized_wager_probability_stats
 from wagering.core.dataset import Dataset
 
 
@@ -363,6 +363,16 @@ class TestMetaMetrics:
         # One concordant and zero discordant out of 3 total model pairs.
         assert metrics["kendall_tau"] == pytest.approx(1.0 / 3.0, abs=1e-9)
         assert metrics["best_model_mrr"] == pytest.approx(1.0, abs=1e-9)
+
+    def test_normalized_wager_probability_stats(self):
+        wagers = np.array([[2.0, 2.0], [1.0, 3.0]], dtype=np.float64)
+        brier_best = np.array([0, 1], dtype=np.int64)
+        stats = compute_normalized_wager_probability_stats(wagers, brier_best)
+        assert stats["wager_prob_mean_per_model"] == pytest.approx([0.375, 0.625])
+        assert stats["wager_prob_var_per_model"][0] == pytest.approx(0.015625)
+        assert stats["wager_prob_var_per_model"][1] == pytest.approx(0.015625)
+        assert stats["brier_best_wager_prob_mean"] == pytest.approx(0.625)
+        assert stats["brier_best_wager_prob_var"] == pytest.approx(0.015625)
 
 
 if __name__ == "__main__":

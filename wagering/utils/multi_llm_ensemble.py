@@ -828,6 +828,37 @@ def get_cached_logits_and_hidden_states_for_model(
                 )
                 return None, None, None
 
+            row_map = getattr(dataset, "cache_source_row_indices", None)
+            n_src = int(getattr(dataset, "cache_source_num_examples", 0) or 0)
+            if row_map is not None and n_src > 0 and logits is not None:
+                if logits.shape[0] == n_src:
+                    idx = np.asarray(row_map, dtype=np.int64)
+                    logits = np.asarray(logits, dtype=np.float32)[idx, :]
+                    if labels is not None and np.asarray(labels).shape[0] == n_src:
+                        lab = np.asarray(labels)
+                        labels = lab[idx, ...] if lab.ndim > 1 else lab[idx]
+                    if hidden_states is not None:
+                        if isinstance(hidden_states, list):
+                            hidden_states = [
+                                np.asarray(h, dtype=np.float32)[idx, :]
+                                for h in hidden_states
+                            ]
+                        else:
+                            hs = np.asarray(hidden_states, dtype=np.float32)
+                            if hs.ndim == 3:
+                                hidden_states = hs[:, idx, :]
+                            else:
+                                hidden_states = hs[idx, :]
+                elif logits.shape[0] != len(dataset.x):
+                    log.debug(
+                        "Cache shape %s vs view %d / full %d; skipping source-row reindex (prompt_variant=%s)",
+                        getattr(logits, "shape", None),
+                        len(dataset.x),
+                        n_src,
+                        prompt_variant or "default",
+                    )
+                    return None, None, None
+
             log.debug(
                 "Cache hit for model %s and dataset size %d (prompt_variant=%s)",
                 model_key,
@@ -898,6 +929,63 @@ def set_cached_logits_and_hidden_states_for_model(
             except Exception as delete_err:
                 log.warning(f"Failed to delete corrupted cache file {cache_path}: {delete_err}")
             existing_data = {}
+
+    row_map = getattr(dataset, "cache_source_row_indices", None)
+    n_src = int(getattr(dataset, "cache_source_num_examples", 0) or 0)
+    if row_map is not None and n_src > 0 and logits is not None:
+        idx = np.asarray(row_map, dtype=np.int64)
+        if logits.shape[0] == len(idx):
+            n_opt = int(logits.shape[1])
+            full_logits = np.zeros((n_src, n_opt), dtype=np.float32)
+            ex_log = existing_data.get("logits")
+            if isinstance(ex_log, np.ndarray) and ex_log.shape[0] == n_src:
+                full_logits = np.asarray(ex_log, dtype=np.float32).copy()
+            full_logits[idx, :] = np.asarray(logits, dtype=np.float32)
+            logits = full_logits
+    if row_map is not None and n_src > 0 and labels is not None:
+        idx = np.asarray(row_map, dtype=np.int64)
+        lab = np.asarray(labels)
+        if lab.shape[0] == len(idx):
+            full_labels = np.zeros(n_src, dtype=np.int32)
+            ex_lb = existing_data.get("labels")
+            if isinstance(ex_lb, np.ndarray) and ex_lb.shape[0] == n_src:
+                full_labels = np.asarray(ex_lb, dtype=np.int32).copy()
+            full_labels[idx] = lab.astype(np.int32, copy=False)
+            labels = full_labels
+    if row_map is not None and n_src > 0 and hidden_states is not None:
+        idx = np.asarray(row_map, dtype=np.int64)
+        ex_h = existing_data.get("hidden_states")
+        if isinstance(hidden_states, np.ndarray) and hidden_states.shape[0] == len(idx):
+            mat = np.asarray(hidden_states, dtype=np.float32)
+            if mat.ndim == 2:
+                _, d = mat.shape
+                full_h = np.zeros((n_src, d), dtype=np.float32)
+                if isinstance(ex_h, np.ndarray) and ex_h.shape[0] == n_src and ex_h.ndim == 2:
+                    full_h = np.asarray(ex_h, dtype=np.float32).copy()
+                full_h[idx, :] = mat
+                hidden_states = full_h
+        elif (
+            isinstance(hidden_states, list)
+            and ex_h
+            and isinstance(ex_h, list)
+            and len(hidden_states) == len(idx)
+            and len(ex_h) == len(hidden_states)
+        ):
+            merged: List[np.ndarray] = []
+            for h_new, h_prev in zip(hidden_states, ex_h):
+                a = np.asarray(h_new, dtype=np.float32)
+                b = np.asarray(h_prev, dtype=np.float32)
+                if a.shape[0] != len(idx) or b.shape[0] != n_src or a.ndim != 2:
+                    merged = []
+                    break
+                _, d = a.shape
+                full = np.zeros((n_src, d), dtype=np.float32)
+                full += b
+                full[idx, :] = a
+                merged.append(full)
+            if merged:
+                hidden_states = merged
+
     # Merge with existing cache entry
     cache_dict = {}
     if logits is not None:

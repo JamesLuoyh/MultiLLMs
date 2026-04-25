@@ -7,7 +7,7 @@ _include_models:
   - models/llama3_aloe_8b_alpha.yaml
 
 # Checkpoint path (inference-only method; checkpoint can be a dummy path)
-checkpoint_path: /common/users/yl2310/MultiLLMs/checkpoints/dummy_packllm_perplexity_wagers
+checkpoint_path: /research/projects/ecoai/yl2310/MultiLLMs/checkpoints/dummy_packllm_perplexity_wagers
 
 # Apply adaptive temperature scaling to cached option logits before wagering.
 calibrated: true
@@ -15,7 +15,7 @@ _include_calibration: calibration/adaptive_temperature_1000samples.yaml
 
 
 shuffle_data: true
-shuffle_seed: 18 #18 #17
+shuffle_seed: 18 #1d8 #17
 
 # Wagering method - PackLLM-style inverse perplexity weighting (inference-only)
 wagering_method:
@@ -64,26 +64,22 @@ wandb_name: null
 
 # Include test dataset configs
 _include_test_datasets:
-  - datasets/pubmedqa_context_only.yaml
-
-# Override dataset-specific settings for evaluation
-# Test datasets
-_include_test_datasets:
   - datasets/mmlu_full.yaml
   - datasets/medmcqa.yaml
 
-# Override dataset-specific settings for evaluation
+shared_source_tripartition: true
+
+# Override dataset-specific settings for evaluation with 1000 samples each
 test_datasets:
   - display_name: mmlu_full_test
-    eval_split: test
+    eval_split: auxiliary_train
   - display_name: medmcqa_test
-    eval_split: validation  # MedMCQA test split has no labels, use validation
-
-# OOD dataset
-# Include OOD dataset config
+    eval_split: train  # MedMCQA test split has no labels, use validation
+# Include OOD dataset configs
 _include_ood_datasets:
   - datasets/arc_challenge.yaml
   - datasets/forecastqa.yaml
+
 # Override OOD dataset-specific settings
 ood_datasets:
   - display_name: arc_challenge_ood

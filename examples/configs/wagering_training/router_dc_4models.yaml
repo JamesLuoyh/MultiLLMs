@@ -7,8 +7,8 @@
 
 # Models (shared between training and evaluation)
 _include_models:
-  - models/gemma_2_9b_it.yaml
-  - models/llama3_aloe_8b_alpha.yaml
+    - models/llama3_1_8b_instruct.yaml
+    - models/llama3_aloe_8b_alpha.yaml
   # - models/qwen3_5_9b.yaml
   # - models/llama_2_7b.yaml
 
@@ -95,6 +95,8 @@ wandb_name: router_dc_4models
 # For testing, this will be set by the pipeline script automatically
 
 # Test datasets
+shared_source_tripartition: true
+
 _include_test_datasets:
   - datasets/mmlu_full.yaml
   - datasets/medmcqa.yaml
@@ -102,12 +104,11 @@ _include_test_datasets:
 # Override dataset-specific settings for evaluation
 test_datasets:
   - display_name: mmlu_full_test
-    eval_split: test
+    eval_split: auxiliary_train
   - display_name: medmcqa_test
-    eval_split: validation  # MedMCQA test split has no labels, use validation
+    eval_split: train
 
 # OOD dataset
-# Include OOD dataset config
 _include_ood_datasets:
   - datasets/arc_challenge.yaml
   - datasets/forecastqa.yaml
@@ -116,5 +117,4 @@ ood_datasets:
   - display_name: arc_challenge_ood
     eval_split: test
   - display_name: forecastqa_ood
-    eval_split: test
-
+    eval_split: train
