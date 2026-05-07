@@ -27,11 +27,11 @@ aggregation:
 option_tokens:
 - 'YES'
 - 'NO'
-cache_path: /research/projects/ecoai/yl2310/MultiLLMs/cache
+cache_path: /research/projects/ecoai/abcdefg/MultiLLMs/cache
 _include_datasets:
 - datasets/pubmedqa_context_only.yaml
 num_epochs: 50
-checkpoint_base_dir: /research/projects/ecoai/yl2310/MultiLLMs/checkpoints/centralized_wagers_hetero_4models_pubmedqa_20260501_090610/repeat_0004
+checkpoint_base_dir: /research/projects/ecoai/abcdefg/MultiLLMs/checkpoints/centralized_wagers_hetero_4models_pubmedqa_20260501_090610/repeat_0004
 save_every: 100
 training_batch_size: 100
 auto_resume: false
@@ -49,5 +49,5 @@ _include_test_datasets:
 - datasets/pubmedqa_context_only.yaml
 test_datasets:
 - display_name: pubmedqa_test
-eval_checkpoint_dir: /research/projects/ecoai/yl2310/MultiLLMs/checkpoints/centralized_wagers_hetero_4models_pubmedqa_20260501_090610/repeat_0004/eval
-checkpoint_path: /research/projects/ecoai/yl2310/MultiLLMs/checkpoints/centralized_wagers_hetero_4models_pubmedqa_20260501_090610/repeat_0004
+eval_checkpoint_dir: /research/projects/ecoai/abcdefg/MultiLLMs/checkpoints/centralized_wagers_hetero_4models_pubmedqa_20260501_090610/repeat_0004/eval
+checkpoint_path: /research/projects/ecoai/abcdefg/MultiLLMs/checkpoints/centralized_wagers_hetero_4models_pubmedqa_20260501_090610/repeat_0004

@@ -122,7 +122,7 @@ def resolve_calibration_artifact_dir(args: Dict[str, Any]) -> Optional[Path]:
     base_dir = Path(
         calibration_config.get(
             "checkpoint_base_dir",
-            "/common/users/yl2310/MultiLLMs/calibration_checkpoints",
+            "/common/users/abcdefg/MultiLLMs/calibration_checkpoints",
         )
     )
     # PubMedQA: single combined artifact keyed by full ensemble. Non-PubMedQA: per-model
@@ -1065,7 +1065,7 @@ def fit_or_load_logit_calibrator(
     base_root = Path(calibration_path) if calibration_path is not None else Path(
         calibration_config.get(
             "checkpoint_base_dir",
-            "/common/users/yl2310/MultiLLMs/calibration_checkpoints",
+            "/common/users/abcdefg/MultiLLMs/calibration_checkpoints",
         )
     )
 

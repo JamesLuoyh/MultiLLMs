@@ -8,7 +8,7 @@ _include_models:
   - models/llama3_1_8b_instruct.yaml
   - models/biomistral_7b.yaml
 # Checkpoint path (for equal_wagers, this can be a dummy path since no training is needed)
-checkpoint_path: /common/users/yl2310/MultiLLMs/checkpoints/dummy_equal_wagers
+checkpoint_path: /common/users/abcdefg/MultiLLMs/checkpoints/dummy_equal_wagers
 
 # Apply adaptive temperature scaling to cached option logits before wagering.
 calibrated: false
@@ -45,7 +45,7 @@ option_tokens: ["A", "B", "C", "D"]
 # # Training parameters
 # num_epochs: 1  # Default: 100 epochs
 # # Base directory for checkpoints (unique subdirectory will be generated)
-# checkpoint_base_dir: /common/users/yl2310/MultiLLMs/checkpoints
+# checkpoint_base_dir: /common/users/abcdefg/MultiLLMs/checkpoints
 # save_every: 100  # Save checkpoint every 100 batches
 # training_batch_size: 100  # Batch size for training loop (different from batch size for collecting hidden states)
 
@@ -92,7 +92,7 @@ ood_datasets:
 resume_eval: false  # Set to true to resume from checkpoint
 
 # Paths
-cache_path: /common/users/yl2310/MultiLLMs/cache
+cache_path: /common/users/abcdefg/MultiLLMs/cache
 
 # Wandb logging
 report_to_wandb: false

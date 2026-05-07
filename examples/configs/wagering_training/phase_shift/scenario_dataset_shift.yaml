@@ -10,7 +10,7 @@ aggregation:
 
 option_tokens: [A, B, C, D]
 
-checkpoint_base_dir: /research/projects/ecoai/yl2310/MultiLLMs/checkpoints
+checkpoint_base_dir: /research/projects/ecoai/abcdefg/MultiLLMs/checkpoints
 save_every: 100
 # Trainer loop batch size. Keep aligned with per-phase dataset batch_size for clarity.
 training_batch_size: 8
@@ -27,7 +27,7 @@ test_datasets: []
 phase_shift:
   rolling_window_batches: 30
   evaluate_after_phase2: false
-  output_dir: /research/projects/ecoai/yl2310/MultiLLMs/phase_shift_outputs/scenario_dataset_shift_short_bs_8_cache
+  output_dir: /research/projects/ecoai/abcdefg/MultiLLMs/phase_shift_outputs/scenario_dataset_shift_short_bs_8_cache
   metrics: [accuracy, ece, kendall_tau, best_model_mrr, brier_d_regret]
   methods:
     - name: centralized_wagers

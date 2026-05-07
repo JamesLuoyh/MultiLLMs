@@ -31,9 +31,9 @@ option_tokens:
 - '0'
 _include_datasets:
 - datasets/cluster_saturation_bayes_extreme_uniform.yaml
-cache_path: /research/projects/ecoai/yl2310/MultiLLMs/cache
+cache_path: /research/projects/ecoai/abcdefg/MultiLLMs/cache
 num_epochs: 5
-checkpoint_base_dir: /research/projects/ecoai/yl2310/MultiLLMs/checkpoints/centralized_wagers_cluster_saturation_bayes_mixed_layers_20260430_104406/repeat_0001
+checkpoint_base_dir: /research/projects/ecoai/abcdefg/MultiLLMs/checkpoints/centralized_wagers_cluster_saturation_bayes_mixed_layers_20260430_104406/repeat_0001
 save_every: 100
 training_batch_size: 100
 auto_resume: false
@@ -51,5 +51,5 @@ _include_test_datasets:
 test_datasets:
 - display_name: cluster_saturation_bayesX_4
 dataset_split_seed: 43
-eval_checkpoint_dir: /research/projects/ecoai/yl2310/MultiLLMs/checkpoints/centralized_wagers_cluster_saturation_bayes_mixed_layers_20260430_104406/repeat_0001/eval
-checkpoint_path: /research/projects/ecoai/yl2310/MultiLLMs/checkpoints/centralized_wagers_cluster_saturation_bayes_mixed_layers_20260430_104406/repeat_0001
+eval_checkpoint_dir: /research/projects/ecoai/abcdefg/MultiLLMs/checkpoints/centralized_wagers_cluster_saturation_bayes_mixed_layers_20260430_104406/repeat_0001/eval
+checkpoint_path: /research/projects/ecoai/abcdefg/MultiLLMs/checkpoints/centralized_wagers_cluster_saturation_bayes_mixed_layers_20260430_104406/repeat_0001

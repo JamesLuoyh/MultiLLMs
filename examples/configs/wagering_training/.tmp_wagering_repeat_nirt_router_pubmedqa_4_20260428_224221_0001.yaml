@@ -38,11 +38,11 @@ aggregation:
 option_tokens:
 - 'YES'
 - 'NO'
-cache_path: /research/projects/ecoai/yl2310/MultiLLMs/cache
+cache_path: /research/projects/ecoai/abcdefg/MultiLLMs/cache
 _include_datasets:
 - datasets/pubmedqa_context_only.yaml
 num_epochs: 5
-checkpoint_base_dir: /research/projects/ecoai/yl2310/MultiLLMs/checkpoints/nirt_router_pubmedqa_4_20260428_224221/repeat_0001
+checkpoint_base_dir: /research/projects/ecoai/abcdefg/MultiLLMs/checkpoints/nirt_router_pubmedqa_4_20260428_224221/repeat_0001
 save_every: 100
 training_batch_size: 100
 auto_resume: false
@@ -60,5 +60,5 @@ _include_test_datasets:
 test_datasets:
 - display_name: pubmedqa_test
 dataset_split_seed: 43
-eval_checkpoint_dir: /research/projects/ecoai/yl2310/MultiLLMs/checkpoints/nirt_router_pubmedqa_4_20260428_224221/repeat_0001/eval
-checkpoint_path: /research/projects/ecoai/yl2310/MultiLLMs/checkpoints/nirt_router_pubmedqa_4_20260428_224221/repeat_0001
+eval_checkpoint_dir: /research/projects/ecoai/abcdefg/MultiLLMs/checkpoints/nirt_router_pubmedqa_4_20260428_224221/repeat_0001/eval
+checkpoint_path: /research/projects/ecoai/abcdefg/MultiLLMs/checkpoints/nirt_router_pubmedqa_4_20260428_224221/repeat_0001

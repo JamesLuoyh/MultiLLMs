@@ -56,7 +56,7 @@ tool:
     top_k: 1                        # Number of top Wikipedia passages to retrieve
     name: wiki_bm25_retriever       # Tool name
     index_name: wikipedia-dpr-100w   # Pyserini index name (default: wikipedia-dpr-100w, uses BM25 k1=0.9, b=0.4 tuned for QA)
-    cache_dir: /common/users/yl2310/.cache/pyserini  # Cache directory for pyserini indices
+    cache_dir: /common/users/abcdefg/.cache/pyserini  # Cache directory for pyserini indices
     description: "A retrieval tool that searches Wikipedia using BM25 algorithm (Robertson & Zaragoza, 2009). Use this tool to find relevant information from Wikipedia articles."
 
 # Evaluation configuration

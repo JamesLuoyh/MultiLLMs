@@ -31,7 +31,7 @@ import yaml
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SRC_PATH = PROJECT_ROOT / "src"
-DISK_ROOT = Path("/common/users/yl2310/MultiLLMs")
+DISK_ROOT = Path("/common/users/abcdefg/MultiLLMs")
 
 
 def _ensure_project_importable() -> None:

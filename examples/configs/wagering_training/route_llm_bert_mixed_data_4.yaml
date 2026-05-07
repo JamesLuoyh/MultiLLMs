@@ -46,7 +46,7 @@ aggregation:
 
 # Common options
 option_tokens: ["A", "B", "C", "D"]
-cache_path: /common/users/yl2310/MultiLLMs/cache
+cache_path: /common/users/abcdefg/MultiLLMs/cache
 
 # ============================================================================
 # TRAINING CONFIGURATION
@@ -64,7 +64,7 @@ datasets:
 
 # Training parameters
 num_epochs: 50
-checkpoint_base_dir: /common/users/yl2310/MultiLLMs/checkpoints
+checkpoint_base_dir: /common/users/abcdefg/MultiLLMs/checkpoints
 save_every: 100
 training_batch_size: 100
 

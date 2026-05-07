@@ -31,7 +31,7 @@ while also yielding a learning signal suitable for gradient-based optimization.
 This repo’s Python tooling is expected to run inside the project virtual environment at **`.venv`**.
 
 ```bash
-cd /common/home/yl2310/MultiLLMs
+cd /common/home/abcdefg/MultiLLMs
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 ```
@@ -56,7 +56,7 @@ Experiments are configured via a single YAML file (see `examples/configs/wagerin
 Runs **(optional) calibration → training → evaluation**.
 
 ```bash
-cd /common/home/yl2310/MultiLLMs
+cd /common/home/abcdefg/MultiLLMs
 CUDA_VISIBLE_DEVICES=0 .venv/bin/python scripts/wagering_pipeline.py \
   examples/configs/wagering_training/mse_br_wagers_v2_8models.yaml
 ```
@@ -64,7 +64,7 @@ CUDA_VISIBLE_DEVICES=0 .venv/bin/python scripts/wagering_pipeline.py \
 ### Train only / eval only
 
 ```bash
-cd /common/home/yl2310/MultiLLMs
+cd /common/home/abcdefg/MultiLLMs
 .venv/bin/python scripts/wagering_train.py examples/configs/wagering_training/mse_br_wagers_v2_8models.yaml
 .venv/bin/python scripts/wagering_eval.py  examples/configs/wagering_training/mse_br_wagers_v2_8models.yaml
 ```
@@ -74,7 +74,7 @@ cd /common/home/yl2310/MultiLLMs
 If a config defines `phase_shift.phase1` and `phase_shift.phase2`, run:
 
 ```bash
-cd /common/home/yl2310/MultiLLMs
+cd /common/home/abcdefg/MultiLLMs
 CUDA_VISIBLE_DEVICES=0 .venv/bin/python scripts/wagering_two_phase_pipeline.py \
   path/to/two_phase_config.yaml
 ```

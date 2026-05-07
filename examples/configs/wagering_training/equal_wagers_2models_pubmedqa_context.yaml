@@ -16,7 +16,7 @@ _include_models:
 calibrated: false
 _include_calibration: calibration/adaptive_temperature_pubmedqa_1000samples.yaml
 
-checkpoint_path: /research/projects/ecoai/yl2310/MultiLLMs/checkpoints/dummy_equal_wagers
+checkpoint_path: /research/projects/ecoai/abcdefg/MultiLLMs/checkpoints/dummy_equal_wagers
 
 
 # Wagering method (must match between training and evaluation)

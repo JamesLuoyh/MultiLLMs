@@ -125,7 +125,7 @@ class LogitCache:
 #
 # NOTE: This cache can be redirected at runtime by calling
 # `configure_wagering_cache_dir(...)` (used by `scripts/wagering_pipeline.py`).
-_WAGERING_CACHE_DIR = Path("/common/users/yl2310/MultiLLMs/wagering_model_logits_states_caches")
+_WAGERING_CACHE_DIR = Path("/common/users/abcdefg/MultiLLMs/wagering_model_logits_states_caches")
 _WAGERING_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 

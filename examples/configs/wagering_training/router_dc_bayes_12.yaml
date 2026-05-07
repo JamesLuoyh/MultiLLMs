@@ -54,7 +54,7 @@ aggregation:
 
 # Binary option tokens for this synthetic dataset.
 option_tokens: ["1", "0"]
-cache_path: /filer/tmp1/yl2310/MultiLLMs/wagering_model_logits_states_caches
+cache_path: /filer/tmp1/abcdefg/MultiLLMs/wagering_model_logits_states_caches
 
 # ============================================================================
 # TRAINING CONFIGURATION
@@ -64,7 +64,7 @@ _include_datasets:
   - datasets/cluster_saturation_bayes_extreme.yaml
 
 num_epochs: 5
-checkpoint_base_dir: /common/users/yl2310/MultiLLMs/checkpoints
+checkpoint_base_dir: /common/users/abcdefg/MultiLLMs/checkpoints
 save_every: 100
 training_batch_size: 20
 

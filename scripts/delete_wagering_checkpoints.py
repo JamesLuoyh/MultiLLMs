@@ -24,7 +24,7 @@ def delete_checkpoints(config_path: Path, method_name: str):
     print(f"{'='*60}")
     
     config = load_and_merge_configs(config_path)
-    base_dir = Path(config.get('checkpoint_base_dir', '/common/users/yl2310/MultiLLMs/checkpoints'))
+    base_dir = Path(config.get('checkpoint_base_dir', '/common/users/abcdefg/MultiLLMs/checkpoints'))
     checkpoint_dir = generate_checkpoint_dir(
         base_dir=base_dir,
         models=config['models'],

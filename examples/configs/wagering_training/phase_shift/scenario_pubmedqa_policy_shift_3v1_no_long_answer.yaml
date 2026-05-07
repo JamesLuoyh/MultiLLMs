@@ -10,8 +10,8 @@ aggregation:
 
 option_tokens: ["YES", "NO"]
 
-cache_path: /research/projects/ecoai/yl2310/MultiLLMs/wagering_model_logits_states_caches
-checkpoint_base_dir: /research/projects/ecoai/yl2310/MultiLLMs/checkpoints
+cache_path: /research/projects/ecoai/abcdefg/MultiLLMs/wagering_model_logits_states_caches
+checkpoint_base_dir: /research/projects/ecoai/abcdefg/MultiLLMs/checkpoints
 save_every: 100
 # Trainer loop batch size. Keep aligned with per-phase dataset batch_size for clarity.
 training_batch_size: 30
@@ -46,7 +46,7 @@ phase_shift:
   # For identical base models under mixed-context PubMedQA routing, compute
   # perplexity once per unique prompt variant and reuse across repeated slots.
   reuse_prompt_perplexities_for_identical_models: true
-  output_dir: /common/users/yl2310/MultiLLMs/phase_shift_outputs/scenario_pubmedqa_shift_3v1_to_1v3
+  output_dir: /common/users/abcdefg/MultiLLMs/phase_shift_outputs/scenario_pubmedqa_shift_3v1_to_1v3
   metrics: [auc, accuracy, ece, kendall_tau, best_model_mrr, brier_d_regret]
   methods:
     - name: router_dc

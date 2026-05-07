@@ -56,7 +56,7 @@ datasets:
 # Training parameters
 num_epochs: 50  # Default: 100 epochs
 # Base directory for checkpoints (unique subdirectory will be generated)
-checkpoint_base_dir: /research/projects/ecoai/yl2310/MultiLLMs/checkpoints
+checkpoint_base_dir: /research/projects/ecoai/abcdefg/MultiLLMs/checkpoints
 save_every: 100  # Save checkpoint every 100 batches
 training_batch_size: 100  # Batch size for training loop (different from batch size for collecting hidden states)
 wager_score_plot_every: 500  # Plot wager score distributions every 100 batches (set to None to disable)

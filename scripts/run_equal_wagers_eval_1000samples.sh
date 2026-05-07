@@ -21,7 +21,7 @@ if [ ! -f "$CONFIG_FILE" ]; then
 fi
 
 # Wagering cache directory (where logits and hidden states are cached)
-WAGERING_CACHE_DIR="/common/users/yl2310/MultiLLMs/wagering_cache"
+WAGERING_CACHE_DIR="/common/users/abcdefg/MultiLLMs/wagering_cache"
 
 echo "=========================================="
 echo "Running Equal Wagering Evaluation"

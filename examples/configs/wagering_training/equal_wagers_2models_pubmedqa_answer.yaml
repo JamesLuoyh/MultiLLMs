@@ -18,7 +18,7 @@ _include_models:
 calibrated: false
 _include_calibration: calibration/adaptive_temperature_pubmedqa_answer.yaml
 
-checkpoint_path: /research/projects/ecoai/yl2310/MultiLLMs/checkpoints/dummy_equal_wagers
+checkpoint_path: /research/projects/ecoai/abcdefg/MultiLLMs/checkpoints/dummy_equal_wagers
 
 
 # Wagering method (must match between training and evaluation)
@@ -32,7 +32,7 @@ aggregation:
 
 # Common options
 option_tokens: ["YES", "NO"]
-cache_path: /research/projects/ecoai/yl2310/MultiLLMs/cache
+cache_path: /research/projects/ecoai/abcdefg/MultiLLMs/cache
 
 
 report_to_wandb: false

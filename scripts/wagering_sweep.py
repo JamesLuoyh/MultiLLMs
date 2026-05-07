@@ -155,7 +155,7 @@ def run_sweep(
     with open(config_path, 'r') as f:
         original_config = yaml.safe_load(f)
     
-    checkpoint_base_dir = Path(original_config.get("checkpoint_base_dir", "/common/users/yl2310/MultiLLMs/checkpoints"))
+    checkpoint_base_dir = Path(original_config.get("checkpoint_base_dir", "/common/users/abcdefg/MultiLLMs/checkpoints"))
     
     # Run pipeline for each seed
     all_checkpoint_dirs = []

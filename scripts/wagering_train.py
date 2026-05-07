@@ -95,7 +95,7 @@ def main(config_path: Optional[str] = None, calibration_path: Optional[str] = No
     logging.getLogger("urllib3").setLevel(logging.WARNING)
     
     # Generate unique checkpoint directory
-    base_checkpoint_dir = Path(args.get("checkpoint_base_dir", "/common/users/yl2310/MultiLLMs/checkpoints"))
+    base_checkpoint_dir = Path(args.get("checkpoint_base_dir", "/common/users/abcdefg/MultiLLMs/checkpoints"))
     calibration_config = args.get("calibration") if calibration_enabled(args) else None
     checkpoint_dir = generate_checkpoint_dir(
         base_dir=base_checkpoint_dir,

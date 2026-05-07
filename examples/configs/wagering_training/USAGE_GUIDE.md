@@ -23,7 +23,7 @@ Use separate configs when you need more control:
 ```bash
 # Step 1: Train
 python scripts/wagering_train.py train_mmlu_medmcqa.yaml
-# Checkpoint saved to: /common/users/yl2310/MultiLLMs/checkpoints/{unique_dir}/final
+# Checkpoint saved to: /common/users/abcdefg/MultiLLMs/checkpoints/{unique_dir}/final
 
 # Step 2: Evaluate (update checkpoint_path in eval config first)
 python scripts/wagering_eval.py eval_mmlu_medmcqa_arc.yaml
@@ -51,14 +51,14 @@ python scripts/wagering_eval.py eval_mmlu_medmcqa_arc.yaml
 ```bash
 # Train once
 python scripts/wagering_train.py train_mmlu_medmcqa.yaml
-# Checkpoint: /common/users/yl2310/MultiLLMs/checkpoints/models_..._hash/final
+# Checkpoint: /common/users/abcdefg/MultiLLMs/checkpoints/models_..._hash/final
 
 # Evaluate on different datasets
 python scripts/wagering_eval.py eval_mmlu_test.yaml \
-    --checkpoint-path-override /common/users/yl2310/MultiLLMs/checkpoints/models_..._hash/final
+    --checkpoint-path-override /common/users/abcdefg/MultiLLMs/checkpoints/models_..._hash/final
 
 python scripts/wagering_eval.py eval_medmcqa_test.yaml \
-    --checkpoint-path-override /common/users/yl2310/MultiLLMs/checkpoints/models_..._hash/final
+    --checkpoint-path-override /common/users/abcdefg/MultiLLMs/checkpoints/models_..._hash/final
 ```
 
 ### Workflow 2: Using Pre-trained Checkpoint
@@ -66,7 +66,7 @@ python scripts/wagering_eval.py eval_medmcqa_test.yaml \
 ```bash
 # Use checkpoint from a previous experiment
 python scripts/wagering_eval.py eval_config.yaml \
-    --checkpoint-path-override /common/users/yl2310/MultiLLMs/checkpoints/models_..._hash/final
+    --checkpoint-path-override /common/users/abcdefg/MultiLLMs/checkpoints/models_..._hash/final
 ```
 
 ### Workflow 3: Debugging
@@ -102,7 +102,7 @@ Checkpoints are automatically named based on:
 
 Example:
 ```
-/common/users/yl2310/MultiLLMs/checkpoints/
+/common/users/abcdefg/MultiLLMs/checkpoints/
   models_HPAI-BSC_Llama3-Aloe-8B-Alpha_google_gemma-2-9b-it_datasets_medmcqa_mmlu_wagering_equal_wagers_agg_weighted_linear_0b7d3793/
     final/
       wagering_state.pt

@@ -463,7 +463,7 @@ def _resolve_base_checkpoint_dir(
             p = (config_path.parent / p).resolve()
         return p.parent
 
-    return Path("/common/users/yl2310/MultiLLMs/checkpoints")
+    return Path("/common/users/abcdefg/MultiLLMs/checkpoints")
 
 
 def _repeat_checkpoint_dir(base: Path, repeat_idx: int, run_tag: str) -> Path:

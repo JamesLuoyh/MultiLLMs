@@ -138,8 +138,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--cache-dir",
         type=str,
-        default="/common/users/yl2310/MultiLLMs",
-        help="Directory to store cached hidden states and max_probs (default: /common/users/yl2310/MultiLLMs).",
+        default="/common/users/abcdefg/MultiLLMs",
+        help="Directory to store cached hidden states and max_probs (default: /common/users/abcdefg/MultiLLMs).",
     )
     parser.add_argument(
         "--cache-file",

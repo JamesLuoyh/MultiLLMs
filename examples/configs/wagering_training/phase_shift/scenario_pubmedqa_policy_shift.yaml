@@ -8,8 +8,8 @@ aggregation:
 
 option_tokens: ["YES", "NO"]
 
-cache_path: /common/users/yl2310/MultiLLMs/cache
-checkpoint_base_dir: /common/users/yl2310/MultiLLMs/checkpoints
+cache_path: /common/users/abcdefg/MultiLLMs/cache
+checkpoint_base_dir: /common/users/abcdefg/MultiLLMs/checkpoints
 save_every: 100
 # Trainer loop batch size. Keep aligned with per-phase dataset batch_size for clarity.
 training_batch_size: 100
@@ -38,8 +38,8 @@ pubmedqa_phase2_prompt: &pubmedqa_phase2_prompt "Question:\n{question}\nYou are 
 
 test_datasets:
   []
-cache_path: /research/projects/ecoai/yl2310/MultiLLMs/wagering_model_logits_states_caches
-checkpoint_base_dir: /common/users/yl2310/MultiLLMs/checkpoints
+cache_path: /research/projects/ecoai/abcdefg/MultiLLMs/wagering_model_logits_states_caches
+checkpoint_base_dir: /common/users/abcdefg/MultiLLMs/checkpoints
 
 phase_shift:
   rolling_window_batches: 100
@@ -47,7 +47,7 @@ phase_shift:
   # For identical base models under mixed-context PubMedQA routing, compute
   # perplexity once per unique prompt variant and reuse across repeated slots.
 
-  output_dir: /common/users/yl2310/MultiLLMs/phase_shift_outputs/scenario_pubmedqa_policy_shift
+  output_dir: /common/users/abcdefg/MultiLLMs/phase_shift_outputs/scenario_pubmedqa_policy_shift
 
   metrics: [accuracy, ece, kendall_tau, best_model_mrr, brier_d_regret]
   methods:

@@ -9,9 +9,9 @@ _include_models:
 # Checkpoint path (load trained wagering method from here)
 # IMPORTANT: This will be automatically set by the pipeline script
 # For manual evaluation, set this to the checkpoint directory from training
-# Format: /common/users/yl2310/MultiLLMs/checkpoints/{unique_dir}/final
+# Format: /common/users/abcdefg/MultiLLMs/checkpoints/{unique_dir}/final
 # For equal_wagers (no trainable params), this can be a dummy path
-checkpoint_path: /common/users/yl2310/MultiLLMs/checkpoints/dummy_equal_wagers
+checkpoint_path: /common/users/abcdefg/MultiLLMs/checkpoints/dummy_equal_wagers
 
 # Wagering method (must match training)
 wagering_method:
@@ -54,7 +54,7 @@ option_tokens: ["A", "B", "C", "D"]
 # eval_checkpoint_dir: /path/to/eval/checkpoints  # Optional: custom checkpoint directory
 
 # Paths
-cache_path: /common/users/yl2310/MultiLLMs/cache
+cache_path: /common/users/abcdefg/MultiLLMs/cache
 
 # Wandb logging
 report_to_wandb: true

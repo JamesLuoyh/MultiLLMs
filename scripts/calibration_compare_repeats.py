@@ -17,10 +17,10 @@ error bars on bar plots).
 
 Usage:
   ./.venv/bin/python scripts/calibration_compare_repeats.py \\
-    --out-dir /research/projects/ecoai/yl2310/MultiLLMs/artifacts/calibration_compare \\
+    --out-dir /research/projects/ecoai/abcdefg/MultiLLMs/artifacts/calibration_compare \\
     --n-repeats 4 --gpus 0,1,2,3 --max-workers-per-gpu 2
 
-Default --out-dir is under /research/projects/ecoai/yl2310/MultiLLMs/artifacts/….
+Default --out-dir is under /research/projects/ecoai/abcdefg/MultiLLMs/artifacts/….
 Relative --out-dir is resolved under MULTILLMS_OUTPUT_ROOT (not your cwd), so checkpoints avoid home quota.
 """
 
@@ -41,7 +41,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_OUTPUT_ROOT = Path(
-    os.environ.get("MULTILLMS_OUTPUT_ROOT", "/research/projects/ecoai/yl2310/MultiLLMs")
+    os.environ.get("MULTILLMS_OUTPUT_ROOT", "/research/projects/ecoai/abcdefg/MultiLLMs")
 ).expanduser()
 _VENV_PYTHON = PROJECT_ROOT / ".venv" / "bin" / "python"
 

@@ -9,7 +9,7 @@ aggregation:
 
 option_tokens: [A, B, C, D]
 
-checkpoint_base_dir: /common/users/yl2310/MultiLLMs/checkpoints
+checkpoint_base_dir: /common/users/abcdefg/MultiLLMs/checkpoints
 save_every: 100
 # Trainer loop batch size. Keep aligned with per-phase dataset batch_size for clarity.
 training_batch_size: 8
@@ -25,7 +25,7 @@ test_datasets: []
 
 phase_shift:
   rolling_window_batches: 500
-  output_dir: /common/users/yl2310/MultiLLMs/phase_shift_outputs/scenario_model_addition_cache
+  output_dir: /common/users/abcdefg/MultiLLMs/phase_shift_outputs/scenario_model_addition_cache
   evaluate_after_phase2: false
   metrics: [accuracy, ece, kendall_tau, best_model_mrr, brier_d_regret]
   methods:

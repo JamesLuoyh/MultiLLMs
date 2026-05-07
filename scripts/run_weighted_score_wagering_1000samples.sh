@@ -54,7 +54,7 @@ config_file = Path("$CONFIG_FILE")
 config = load_and_merge_configs(config_file)
 
 # 1. Delete checkpoint directory
-base_dir = Path(config.get('checkpoint_base_dir', '/common/users/yl2310/MultiLLMs/checkpoints'))
+base_dir = Path(config.get('checkpoint_base_dir', '/common/users/abcdefg/MultiLLMs/checkpoints'))
 checkpoint_dir = generate_checkpoint_dir(
     base_dir=base_dir,
     models=config['models'],
@@ -73,7 +73,7 @@ else:
     print(f"  No checkpoint directory found (nothing to delete)")
 
 # 2. Clear wagering cache (logits and hidden states)
-wagering_cache_dir = Path("/common/users/yl2310/MultiLLMs/wagering_cache")
+wagering_cache_dir = Path("/common/users/abcdefg/MultiLLMs/wagering_cache")
 if wagering_cache_dir.exists():
     print(f"\nWagering cache directory: {wagering_cache_dir}")
     cache_files = list(wagering_cache_dir.glob("*.npz"))

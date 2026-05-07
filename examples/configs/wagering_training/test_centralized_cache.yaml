@@ -21,7 +21,7 @@ aggregation:
   config: {}
 
 option_tokens: ["A", "B", "C", "D"]
-cache_path: /common/users/yl2310/MultiLLMs/cache
+cache_path: /common/users/abcdefg/MultiLLMs/cache
 
 _include_datasets:
   - datasets/mmlu.yaml
@@ -31,7 +31,7 @@ datasets:
     size: 10  # Very small for quick testing
 
 num_epochs: 2  # Just 2 epochs for testing
-checkpoint_base_dir: /common/users/yl2310/MultiLLMs/test_checkpoints_cache
+checkpoint_base_dir: /common/users/abcdefg/MultiLLMs/test_checkpoints_cache
 save_every: 100
 training_batch_size: 10
 

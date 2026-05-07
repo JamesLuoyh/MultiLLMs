@@ -12,7 +12,7 @@ _include_datasets:
   - ../datasets/pubmedqa_context_only.yaml
 
 
-checkpoint_base_dir: /research/projects/ecoai/yl2310/MultiLLMs/calibration_checkpoints
+checkpoint_base_dir: /research/projects/ecoai/abcdefg/MultiLLMs/calibration_checkpoints
 head_hidden_layers: [256, 64]
 learning_rate: 1e-4
 weight_decay: 1e-5

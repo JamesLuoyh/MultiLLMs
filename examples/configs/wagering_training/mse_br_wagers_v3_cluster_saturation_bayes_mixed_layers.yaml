@@ -14,7 +14,7 @@ _include_models:
 
 # Apply adaptive temperature scaling to cached option logits before wagering.
 calibrated: false
-cache_path: /research/projects/ecoai/yl2310/MultiLLMs/cache
+cache_path: /research/projects/ecoai/abcdefg/MultiLLMs/cache
 # Wagering method (must match between training and evaluation)
 wagering_method:
   name: mse_br_wagers_v3
@@ -46,7 +46,7 @@ _include_datasets:
   - datasets/cluster_saturation_bayesX.yaml
 
 num_epochs: 5
-checkpoint_base_dir: /research/projects/ecoai/yl2310/MultiLLMs/checkpoints
+checkpoint_base_dir: /research/projects/ecoai/abcdefg/MultiLLMs/checkpoints
 save_every: 100
 training_batch_size: 100
 

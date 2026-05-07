@@ -34,11 +34,11 @@ aggregation:
 num_epochs: 1
 option_tokens: ["A", "B", "C", "D"]
 # Base directory for checkpoints (unique subdirectory will be generated based on config)
-checkpoint_base_dir: /common/users/yl2310/MultiLLMs/checkpoints
+checkpoint_base_dir: /common/users/abcdefg/MultiLLMs/checkpoints
 save_every: 1  # Save after each batch
 
 # Paths
-cache_path: /common/users/yl2310/MultiLLMs/cache
+cache_path: /common/users/abcdefg/MultiLLMs/cache
 
 # Wandb logging
 report_to_wandb: false

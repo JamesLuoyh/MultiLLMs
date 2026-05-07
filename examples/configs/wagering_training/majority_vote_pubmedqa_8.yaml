@@ -13,7 +13,7 @@ _include_models:
   - models/llama3_aloe_8b_alpha.yaml
 
 # Checkpoint path (for equal_wagers, this can be a dummy path since no training is needed)
-checkpoint_path: /common/users/yl2310/MultiLLMs/checkpoints/dummy_equal_wagers
+checkpoint_path: /common/users/abcdefg/MultiLLMs/checkpoints/dummy_equal_wagers
 
 # Apply adaptive temperature scaling to cached option logits before wagering.
 calibrated: false
@@ -48,7 +48,7 @@ aggregation:
 
 # # Training parameters
 # num_epochs: 1
-# checkpoint_base_dir: /common/users/yl2310/MultiLLMs/checkpoints
+# checkpoint_base_dir: /common/users/abcdefg/MultiLLMs/checkpoints
 # save_every: 100
 # training_batch_size: 100
 
@@ -80,4 +80,4 @@ option_tokens: ["YES", "NO"]
 resume_eval: false
 
 # Paths
-cache_path: /common/users/yl2310/MultiLLMs/cache
+cache_path: /common/users/abcdefg/MultiLLMs/cache

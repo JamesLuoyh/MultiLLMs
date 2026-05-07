@@ -18,7 +18,7 @@ option_tokens:
 - B
 - C
 - D
-cache_path: /common/users/yl2310/MultiLLMs/cache
+cache_path: /common/users/abcdefg/MultiLLMs/cache
 _include_datasets:
 - datasets/mmlu.yaml
 - datasets/medmcqa.yaml
@@ -28,7 +28,7 @@ datasets:
 - train_split: train
   size: 10
 num_epochs: 1
-checkpoint_base_dir: /common/users/yl2310/MultiLLMs/checkpoints
+checkpoint_base_dir: /common/users/abcdefg/MultiLLMs/checkpoints
 save_every: 1
 auto_resume: true
 shuffle_data: true

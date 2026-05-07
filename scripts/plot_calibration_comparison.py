@@ -10,7 +10,7 @@ Outputs:
   - Training plots (per model): mean wager + mean net payout over batches (smoothed window=100)
   - Test bar plots (ID test only): avg wager + avg net payout per model (pairs of bars)
 
-Default --out-dir is under /research/projects/ecoai/yl2310/MultiLLMs/artifacts/.
+Default --out-dir is under /research/projects/ecoai/abcdefg/MultiLLMs/artifacts/.
 If --out-dir is relative (e.g. artifacts/foo), it is resolved under MULTILLMS_OUTPUT_ROOT, not repo cwd.
 """
 
@@ -53,7 +53,7 @@ def _repo_root() -> Path:
 # Plots / artifacts default here (not under repo/home) to avoid quota issues.
 # Override with env MULTILLMS_OUTPUT_ROOT if needed.
 DEFAULT_OUTPUT_ROOT = Path(
-    os.environ.get("MULTILLMS_OUTPUT_ROOT", "/research/projects/ecoai/yl2310/MultiLLMs")
+    os.environ.get("MULTILLMS_OUTPUT_ROOT", "/research/projects/ecoai/abcdefg/MultiLLMs")
 ).expanduser()
 
 

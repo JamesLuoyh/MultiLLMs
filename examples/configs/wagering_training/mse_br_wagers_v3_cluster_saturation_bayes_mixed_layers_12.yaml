@@ -46,7 +46,7 @@ aggregation:
 
 # Binary option tokens for this synthetic dataset.
 option_tokens: ["1", "0"]
-cache_path: /research/projects/ecoai/yl2310/MultiLLMs/cache
+cache_path: /research/projects/ecoai/abcdefg/MultiLLMs/cache
 
 # ============================================================================
 # TRAINING CONFIGURATION
@@ -56,7 +56,7 @@ _include_datasets:
   - datasets/cluster_saturation_bayesX.yaml
 
 num_epochs: 20
-checkpoint_base_dir: /research/projects/ecoai/yl2310/MultiLLMs/checkpoints
+checkpoint_base_dir: /research/projects/ecoai/abcdefg/MultiLLMs/checkpoints
 save_every: 100
 training_batch_size: 100
 

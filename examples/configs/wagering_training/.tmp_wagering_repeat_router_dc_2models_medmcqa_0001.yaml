@@ -41,7 +41,7 @@ _include_datasets:
 datasets:
 - train_split: train
 num_epochs: 5
-checkpoint_base_dir: /research/projects/ecoai/yl2310/MultiLLMs/checkpoints/router_dc_2models_medmcqa/repeat_0001
+checkpoint_base_dir: /research/projects/ecoai/abcdefg/MultiLLMs/checkpoints/router_dc_2models_medmcqa/repeat_0001
 save_every: 100
 training_batch_size: 50
 wager_score_plot_every: 500
@@ -62,5 +62,5 @@ test_datasets:
 - display_name: medmcqa_test
   eval_split: train
 dataset_split_seed: 43
-eval_checkpoint_dir: /research/projects/ecoai/yl2310/MultiLLMs/checkpoints/router_dc_2models_medmcqa/repeat_0001/eval
-checkpoint_path: /research/projects/ecoai/yl2310/MultiLLMs/checkpoints/router_dc_2models_medmcqa/repeat_0001
+eval_checkpoint_dir: /research/projects/ecoai/abcdefg/MultiLLMs/checkpoints/router_dc_2models_medmcqa/repeat_0001/eval
+checkpoint_path: /research/projects/ecoai/abcdefg/MultiLLMs/checkpoints/router_dc_2models_medmcqa/repeat_0001
