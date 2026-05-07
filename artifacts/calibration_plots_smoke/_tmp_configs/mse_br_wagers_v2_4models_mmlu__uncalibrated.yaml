@@ -1,18 +1,21 @@
 _include_models:
+- models/gemma_2_9b_it.yaml
 - models/llama3_1_8b_instruct.yaml
 - models/llama3_aloe_8b_alpha.yaml
-calibrated: true
+- models/biomistral_7b.yaml
+calibrated: false
 _include_calibration: calibration/adaptive_temperature_1000samples.yaml
 wagering_method:
-  name: centralized_wagers
+  name: mse_br_wagers_v2_augmented
   config:
+    ablation_study: true
     hidden_dim: 4096
     hidden_layers:
     - 512
     - 256
     hidden_state_layers:
     - -1
-    learning_rate: 1e-7
+    learning_rate: 5e-7
     lr_decay_factor: 1.0
     lr_decay_steps: 100
     temperature: 2.0
@@ -20,7 +23,7 @@ wagering_method:
     normalize_hidden_states: false
     device: cuda:0
 aggregation:
-  name: weighted_linear_pooling
+  name: logarithmic_pooling
   config: {}
 option_tokens:
 - A
@@ -29,33 +32,30 @@ option_tokens:
 - D
 _include_datasets:
 - datasets/mmlu_full.yaml
-- datasets/medmcqa.yaml
 datasets:
 - train_split: auxiliary_train
-- train_split: train
 num_epochs: 50
-checkpoint_base_dir: /research/projects/ecoai/yl2310/MultiLLMs/checkpoints/20260425_131754/repeat_0001
+checkpoint_base_dir: /research/projects/ecoai/yl2310/MultiLLMs/checkpoints
 save_every: 100
 training_batch_size: 100
+wager_score_plot_every: 500
 auto_resume: false
 balance_training_datasets: true
 shuffle_data: true
-shuffle_seed: 19
-early_stopping_patience: 5
-early_stopping_criterion: validation
-report_to_wandb: false
+shuffle_seed: 18
+early_stopping_patience: 10000
+early_stopping_criterion: online_learning
+use_brier_d_regret_for_early_stopping: true
+report_to_wandb: true
 wandb_project: multi-llm-wagering
 wandb_entity: null
-wandb_name: centralized_wagers_linear_pooling
+wandb_name: mse_br_wagers_v2_4models_mmlu_calibrated
 shared_source_tripartition: true
 _include_test_datasets:
 - datasets/mmlu_full.yaml
-- datasets/medmcqa.yaml
 test_datasets:
 - display_name: mmlu_full_test
   eval_split: auxiliary_train
-- display_name: medmcqa_test
-  eval_split: train
 _include_ood_datasets:
 - datasets/arc_challenge.yaml
 - datasets/forecastqa.yaml
@@ -64,4 +64,3 @@ ood_datasets:
   eval_split: test
 - display_name: forecastqa_ood
   eval_split: train
-dataset_split_seed: 43

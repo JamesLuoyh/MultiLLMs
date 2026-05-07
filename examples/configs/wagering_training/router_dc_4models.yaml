@@ -13,7 +13,7 @@ _include_models:
   # - models/llama_2_7b.yaml
 
 # Apply adaptive temperature scaling to cached option logits before wagering.
-calibrated: true
+calibrated: false
 _include_calibration: calibration/adaptive_temperature_1000samples.yaml
 
 
@@ -24,6 +24,8 @@ wagering_method:
   name: router_dc
   config:
     encoder_model_name: microsoft/mdeberta-v3-base
+    debug_param_dtypes: true
+
     tokenizer_use_fast: false
     hidden_state_layers: [-1]  # Per-model layer picks, aligned with _include_models order
     max_seq_length: 512
@@ -31,7 +33,11 @@ wagering_method:
     lr_decay_factor: 1
     lr_decay_steps: 100
     temperature: 1.0
-    grad_clip_norm: 1.0
+    # Stability: keep encoder trainable but at a much smaller LR.
+    encoder_lr_mult: 0.01
+    # Stability: tighter clipping + skip extremely bad updates.
+    grad_clip_norm: 0.5
+    max_grad_norm_before_skip: 1000
     weight_decay: 0.01
     freeze_encoder: false
     pubmedqa_strip_context: true

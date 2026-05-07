@@ -3,11 +3,11 @@
 
 # Include model configs (must match training)
 _include_models:
-  - models/biomistral_7b.yaml
+  - models/llama3_aloe_8b_alpha.yaml
 
 # Checkpoint path (for equal_wagers, this can be a dummy path since no training is needed)
 checkpoint_path: /common/users/yl2310/MultiLLMs/checkpoints/dummy_equal_wagers
-
+cache_path: /research/projects/ecoai/yl2310/MultiLLMs/cache
 # Apply adaptive temperature scaling to cached option logits before wagering.
 calibrated: false
 _include_calibration: calibration/adaptive_temperature_pubmedqa_1000samples.yaml
@@ -53,7 +53,7 @@ aggregation:
 # validation_split_ratio: 0.1  # 10% of data for validation set (for early stopping)
 
 # Wandb logging
-report_to_wandb: true
+report_to_wandb: false
 wandb_project: multi-llm-wagering
 wandb_entity: null
 wandb_name: null
@@ -64,7 +64,7 @@ _include_test_datasets:
 
 # Override dataset-specific settings for evaluation
 test_datasets:
-  - display_name: pubmedqa_context_only_test
+  - display_name: pubmedqa_test
 
 # Evaluation parameters
 option_tokens: ["YES", "NO"]

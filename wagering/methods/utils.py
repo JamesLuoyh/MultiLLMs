@@ -57,11 +57,16 @@ def compute_scoring_rule(model_probs: torch.Tensor, outcome: int, scoring_rule: 
 def is_likely_pubmedqa_prompt(prompt: str) -> bool:
     """Heuristic detection for PubMedQA-style prompts used in this codebase."""
     lowered = str(prompt).lower()
-    return (
-        "question:" in lowered
-        and "long answer:" in lowered
-        and "answer with yes or no" in lowered
-    )
+    # We support two common prompt shapes in this repo:
+    # 1) "Question: ... Context: ... Long Answer: ... Answer with YES/NO ..."
+    # 2) "Question: ... Context: ... Answer with YES/NO ..." (context-only, no Long Answer section)
+    has_question = "question:" in lowered
+    has_context = "context:" in lowered
+    has_yes_no = "answer with yes or no" in lowered
+    has_long_answer = "long answer:" in lowered
+    # For stripping we really just need to be confident that a "Context:" block exists and that this
+    # prompt is in the PubMedQA family.
+    return bool(has_question and has_context and (has_yes_no or has_long_answer))
 
 
 def strip_pubmedqa_context(prompt: str) -> str:
@@ -73,8 +78,14 @@ def strip_pubmedqa_context(prompt: str) -> str:
     """
     text = str(prompt)
 
+    # Remove everything between the "Context:" header and the next section header.
+    # Some prompt templates include "Long Answer:"; others jump directly to "Answer...".
     context_pattern = re.compile(
-        r"(\n?\s*context:\s*\n?)(.*?)(?=\n\s*long answer:\s*|\Z)",
+        r"(\n?\s*context:\s*\n?)(.*?)(?="
+        r"\n\s*long answer:\s*"
+        r"|\n\s*answer\s+with\s+yes\s+or\s+no\b"
+        r"|\n\s*answer\s*:\s*"
+        r"|\Z)",
         flags=re.IGNORECASE | re.DOTALL,
     )
 
@@ -90,11 +101,18 @@ def preprocess_pubmedqa_prompts_for_embedding(
     prompts: Iterable[str],
     strip_context: bool = True,
 ) -> List[str]:
-    """Optionally strip PubMedQA context blocks before embedding generation."""
+    """Optionally strip *any* `Context:` blocks before embedding generation.
+
+    In this repo, multiple datasets reuse `mixed_context_routing: pubmedqa` and/or
+    PubMedQA-derived prompt templates that include a `Context:` section but may not
+    include the canonical PubMedQA `Long Answer:` section. When `strip_context` is
+    enabled, we strip the `Context:` block whenever it appears rather than relying
+    on a prompt-shape heuristic.
+    """
     processed: List[str] = []
     for prompt in prompts:
         prompt_text = str(prompt)
-        if strip_context and is_likely_pubmedqa_prompt(prompt_text):
+        if strip_context:
             prompt_text = strip_pubmedqa_context(prompt_text)
         processed.append(prompt_text)
     return processed

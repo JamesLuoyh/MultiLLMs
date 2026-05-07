@@ -68,7 +68,11 @@ class PreInferenceMSEBrWagersV2(WageringMethod):
         self.device = torch.device(self.device_str)
 
         self.tokenizer = AutoTokenizer.from_pretrained(self.bert_model_name)
-        self.bert = AutoModel.from_pretrained(self.bert_model_name).to(self.device)
+        # Ensure router encoder stays fp32 (trainer uses plain AdamW, no AMP GradScaler).
+        self.bert = AutoModel.from_pretrained(
+            self.bert_model_name,
+            torch_dtype=torch.float32,
+        ).to(self.device)
 
         if self.freeze_bert:
             for param in self.bert.parameters():

@@ -3,7 +3,7 @@
 Repeat-run wrapper for scripts/wagering_pipeline.py.
 
 Runs the same config N times (parallel by default), forces wandb off, varies
-shuffle_seed and dataset_split_seed per repeat, and gives each repeat its own
+shuffle_seed per repeat (keeping dataset_split_seed fixed for stable splits/caches), and gives each repeat its own
 checkpoint directory. Use ``--max-workers-per-gpu K`` to cap concurrency at
 ``K`` jobs per visible GPU (each subprocess gets its own ``CUDA_VISIBLE_DEVICES``).
 Optionally set ``--gpus`` to constrain visible GPU IDs (e.g. ``--gpus 2,3``).
@@ -63,6 +63,9 @@ import yaml
 
 DEFAULT_AGGREGATE_METRICS = [
     "accuracy",
+    "auc",
+    "bernoulli_kl",
+    "bernoulli_tv",
     "d_regret",
     "brier_d_regret",
     "kendall_tau",
@@ -74,7 +77,7 @@ DEFAULT_AGGREGATE_METRICS = [
 
 # Printed as (value * scale); e.g. accuracy 0.76 -> "76.12" with scale 100.
 _AGGREGATE_PRINT_SCALE_100 = frozenset(
-    {"accuracy", "ece", "best_model_mrr", "d_regret", "brier_d_regret", "kendall_tau"}
+    {"accuracy", "auc", "ece", "best_model_mrr", "d_regret", "brier_d_regret", "kendall_tau", "bernoulli_kl", "bernoulli_tv"}
 )
 
 
@@ -105,6 +108,153 @@ def _format_aggregate_metric_latex_line(
     if pd.notna(nruns):
         parts_out.append(f"$n={int(nruns)}$")
     return f"{col}: " + "  ".join(parts_out)
+
+
+def _format_mean_ci_for_metric(col: str, mean: float, ci_low: Optional[float], ci_high: Optional[float], n: int) -> str:
+    """Format like: 94.68\\tiny{$\\pm$0.00} (scaled when appropriate)."""
+    scale = 100.0 if col in _AGGREGATE_PRINT_SCALE_100 else 1.0
+    dec = 2 if scale == 100.0 else 4
+    m = float(mean) * scale
+    if ci_low is not None and ci_high is not None:
+        lo_f, hi_f = float(ci_low) * scale, float(ci_high) * scale
+        margin = (hi_f - lo_f) / 2.0
+        return f"{m:.{dec}f}\\tiny{{$\\pm${margin:.{dec}f}}}  $n={int(n)}$"
+    return f"{m:.{dec}f}  $n={int(n)}$"
+
+
+def _mean_std_ci95(values: List[float]) -> Dict[str, Any]:
+    """Return mean/std and (ci_low, ci_high) for the mean using Student's t."""
+    import numpy as np
+    from scipy import stats
+
+    arr = np.asarray(values, dtype=float)
+    arr = arr[np.isfinite(arr)]
+    n = int(arr.size)
+    if n == 0:
+        return {"n": 0, "mean": None, "std": None, "ci95_low": None, "ci95_high": None}
+    mean = float(np.mean(arr))
+    std = float(np.std(arr, ddof=1)) if n >= 2 else 0.0
+    if n >= 2:
+        sem = std / float(np.sqrt(n))
+        tcrit = float(stats.t.ppf(0.975, df=n - 1))
+        margin = tcrit * sem
+        return {"n": n, "mean": mean, "std": std, "ci95_low": mean - margin, "ci95_high": mean + margin}
+    return {"n": n, "mean": mean, "std": std, "ci95_low": None, "ci95_high": None}
+
+
+def _collect_eval_metrics_json_paths(repeat_root: Path) -> List[Path]:
+    # Matches: repeat_0000/<wandb_name>/pipeline_artifacts/eval.metrics.json
+    paths = sorted(repeat_root.glob("repeat_*/**/pipeline_artifacts/eval.metrics.json"))
+    return [p for p in paths if p.is_file()]
+
+
+def _aggregate_eval_metrics_json(repeat_root: Path, metrics: List[str]) -> Optional[Dict[str, Any]]:
+    """Aggregate per-repeat eval.metrics.json into a run-level summary dict."""
+    import json
+
+    paths = _collect_eval_metrics_json_paths(repeat_root)
+    if not paths:
+        return None
+
+    loaded: List[Dict[str, Any]] = []
+    for p in paths:
+        try:
+            loaded.append(json.loads(p.read_text()))
+        except Exception:
+            continue
+    if not loaded:
+        return None
+
+    # Aggregate per dataset.
+    per_dataset_values: Dict[str, Dict[str, List[float]]] = {}
+    subset_per_dataset_values: Dict[str, Dict[str, List[float]]] = {}
+
+    for blob in loaded:
+        pd = blob.get("per_dataset", {})
+        if isinstance(pd, dict):
+            for ds, row in pd.items():
+                if not isinstance(row, dict):
+                    continue
+                per_dataset_values.setdefault(str(ds), {})
+                for m in metrics:
+                    try:
+                        v = row.get(m, None)
+                        if v is None:
+                            continue
+                        per_dataset_values[str(ds)].setdefault(m, []).append(float(v))
+                    except Exception:
+                        continue
+
+        subset = blob.get("subset_any_model_wrong", {})
+        if isinstance(subset, dict):
+            spd = subset.get("per_dataset", {})
+            if isinstance(spd, dict):
+                for ds, row in spd.items():
+                    if not isinstance(row, dict):
+                        continue
+                    subset_per_dataset_values.setdefault(str(ds), {})
+                    for m in metrics:
+                        try:
+                            v = row.get(m, None)
+                            if v is None:
+                                continue
+                            subset_per_dataset_values[str(ds)].setdefault(m, []).append(float(v))
+                        except Exception:
+                            continue
+
+    def _build_section(values_by_ds: Dict[str, Dict[str, List[float]]]) -> Dict[str, Any]:
+        out_per_ds: Dict[str, Any] = {}
+        # Overall = pooled across all repeats (and datasets, if multiple).
+        overall_vals: Dict[str, List[float]] = {m: [] for m in metrics}
+        n_repeats_by_ds: Dict[str, int] = {}
+
+        for ds, by_metric in values_by_ds.items():
+            out_per_ds[ds] = {}
+            # n for a dataset = max count across metrics present
+            n_ds = 0
+            for m, vals in by_metric.items():
+                stats = _mean_std_ci95(vals)
+                n_ds = max(n_ds, int(stats["n"]))
+                if stats["mean"] is not None:
+                    out_per_ds[ds][m] = {
+                        "mean": stats["mean"],
+                        "std": stats["std"],
+                        "ci95_low": stats["ci95_low"],
+                        "ci95_high": stats["ci95_high"],
+                        "formatted": _format_mean_ci_for_metric(
+                            m, stats["mean"], stats["ci95_low"], stats["ci95_high"], int(stats["n"])
+                        ),
+                    }
+                    # Pool raw per-repeat values so n reflects repeats.
+                    overall_vals[m].extend([float(x) for x in vals])
+            n_repeats_by_ds[ds] = n_ds
+            out_per_ds[ds]["num_repeats_with_metrics"] = n_ds
+
+        overall_out: Dict[str, Any] = {}
+        for m, vals in overall_vals.items():
+            if not vals:
+                continue
+            stats = _mean_std_ci95(vals)
+            if stats["mean"] is None:
+                continue
+            overall_out[m] = {
+                "mean": stats["mean"],
+                "std": stats["std"],
+                "ci95_low": stats["ci95_low"],
+                "ci95_high": stats["ci95_high"],
+                "formatted": _format_mean_ci_for_metric(
+                    m, stats["mean"], stats["ci95_low"], stats["ci95_high"], int(stats["n"])
+                ),
+            }
+
+        return {"per_dataset": out_per_ds, "overall": overall_out}
+
+    return {
+        "repeat_root": str(repeat_root),
+        "num_repeats_with_eval_metrics_json": len(loaded),
+        "full": _build_section(per_dataset_values),
+        "subset_any_model_wrong": _build_section(subset_per_dataset_values),
+    }
 
 
 def _add_mean_ci95_columns(agg: Any, result_columns: List[str]) -> Any:
@@ -241,6 +391,33 @@ def _dump_yaml(path: Path, data: Dict[str, Any]) -> None:
         yaml.safe_dump(data, f, sort_keys=False)
 
 
+def _write_json(path: Path, data: Any) -> None:
+    import json
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    def _default(obj: Any) -> str:
+        try:
+            if isinstance(obj, Path):
+                return str(obj)
+        except Exception:
+            pass
+        if hasattr(obj, "tolist"):
+            try:
+                return obj.tolist()
+            except Exception:
+                pass
+        if hasattr(obj, "__dict__"):
+            try:
+                return obj.__dict__
+            except Exception:
+                pass
+        return str(obj)
+
+    with path.open("w") as f:
+        json.dump(data, f, indent=2, default=_default)
+
+
 def _force_wandb_off(cfg: Dict[str, Any]) -> Dict[str, Any]:
     out = dict(cfg)
     out["report_to_wandb"] = False
@@ -258,10 +435,7 @@ def _vary_seeds(cfg: Dict[str, Any], repeat_idx: int) -> Dict[str, Any]:
             return int(default)
 
     base_shuffle = _base_int("shuffle_seed", 42)
-    base_split = _base_int("dataset_split_seed", 42)
-
     out["shuffle_seed"] = base_shuffle + int(repeat_idx)
-    out["dataset_split_seed"] = base_split + int(repeat_idx)
     return out
 
 
@@ -275,7 +449,19 @@ def _resolve_base_checkpoint_dir(
 
     cfg_val = cfg.get("checkpoint_base_dir")
     if isinstance(cfg_val, str) and cfg_val.strip():
-        return Path(cfg_val)
+        p = Path(cfg_val).expanduser()
+        if not p.is_absolute():
+            p = (config_path.parent / p).resolve()
+        return p
+
+    # Back-compat: if the config only has a concrete checkpoint_path, infer the base
+    # directory from its parent.
+    ckpt_path = cfg.get("checkpoint_path")
+    if isinstance(ckpt_path, str) and ckpt_path.strip():
+        p = Path(ckpt_path).expanduser()
+        if not p.is_absolute():
+            p = (config_path.parent / p).resolve()
+        return p.parent
 
     return Path("/common/users/yl2310/MultiLLMs/checkpoints")
 
@@ -587,8 +773,43 @@ def main() -> int:
 
     checkpoint_base_dir_override = Path(args.checkpoint_base_dir) if args.checkpoint_base_dir else None
     base_ckpt_dir = _resolve_base_checkpoint_dir(cfg, config_path, checkpoint_base_dir_override)
-    run_tag = time.strftime("%Y%m%d_%H%M%S")
+    wandb_name = cfg.get("wandb_name")
+    if isinstance(wandb_name, str) and wandb_name.strip():
+        run_tag = wandb_name.strip()
+    else:
+        run_tag = time.strftime("%Y%m%d_%H%M%S")
+
     run_tag_dir = base_ckpt_dir / run_tag
+    if run_tag_dir.exists():
+        # Avoid clobbering a previous run with the same wandb_name.
+        run_tag = f"{run_tag}_{time.strftime('%Y%m%d_%H%M%S')}"
+        run_tag_dir = base_ckpt_dir / run_tag
+    run_tag_dir.mkdir(parents=True, exist_ok=True)
+
+    # Persist the repeat-run config inputs for reproducibility.
+    try:
+        _dump_yaml(run_tag_dir / "repeat.base_config.original.yaml", _load_yaml(config_path))
+        _dump_yaml(run_tag_dir / "repeat.base_config.mutated.yaml", cfg)
+        _write_json(
+            run_tag_dir / "repeat.run_manifest.json",
+            {
+                "config_path": str(config_path),
+                "run_tag": run_tag,
+                        "wandb_name": wandb_name,
+                "checkpoint_base_dir": str(base_ckpt_dir),
+                "run_tag_dir": str(run_tag_dir),
+                "n_repeats": int(args.n_repeats),
+                "max_workers": int(args.max_workers),
+                "max_workers_per_gpu": int(args.max_workers_per_gpu) if args.max_workers_per_gpu is not None else None,
+                "gpus_arg": args.gpus,
+                "visible_gpu_ids": visible_gpu_ids,
+                "skip_training": bool(args.skip_training),
+                "skip_evaluation": bool(args.skip_evaluation),
+                "checkpoint_path_override": args.checkpoint_path,
+            },
+        )
+    except Exception:
+        pass
 
     env = _wandb_disabled_env(os.environ)
     if visible_gpu_ids:
@@ -604,8 +825,15 @@ def main() -> int:
         repeat_ckpt_dir = _repeat_checkpoint_dir(base_ckpt_dir, repeat_idx, run_tag)
         repeat_cfg = _vary_seeds(cfg, repeat_idx)
         repeat_cfg["checkpoint_base_dir"] = str(repeat_ckpt_dir)
+        # Ensure eval artifacts land inside each repeat directory.
+        # For non-trainable methods (no checkpoint required), wagering_eval.py chooses
+        # eval output dir based on (eval_checkpoint_dir) or (checkpoint_path/eval).
+        repeat_cfg.setdefault("eval_checkpoint_dir", str(repeat_ckpt_dir / "eval"))
+        if args.checkpoint_path is None:
+            repeat_cfg.setdefault("checkpoint_path", str(repeat_ckpt_dir))
 
         temp_cfg_path = config_path.parent / f".tmp_wagering_repeat_{run_tag}_{repeat_idx:04d}.yaml"
+        repeat_cfg_logged = run_tag_dir / f"repeat_{repeat_idx:04d}.config.yaml"
 
         gpu_index: Optional[str] = None
         run_env = dict(env)
@@ -615,6 +843,10 @@ def main() -> int:
 
         try:
             _dump_yaml(temp_cfg_path, repeat_cfg)
+            try:
+                _dump_yaml(repeat_cfg_logged, repeat_cfg)
+            except Exception:
+                pass
 
             cmd = [str(python_exe), str(PIPELINE_SCRIPT), str(temp_cfg_path)]
             if args.skip_training:
@@ -696,6 +928,75 @@ def main() -> int:
             metrics = [m.strip() for m in args.aggregate_metrics.split(",") if m.strip()]
             out = Path(args.aggregate_output) if args.aggregate_output else None
             aggregate_eval_repeats(run_tag_dir, out, metrics)
+            # Also aggregate the JSON metrics we write per repeat.
+            try:
+                agg_json = _aggregate_eval_metrics_json(run_tag_dir, metrics)
+                if agg_json is not None:
+                    metrics_dir = run_tag_dir / "pipeline_artifacts"
+                    metrics_dir.mkdir(parents=True, exist_ok=True)
+                    _write_json(metrics_dir / "eval.metrics.json", agg_json)
+
+                    # Console: print in the same style as the CSV aggregator snippet:
+                    #   accuracy: 94.68\tiny{$\pm$0.00}  $n=2$
+                    #     d_regret: ...
+                    def _print_block(overall_dict: Any) -> None:
+                        if not isinstance(overall_dict, dict) or not overall_dict:
+                            return
+                        first = True
+                        for m in metrics:
+                            row = overall_dict.get(m)
+                            if not isinstance(row, dict) or "formatted" not in row:
+                                continue
+                            prefix = "" if first else "  "
+                            print(f"{prefix}{m}: {row['formatted']}", flush=True)
+                            first = False
+
+                    def _print_per_dataset(section: Any) -> bool:
+                        """Print per-dataset blocks; return True if printed any."""
+                        if not isinstance(section, dict):
+                            return False
+                        per_ds = section.get("per_dataset", {})
+                        if not isinstance(per_ds, dict) or not per_ds:
+                            return False
+                        # Only print per-dataset breakdown when multiple datasets exist.
+                        if len(per_ds) <= 1:
+                            return False
+                        for ds_name, ds_blob in per_ds.items():
+                            if not isinstance(ds_blob, dict):
+                                continue
+                            print(f"[{ds_name}]", flush=True)
+                            _print_block(ds_blob)
+                        return True
+
+                    full_section = agg_json.get("full", {})
+                    printed_full_per_ds = _print_per_dataset(full_section)
+                    if not printed_full_per_ds:
+                        full_overall = full_section.get("overall", {}) if isinstance(full_section, dict) else {}
+                        _print_block(full_overall)
+
+                    subset_section = agg_json.get("subset_any_model_wrong", {})
+                    subset_has_any = isinstance(subset_section, dict) and bool(subset_section)
+                    if subset_has_any:
+                        print("subset_any_model_wrong", flush=True)
+                        printed_subset_per_ds = _print_per_dataset(subset_section)
+                        if not printed_subset_per_ds:
+                            subset_overall = subset_section.get("overall", {})
+                            _print_block(subset_overall)
+            except Exception as e_json:
+                print(f"[aggregate json] skipped or failed: {e_json}", flush=True)
+            try:
+                _write_json(
+                    run_tag_dir / "repeat.aggregate_manifest.json",
+                    {
+                        "repeat_root": str(run_tag_dir),
+                        "aggregate_output": str(out) if out is not None else str(run_tag_dir / "aggregated_eval_repeats.csv"),
+                        "aggregate_metrics": metrics,
+                        "per_repeat_csv": str(run_tag_dir / "aggregate_eval_per_repeat.csv"),
+                        "aggregate_eval_metrics_json": str((run_tag_dir / "pipeline_artifacts" / "eval.metrics.json")),
+                    },
+                )
+            except Exception:
+                pass
         except Exception as e:
             print(f"[aggregate] skipped or failed: {e}", flush=True)
 

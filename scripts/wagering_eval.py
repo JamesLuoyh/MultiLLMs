@@ -16,6 +16,7 @@ from typing import Optional
 
 import numpy as np
 import pandas as pd
+import torch
 
 # Ensure the local src/ tree and wagering package are importable
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -26,6 +27,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from wagering.utils import load_models_from_config, load_datasets_from_config, load_and_merge_configs
+from wagering.utils.model_utils import should_load_prompt_perplexity_models_sequentially
 from wagering.calibration import calibration_enabled, fit_or_load_logit_calibrator
 from wagering.utils.multi_llm_ensemble import (
     assign_pubmedqa_context_models,
@@ -290,10 +292,25 @@ def main(
             num_models,
         )
 
+    use_sequential_eval_perplexity = (
+        force_load_all_models and should_load_prompt_perplexity_models_sequentially(num_models)
+    )
+    perplexity_cache_kwargs = (
+        {"cache_dir": args.get("cache_path", "./workdir/cache")} if args.get("cache_path") else {}
+    )
+
     models = []
     model_names = cached_model_names[:]
     load_model_indices = list(range(num_models)) if force_load_all_models else cache_miss_indices
-    if load_model_indices:
+    if use_sequential_eval_perplexity:
+        log.info(
+            "Deferring full ensemble load for prompt perplexity (%d models on %d visible CUDA device(s)); "
+            "evaluator will load one model at a time.",
+            num_models,
+            int(torch.cuda.device_count()) if torch.cuda.is_available() else 0,
+        )
+        models = [cfg["path"] for cfg in model_cfgs]
+    elif load_model_indices:
         if force_load_all_models:
             log.info(
                 "Loading %d/%d models to compute prompt perplexities.",
@@ -305,7 +322,7 @@ def main(
         missing_cfgs = [model_cfgs[i] for i in load_model_indices]
         missing_models, missing_names = load_models_from_config(
             missing_cfgs,
-            cache_kwargs={"cache_dir": args.get("cache_path", "./workdir/cache")} if args.get("cache_path") else {},
+            cache_kwargs=perplexity_cache_kwargs,
         )
         missing_name_map = {idx: name for idx, name in zip(load_model_indices, missing_names)}
         missing_iter = iter(missing_models)
@@ -358,21 +375,25 @@ def main(
             log.error(f"   Directory contents: {list(checkpoint_path.iterdir()) if checkpoint_path.exists() else 'directory does not exist'}")
             sys.exit(1)
         
-        import torch
-
         def _nested_tensor_sum(obj) -> float:
+            """Sum all tensor leaves in deterministic key order using float64 on CPU.
+
+            Avoids false checksum mismatches from (1) GPU vs CPU reduction order in
+            tensor.sum() and (2) differing dict iteration order between checkpoint and
+            loaded state_dict trees.
+            """
             total = 0.0
             if isinstance(obj, dict):
-                for v in obj.values():
-                    total += _nested_tensor_sum(v)
+                for k in sorted(obj.keys()):
+                    total += _nested_tensor_sum(obj[k])
             elif torch.is_tensor(obj):
-                total += float(obj.detach().sum().cpu().item())
+                total += float(obj.detach().cpu().double().sum().item())
             return total
 
         def _subset_tensor_sum(obj, keys) -> float:
             total = 0.0
             if isinstance(obj, dict):
-                for k in keys:
+                for k in sorted(keys):
                     if k in obj:
                         total += _nested_tensor_sum(obj[k])
             return total
@@ -496,6 +517,13 @@ def main(
         metadata["training_datasets"] = training_datasets
     
     seed = args.get("seed", args.get("shuffle_seed", None))
+
+    env_prob_dbg = os.environ.get("WAGERING_DEBUG_PROB_ALIGN", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    debug_batch_prob_alignment = bool(args.get("debug_batch_prob_alignment", False)) or env_prob_dbg
     
     # Get starting step from wandb if active
     wandb_starting_step = None
@@ -523,6 +551,11 @@ def main(
         seed=seed,
         wandb_starting_step=wandb_starting_step,
         logit_calibrator=logit_calibrator,
+        model_configs_for_sequential_perplexity=(
+            model_cfgs if force_load_all_models else None
+        ),
+        perplexity_load_cache_kwargs=perplexity_cache_kwargs if perplexity_cache_kwargs else None,
+        debug_batch_prob_alignment=debug_batch_prob_alignment,
     )
     
     # Evaluate
@@ -548,6 +581,8 @@ def main(
         "brier": [],
         "auc": [],
         "ece": [],
+        "inverse_hhi": [],
+        "avg_inference_time_per_batch_s": [],
         "d_regret": [],
         "brier_d_regret": [],
         "meta_acc": [],
@@ -555,9 +590,12 @@ def main(
         "meta_auc": [],
         "kendall_tau": [],
         "best_model_mrr": [],
+        "bernoulli_kl": [],
+        "bernoulli_tv": [],
     }
     
     for dataset_name, result in results.items():
+        subset = result.get("subset_any_model_wrong") if isinstance(result, dict) else None
         def get_metric_str(result, key):
             val = result.get(key, None)
             if val is None:
@@ -583,6 +621,8 @@ def main(
         brier_val = get_metric_float(result, "brier")
         auc_val = get_metric_float(result, "auc")
         ece_val = get_metric_float(result, "ece")
+        inverse_hhi_val = get_metric_float(result, "inverse_hhi")
+        avg_inference_time_val = get_metric_float(result, "avg_inference_time_per_batch_s")
         d_regret_val = get_metric_float(result, "d_regret")
         brier_d_regret_val = get_metric_float(result, "brier_d_regret")
         meta_acc_val = get_metric_float(result, "meta_acc")
@@ -590,6 +630,8 @@ def main(
         meta_auc_val = get_metric_float(result, "meta_auc")
         kendall_tau_val = get_metric_float(result, "kendall_tau")
         best_model_mrr_val = get_metric_float(result, "best_model_mrr")
+        bernoulli_kl_val = get_metric_float(result, "bernoulli_kl")
+        bernoulli_tv_val = get_metric_float(result, "bernoulli_tv")
 
         if accuracy_val is not None:
             aggregate_metrics["accuracy"].append(accuracy_val)
@@ -601,6 +643,10 @@ def main(
             aggregate_metrics["auc"].append(auc_val)
         if ece_val is not None:
             aggregate_metrics["ece"].append(ece_val)
+        if inverse_hhi_val is not None:
+            aggregate_metrics["inverse_hhi"].append(inverse_hhi_val)
+        if avg_inference_time_val is not None:
+            aggregate_metrics["avg_inference_time_per_batch_s"].append(avg_inference_time_val)
         if d_regret_val is not None:
             aggregate_metrics["d_regret"].append(d_regret_val)
         if brier_d_regret_val is not None:
@@ -615,12 +661,18 @@ def main(
             aggregate_metrics["kendall_tau"].append(kendall_tau_val)
         if best_model_mrr_val is not None:
             aggregate_metrics["best_model_mrr"].append(best_model_mrr_val)
+        if bernoulli_kl_val is not None:
+            aggregate_metrics["bernoulli_kl"].append(bernoulli_kl_val)
+        if bernoulli_tv_val is not None:
+            aggregate_metrics["bernoulli_tv"].append(bernoulli_tv_val)
 
         accuracy_str = get_metric_str(result, "accuracy")
         nll_str = get_metric_str(result, "nll")
         brier_str = get_metric_str(result, "brier")
         auc_str = get_metric_str(result, "auc")
         ece_str = get_metric_str(result, "ece")
+        inverse_hhi_str = get_metric_str(result, "inverse_hhi")
+        avg_inference_time_str = get_metric_str(result, "avg_inference_time_per_batch_s")
         d_regret_str = get_metric_str(result, "d_regret")
         brier_d_regret_str = get_metric_str(result, "brier_d_regret")
         meta_acc_str = get_metric_str(result, "meta_acc")
@@ -628,15 +680,44 @@ def main(
         meta_auc_str = get_metric_str(result, "meta_auc")
         kendall_tau_str = get_metric_str(result, "kendall_tau")
         best_model_mrr_str = get_metric_str(result, "best_model_mrr")
+        bernoulli_kl_str = get_metric_str(result, "bernoulli_kl")
+        bernoulli_tv_str = get_metric_str(result, "bernoulli_tv")
         
         log.info(
             f"{dataset_name}: Accuracy={accuracy_str}, "
-            f"NLL={nll_str}, Brier={brier_str}, AUC={auc_str}, ECE={ece_str}, "
+            f"NLL={nll_str}, Brier={brier_str}, KL={bernoulli_kl_str}, TV={bernoulli_tv_str}, AUC={auc_str}, ECE={ece_str}, "
+            f"InverseHHI={inverse_hhi_str}, AvgInferenceTimePerBatchS={avg_inference_time_str}, "
             f"DRegret={d_regret_str}, BrierDRegret={brier_d_regret_str}, MetaAcc={meta_acc_str}, MetaNLL={meta_nll_str}, MetaAUC={meta_auc_str}, "
             f"KendallTau={kendall_tau_str}, BestModelMRR={best_model_mrr_str}"
         )
+
+        if isinstance(subset, dict) and int(subset.get("num_examples", 0) or 0) > 0:
+            sub_n = int(subset.get("num_examples"))
+            sub_acc = subset.get("accuracy", None)
+            sub_nll = subset.get("nll", None)
+            sub_ece = subset.get("ece", None)
+            sub_dr = subset.get("d_regret", None)
+            sub_kl = subset.get("bernoulli_kl", None)
+            sub_tv = subset.get("bernoulli_tv", None)
+            def _fmt(v):
+                try:
+                    return f"{float(v):.4f}"
+                except Exception:
+                    return "N/A"
+            log.info(
+                f"{dataset_name} [subset any-model-wrong n={sub_n}]: "
+                f"Accuracy={_fmt(sub_acc)}, NLL={_fmt(sub_nll)}, KL={_fmt(sub_kl)}, TV={_fmt(sub_tv)}, "
+                f"ECE={_fmt(sub_ece)}, DRegret={_fmt(sub_dr)}"
+            )
         
-        results_summary[dataset_name] = f"Accuracy={accuracy_str}, AUC={auc_str}, ECE={ece_str}, NLL={nll_str}, Brier={brier_str}, DRegret={d_regret_str}, BrierDRegret={brier_d_regret_str}, MetaAcc={meta_acc_str}, MetaAuc={meta_auc_str}, MetaNLL={meta_nll_str}, KendallTau={kendall_tau_str}, BestModelMRR={best_model_mrr_str}"
+        results_summary[dataset_name] = (
+            f"Accuracy={accuracy_str}, AUC={auc_str}, ECE={ece_str}, "
+            f"InverseHHI={inverse_hhi_str}, AvgInferenceTimePerBatchS={avg_inference_time_str}, "
+            f"NLL={nll_str}, Brier={brier_str}, KL={bernoulli_kl_str}, TV={bernoulli_tv_str}, "
+            f"DRegret={d_regret_str}, BrierDRegret={brier_d_regret_str}, "
+            f"MetaAcc={meta_acc_str}, MetaAuc={meta_auc_str}, MetaNLL={meta_nll_str}, "
+            f"KendallTau={kendall_tau_str}, BestModelMRR={best_model_mrr_str}"
+        )
 
     def aggregate_metric_str(values):
         if not values:
@@ -649,6 +730,8 @@ def main(
     overall_brier = aggregate_metric_str(aggregate_metrics["brier"])
     overall_auc = aggregate_metric_str(aggregate_metrics["auc"])
     overall_ece = aggregate_metric_str(aggregate_metrics["ece"])
+    overall_inverse_hhi = aggregate_metric_str(aggregate_metrics["inverse_hhi"])
+    overall_avg_inference_time_per_batch_s = aggregate_metric_str(aggregate_metrics["avg_inference_time_per_batch_s"])
     overall_d_regret = aggregate_metric_str(aggregate_metrics["d_regret"])
     overall_brier_d_regret = aggregate_metric_str(aggregate_metrics["brier_d_regret"])
     overall_meta_acc = aggregate_metric_str(aggregate_metrics["meta_acc"])
@@ -656,10 +739,14 @@ def main(
     overall_meta_auc = aggregate_metric_str(aggregate_metrics["meta_auc"])
     overall_kendall_tau = aggregate_metric_str(aggregate_metrics["kendall_tau"])
     overall_best_model_mrr = aggregate_metric_str(aggregate_metrics["best_model_mrr"])
+    overall_bernoulli_kl = aggregate_metric_str(aggregate_metrics["bernoulli_kl"])
+    overall_bernoulli_tv = aggregate_metric_str(aggregate_metrics["bernoulli_tv"])
 
     results_summary["overall"] = (
         f"Accuracy={overall_accuracy}, AUC={overall_auc}, ECE={overall_ece}, "
-        f"NLL={overall_nll}, Brier={overall_brier}, DRegret={overall_d_regret}, BrierDRegret={overall_brier_d_regret}, MetaAcc={overall_meta_acc}, "
+        f"InverseHHI={overall_inverse_hhi}, AvgInferenceTimePerBatchS={overall_avg_inference_time_per_batch_s}, "
+        f"NLL={overall_nll}, Brier={overall_brier}, KL={overall_bernoulli_kl}, TV={overall_bernoulli_tv}, "
+        f"DRegret={overall_d_regret}, BrierDRegret={overall_brier_d_regret}, MetaAcc={overall_meta_acc}, "
         f"MetaAuc={overall_meta_auc}, MetaNLL={overall_meta_nll}, KendallTau={overall_kendall_tau}, BestModelMRR={overall_best_model_mrr}"
     )
     

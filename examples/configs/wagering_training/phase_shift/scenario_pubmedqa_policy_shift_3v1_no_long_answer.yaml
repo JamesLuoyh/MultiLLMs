@@ -11,10 +11,10 @@ aggregation:
 option_tokens: ["YES", "NO"]
 
 cache_path: /research/projects/ecoai/yl2310/MultiLLMs/wagering_model_logits_states_caches
-checkpoint_base_dir: /common/users/yl2310/MultiLLMs/checkpoints
+checkpoint_base_dir: /research/projects/ecoai/yl2310/MultiLLMs/checkpoints
 save_every: 100
 # Trainer loop batch size. Keep aligned with per-phase dataset batch_size for clarity.
-training_batch_size: 100
+training_batch_size: 30
 shuffle_data: true
 shuffle_seed: 18 #18 #42
 dataset_split_seed: 42
@@ -46,9 +46,30 @@ phase_shift:
   # For identical base models under mixed-context PubMedQA routing, compute
   # perplexity once per unique prompt variant and reuse across repeated slots.
   reuse_prompt_perplexities_for_identical_models: true
-  output_dir: /common/users/yl2310/MultiLLMs/phase_shift_outputs/scenario_pubmedqa_policy_shift_3v1_no_long_answer
-  metrics: [accuracy, ece, kendall_tau, best_model_mrr, brier_d_regret]
+  output_dir: /common/users/yl2310/MultiLLMs/phase_shift_outputs/scenario_pubmedqa_shift_3v1_to_1v3
+  metrics: [auc, accuracy, ece, kendall_tau, best_model_mrr, brier_d_regret]
   methods:
+    - name: router_dc
+      config:
+        encoder_model_name: microsoft/mdeberta-v3-base
+        tokenizer_use_fast: false
+        hidden_state_layers: [-1]  # Per-model layer picks, aligned with _include_models order
+        max_seq_length: 512
+        learning_rate: 1e-6
+        micro_batch_size: 30
+        lr_decay_factor: 1
+        lr_decay_steps: 100
+        temperature: 2.0
+        grad_clip_norm: 1.0
+        weight_decay: 0.01
+        freeze_encoder: false
+        pubmedqa_strip_context: false
+        similarity_function: cos
+        top_k: 3
+        last_k: 3
+        min_pos_p: 0.01
+        neg_mask_threshold: 0.5
+        device: cuda:0
     - name: centralized_wagers
       config:
         hidden_dim: 4096
@@ -76,18 +97,18 @@ phase_shift:
         temperature: 2.0
         normalize_hidden_states: false
         device: cuda:2
-    - name: equal_wagers
-      config:
-        device: cuda:1
-    - name: packllm_perplexity_wagers
-      config:
-        tau: 1.0
-        epsilon: 1.0e-12
-        device: cuda:2
-    - name: kl_uniform_wagers
-      config:
-        confidence_epsilon: 1.0e-8
-        device: cuda:3
+    # - name: equal_wagers
+    #   config:
+    #     device: cuda:1
+    # - name: packllm_perplexity_wagers
+    #   config:
+    #     tau: 1.0
+    #     epsilon: 1.0e-12
+    #     device: cuda:2
+    # - name: kl_uniform_wagers
+    #   config:
+    #     confidence_epsilon: 1.0e-8
+    #     device: cuda:3
     - name: nirt_router
       config:
         encoder_model_name: bert-base-uncased
@@ -101,7 +122,7 @@ phase_shift:
         grad_clip_norm: 1.0
         weight_decay: 0.01
         freeze_encoder: true
-        pubmedqa_strip_context: true
+        pubmedqa_strip_context: false
         knowledge_dim: 25
         model_embedding_dim: 256
         router_hidden_dim: 512
@@ -110,27 +131,7 @@ phase_shift:
         mixture_ce_weight: 0.25
         param_l2_weight: 1e-4
         device: cuda:3
-    - name: router_dc
-      config:
-        encoder_model_name: microsoft/mdeberta-v3-base
-        tokenizer_use_fast: false
-        hidden_state_layers: [-1]  # Per-model layer picks, aligned with _include_models order
-        max_seq_length: 512
-        learning_rate: 1e-6
-        micro_batch_size: 25
-        lr_decay_factor: 1
-        lr_decay_steps: 100
-        temperature: 2.0
-        grad_clip_norm: 1.0
-        weight_decay: 0.01
-        freeze_encoder: false
-        pubmedqa_strip_context: true
-        similarity_function: cos
-        top_k: 3
-        last_k: 3
-        min_pos_p: 0.01
-        neg_mask_threshold: 0.5
-        device: cuda:0
+    
     - name: route_llm_bert
       config:
         bert_model_name: bert-base-uncased
@@ -143,7 +144,7 @@ phase_shift:
         grad_clip_norm: 1.0
         weight_decay: 0.01
         freeze_bert: false
-        pubmedqa_strip_context: true
+        pubmedqa_strip_context: false
         router_dropout: 0.1
         ranking_loss_weight: 0.0
         ranking_margin: 0.1

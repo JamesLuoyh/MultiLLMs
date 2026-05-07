@@ -2,7 +2,10 @@
 
 from unittest.mock import patch
 
-from wagering.utils.model_utils import load_models_from_config
+from wagering.utils.model_utils import (
+    load_models_from_config,
+    should_load_prompt_perplexity_models_sequentially,
+)
 
 
 class _DummyLoadedModel:
@@ -69,3 +72,21 @@ def test_load_models_can_disable_sharing(
     assert len(models) == 2
     assert models[0] is not models[1]
     assert mock_from_pretrained.call_count == 2
+
+
+@patch("wagering.utils.model_utils.torch.cuda.device_count", return_value=1)
+@patch("wagering.utils.model_utils.torch.cuda.is_available", return_value=True)
+def test_should_load_prompt_perplexity_sequentially_multi_on_one_gpu(
+    _mock_cuda_available,
+    _mock_device_count,
+):
+    assert should_load_prompt_perplexity_models_sequentially(4) is True
+
+
+@patch("wagering.utils.model_utils.torch.cuda.device_count", return_value=4)
+@patch("wagering.utils.model_utils.torch.cuda.is_available", return_value=True)
+def test_should_load_prompt_perplexity_sequentially_fits_on_gpus(
+    _mock_cuda_available,
+    _mock_device_count,
+):
+    assert should_load_prompt_perplexity_models_sequentially(4) is False

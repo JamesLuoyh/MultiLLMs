@@ -11,8 +11,9 @@ option_tokens: [A, B, C, D]
 
 checkpoint_base_dir: /research/projects/ecoai/yl2310/MultiLLMs/checkpoints
 save_every: 100
+
 # Trainer loop batch size. Keep aligned with per-phase dataset batch_size for clarity.
-training_batch_size: 100
+training_batch_size: 8
 shuffle_data: true
 shuffle_seed: 18 #18 #42
 dataset_split_seed: 42
@@ -24,8 +25,9 @@ wandb_name: phase_shift_model_deletion
 test_datasets: []
 
 phase_shift:
-  rolling_window_batches: 10
-  output_dir: /research/projects/ecoai/yl2310/MultiLLMs/phase_shift_outputs/scenario_model_deletion_cache
+  rolling_window_batches: 100
+  baseline_window_batches: 200
+  output_dir: /research/projects/ecoai/yl2310/MultiLLMs/phase_shift_outputs/scenario_model_deletion_cache_2000_200batches_restart
   evaluate_after_phase2: false
   metrics: [accuracy, ece, kendall_tau, best_model_mrr, brier_d_regret]
   methods:
@@ -55,18 +57,18 @@ phase_shift:
         temperature: 2.0
         normalize_hidden_states: false
         device: cuda:2
-    - name: equal_wagers
-      config:
-        device: cuda:1
-    - name: packllm_perplexity_wagers
-      config:
-        tau: 1.0
-        epsilon: 1.0e-12
-        device: cuda:0
-    - name: kl_uniform_wagers
-      config:
-        confidence_epsilon: 1.0e-8
-        device: cuda:1
+    # # - name: equal_wagers
+    # #   config:
+    # #     device: cuda:1
+    # # - name: packllm_perplexity_wagers
+    # #   config:
+    # #     tau: 1.0
+    # #     epsilon: 1.0e-12
+    # #     device: cuda:0
+    # # - name: kl_uniform_wagers
+    # #   config:
+    # #     confidence_epsilon: 1.0e-8
+    # #     device: cuda:1
     - name: nirt_router
       config:
         encoder_model_name: bert-base-uncased
@@ -98,11 +100,11 @@ phase_shift:
         learning_rate: 1e-7
         lr_decay_factor: 1
         lr_decay_steps: 100
-        micro_batch_size: 25
+        micro_batch_size: 30
         temperature: 2.0
         grad_clip_norm: 0.25
         weight_decay: 0.001
-        freeze_encoder: true
+        freeze_encoder: false
         pubmedqa_strip_context: true
         similarity_function: cos
         top_k: 3
@@ -122,7 +124,7 @@ phase_shift:
         grad_clip_norm: 1.0
         weight_decay: 0.01
         freeze_bert: false
-        pubmedqa_strip_context: true
+        pubmedqa_strip_context: false
         router_dropout: 0.1
         ranking_loss_weight: 0.0
         ranking_margin: 0.1
@@ -141,7 +143,7 @@ phase_shift:
         label_column: cop
         train_split: train
         batch_size: 5
-        max_batches: 200
+        max_batches: 2000
         max_prompt_tokens: 1200
         load_from_disk: false
         trust_remote_code: false

@@ -36,7 +36,7 @@ wagering_method:
     grad_clip_norm: 1.0
     weight_decay: 0.01
     freeze_encoder: false
-    pubmedqa_strip_context: true
+    pubmedqa_strip_context: false
     similarity_function: cos
     top_k: 3
     last_k: 3
@@ -49,19 +49,18 @@ aggregation:
   config: {}
 
 option_tokens: ["YES", "NO"]
-cache_path: /common/users/yl2310/MultiLLMs/cache
 
 # ============================================================================
 # TRAINING CONFIGURATION
 # ============================================================================
-
+cache_path: /research/projects/ecoai/yl2310/MultiLLMs/cache
 _include_datasets:
   - datasets/pubmedqa_context_only.yaml
 
-num_epochs: 50
-checkpoint_base_dir: /common/users/yl2310/MultiLLMs/checkpoints
+num_epochs: 5
+checkpoint_base_dir: /research/projects/ecoai/yl2310/MultiLLMs/checkpoints
 save_every: 100
-training_batch_size: 8
+training_batch_size: 30
 
 auto_resume: false
 balance_training_datasets: true
@@ -73,7 +72,7 @@ early_stopping_criterion: validation
 report_to_wandb: true
 wandb_project: multi-llm-wagering
 wandb_entity: null
-wandb_name: router_dc_pubmedqa
+wandb_name: router_dc_pubmedqa_12
 
 # ============================================================================
 # EVALUATION CONFIGURATION

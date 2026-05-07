@@ -41,6 +41,7 @@ class WageringAnalytics:
         dataset_size: Optional[int] = None,
         early_stopping_criterion: str = "validation",
         use_brier_d_regret_for_early_stopping: bool = False,
+        use_min_kl_for_early_stopping: bool = False,
     ) -> pd.DataFrame:
         """
         Create analytics dataframe for training results.
@@ -56,6 +57,8 @@ class WageringAnalytics:
             early_stopping_criterion: Early stopping strategy name
             use_brier_d_regret_for_early_stopping: Whether Brier dynamic regret is used
                 as the monitored early stopping metric.
+            use_min_kl_for_early_stopping: Whether KL(gold || pred) is used as the monitored
+                early stopping metric (only valid when soft probabilistic labels exist).
             save_every: Save frequency
             results: Training results dictionary
             metadata: Optional metadata dict with model_names, dataset_names
@@ -108,6 +111,7 @@ class WageringAnalytics:
         row["early_stopping_patience"] = early_stopping_patience
         row["early_stopping_criterion"] = early_stopping_criterion
         row["use_brier_d_regret_for_early_stopping"] = bool(use_brier_d_regret_for_early_stopping)
+        row["use_min_kl_for_early_stopping"] = bool(use_min_kl_for_early_stopping)
         row["save_every"] = save_every
         
         # Dataset size (included in settings_hash to distinguish different settings)
@@ -248,6 +252,18 @@ class WageringAnalytics:
             row["accuracy"] = results.get("accuracy")
             row["nll"] = results.get("nll")
             row["brier"] = results.get("brier") if results.get("brier") is not None and not np.isnan(results.get("brier", np.nan)) else None
+            row["bernoulli_kl"] = (
+                results.get("bernoulli_kl")
+                if results.get("bernoulli_kl") is not None
+                and not np.isnan(results.get("bernoulli_kl", np.nan))
+                else None
+            )
+            row["bernoulli_tv"] = (
+                results.get("bernoulli_tv")
+                if results.get("bernoulli_tv") is not None
+                and not np.isnan(results.get("bernoulli_tv", np.nan))
+                else None
+            )
             row["auc"] = results.get("auc") if results.get("auc") is not None and not np.isnan(results.get("auc", np.nan)) else None
             row["ece"] = results.get("ece") if results.get("ece") is not None and not np.isnan(results.get("ece", np.nan)) else None
             row["inverse_hhi"] = results.get("inverse_hhi") if results.get("inverse_hhi") is not None and not np.isnan(results.get("inverse_hhi", np.nan)) else None
@@ -326,7 +342,7 @@ class WageringAnalytics:
             result_columns = [
                 col for col in combined_df.columns
                 if (col.startswith('final_') or col in [
-                    'accuracy', 'nll', 'brier', 'auc', 'ece', 'num_examples',
+                    'accuracy', 'nll', 'brier', 'bernoulli_kl', 'bernoulli_tv', 'auc', 'ece', 'num_examples',
                     'inverse_hhi', 'avg_inference_time_per_batch_s',
                     'd_regret', 'brier_d_regret', 'meta_acc', 'meta_nll', 'meta_auc',
                     'kendall_tau', 'best_model_mrr',

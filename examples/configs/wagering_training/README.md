@@ -116,7 +116,7 @@ ood_dataset:
 ### Example: Cached-Logit Calibration Config
 
 ```yaml
-calibrated: true
+calibrated: false
 _include_calibration: calibration/adaptive_temperature_1000samples.yaml
 ```
 

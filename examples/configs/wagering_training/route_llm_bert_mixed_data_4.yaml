@@ -15,7 +15,7 @@ _include_models:
   # - models/llama_2_7b.yaml
 
 # Apply adaptive temperature scaling to cached option logits before wagering.
-calibrated: true
+calibrated: false
 _include_calibration: calibration/adaptive_temperature_1000samples.yaml
 
 

@@ -16,10 +16,10 @@ _include_models:
 checkpoint_path: /common/users/yl2310/MultiLLMs/checkpoints/dummy_packllm_perplexity_wagers
 
 # Apply adaptive temperature scaling to cached option logits before wagering.
-calibrated: true
+calibrated: false
 _include_calibration: calibration/adaptive_temperature_1000samples.yaml
 
-
+cache_path: /research/projects/ecoai/yl2310/MultiLLMs/cache
 shuffle_data: true
 shuffle_seed: 18 #18 #17
 
@@ -98,8 +98,6 @@ option_tokens: ["A", "B", "C", "D"]
 # Evaluation checkpoint/resume
 resume_eval: false
 
-# Paths
-cache_path: /common/users/yl2310/MultiLLMs/cache
 
 # Wandb logging
 report_to_wandb: true

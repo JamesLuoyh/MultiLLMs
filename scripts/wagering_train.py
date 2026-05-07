@@ -11,8 +11,9 @@ import logging
 import os
 import sys
 import yaml
+import torch
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 # Ensure the local src/ tree and wagering package are importable
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -29,11 +30,13 @@ from wagering.utils import (
     generate_checkpoint_dir,
     get_checkpoint_metadata,
 )
+from wagering.utils.model_utils import should_load_prompt_perplexity_models_sequentially
 from wagering.calibration import calibration_enabled, fit_or_load_logit_calibrator
 from wagering.utils.multi_llm_ensemble import (
     assign_pubmedqa_context_models,
     get_cached_logits_and_hidden_states_for_model,
     get_model_prompt_variant,
+    resolve_hidden_state_layers_for_model,
 )
 from wagering.core.dataset import Dataset
 from wagering.methods.factory import load_wagering_method
@@ -236,16 +239,47 @@ def main(config_path: Optional[str] = None, calibration_path: Optional[str] = No
         "hidden_state_layers",
         wagering_config.get("config", {}).get("hidden_state_layers"),
     )
+    hidden_state_layers_per_model = getattr(
+        wagering_method,
+        "hidden_state_layers_per_model",
+        wagering_config.get("config", {}).get("hidden_state_layers_per_model"),
+    )
     # Keep cache checks and trainer runtime on the same layer selection, even
     # for methods that don't explicitly expose hidden_state_layers.
     setattr(wagering_method, "hidden_state_layers", hidden_state_layers)
+    setattr(wagering_method, "hidden_state_layers_per_model", hidden_state_layers_per_model)
     log.info(f"Loaded wagering method: {wagering_config['name']}")
 
     wagering_method_name = type(wagering_method).__name__
-    needs_hidden_states = (
-        wagering_method_name not in ["EqualWagers", "ZeroOneWagers", "OneZeroWagers"]
-        or logit_calibrator is not None
+    wagering_needs_hidden_states = wagering_method_name not in [
+        "EqualWagers",
+        "ZeroOneWagers",
+        "OneZeroWagers",
+    ]
+    resolved_hidden_layers_per_model: List[Optional[List[int]]] = [
+        resolve_hidden_state_layers_for_model(
+            hidden_state_layers,
+            hidden_state_layers_per_model,
+            model_index=model_idx,
+            num_models=num_models,
+        )
+        if wagering_needs_hidden_states
+        else None
+        for model_idx in range(num_models)
+    ]
+    reuse_calibration_from_wagering = (
+        logit_calibrator is not None
+        and wagering_needs_hidden_states
+        and all(
+            tuple(layers) == (-1,)
+            for layers in resolved_hidden_layers_per_model
+            if layers is not None
+        )
     )
+    needs_separate_calibration_hidden_states = (
+        logit_calibrator is not None and not reuse_calibration_from_wagering
+    )
+    needs_hidden_states = wagering_needs_hidden_states or logit_calibrator is not None
     needs_model_objects_for_perplexity = bool(
         getattr(wagering_method, "requires_model_perplexities", False)
     )
@@ -265,6 +299,12 @@ def main(config_path: Optional[str] = None, calibration_path: Optional[str] = No
         model_path = model_cfg["path"]
         cached_model_names.append(model_path.replace("/", "_"))
 
+        model_hidden_layers = resolve_hidden_state_layers_for_model(
+            hidden_state_layers,
+            hidden_state_layers_per_model,
+            model_index=idx,
+            num_models=num_models,
+        )
         model_cache_ok = True
         for dataset in train_datasets:
             prompt_variant = get_model_prompt_variant(dataset, model_index=idx)
@@ -274,11 +314,23 @@ def main(config_path: Optional[str] = None, calibration_path: Optional[str] = No
                 option_tokens,
                 prompt_variant=prompt_variant,
                 model_index=idx,
-                hidden_state_layers=hidden_state_layers,
+                hidden_state_layers=model_hidden_layers,
             )
             if cached_logits is None or (needs_hidden_states and cached_hidden_states is None):
                 model_cache_ok = False
                 break
+            if needs_separate_calibration_hidden_states:
+                _, cal_cached_hidden_states, _ = get_cached_logits_and_hidden_states_for_model(
+                    model_path,
+                    dataset,
+                    option_tokens,
+                    prompt_variant=prompt_variant,
+                    model_index=idx,
+                    hidden_state_layers=[-1],
+                )
+                if cal_cached_hidden_states is None:
+                    model_cache_ok = False
+                    break
 
         if not model_cache_ok:
             cache_miss_indices.append(idx)
@@ -289,7 +341,23 @@ def main(config_path: Optional[str] = None, calibration_path: Optional[str] = No
     if needs_model_objects_for_perplexity:
         indices_to_load = set(range(num_models))
 
-    if indices_to_load:
+    use_sequential_perplexity = (
+        needs_model_objects_for_perplexity
+        and should_load_prompt_perplexity_models_sequentially(num_models)
+    )
+    perplexity_cache_kwargs = (
+        {"cache_dir": args.get("cache_path", "./workdir/cache")} if args.get("cache_path") else {}
+    )
+
+    if use_sequential_perplexity:
+        log.info(
+            "Prompt perplexity with %d models on %d visible CUDA device(s): "
+            "deferring full ensemble load; trainer will load one model at a time.",
+            num_models,
+            int(torch.cuda.device_count()) if torch.cuda.is_available() else 0,
+        )
+        models = [model_cfgs[i]["path"] for i in range(num_models)]
+    elif indices_to_load:
         sorted_indices_to_load = sorted(indices_to_load)
         log.info(
             "Loading %d/%d models as objects (cache misses=%d, requires_perplexity=%s).",
@@ -301,7 +369,7 @@ def main(config_path: Optional[str] = None, calibration_path: Optional[str] = No
         missing_cfgs = [model_cfgs[i] for i in sorted_indices_to_load]
         missing_models, missing_names = load_models_from_config(
             missing_cfgs,
-            cache_kwargs={"cache_dir": args.get("cache_path", "./workdir/cache")} if args.get("cache_path") else {},
+            cache_kwargs=perplexity_cache_kwargs,
         )
         missing_name_map = {idx: name for idx, name in zip(sorted_indices_to_load, missing_names)}
         missing_iter = iter(missing_models)
@@ -345,6 +413,13 @@ def main(config_path: Optional[str] = None, calibration_path: Optional[str] = No
             log.info(f"Auto-resuming from: {latest_checkpoint}")
             resume_checkpoint = str(latest_checkpoint)
     
+    env_prob_dbg = os.environ.get("WAGERING_DEBUG_PROB_ALIGN", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    debug_batch_prob_alignment = bool(args.get("debug_batch_prob_alignment", False)) or env_prob_dbg
+
     # Create trainer
     trainer = WageringTrainer(
         models=models,
@@ -360,14 +435,19 @@ def main(config_path: Optional[str] = None, calibration_path: Optional[str] = No
         shuffle_data=args.get("shuffle_data", True),
         shuffle_seed=args.get("shuffle_seed", 42),
         early_stopping_patience=args.get("early_stopping_patience", 10),
+        stop_at_last_iteration=args.get("stop_at_last_iteration", False),
         early_stopping_criterion=args.get("early_stopping_criterion", "validation"),
         use_brier_d_regret_for_early_stopping=args.get("use_brier_d_regret_for_early_stopping", False),
+        use_min_kl_for_early_stopping=args.get("use_min_kl_for_early_stopping", False),
         batch_size=args.get("training_batch_size", 100),
         validation_split_ratio=validation_split_ratio,
         balance_training_datasets=args.get("balance_training_datasets", True),
         wager_score_plot_every=args.get("wager_score_plot_every", None),
         logit_calibrator=logit_calibrator,
         max_training_batches=args.get("max_training_batches"),
+        model_configs_for_sequential_perplexity=(model_cfgs if needs_model_objects_for_perplexity else None),
+        perplexity_load_cache_kwargs=perplexity_cache_kwargs if perplexity_cache_kwargs else None,
+        debug_batch_prob_alignment=debug_batch_prob_alignment,
     )
     
     # Train

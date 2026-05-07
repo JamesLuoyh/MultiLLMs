@@ -9,6 +9,42 @@ from typing import Dict, Any, Optional
 log = logging.getLogger("wagering")
 
 
+def _maybe_log_method_param_dtypes(method: Any, config: Dict[str, Any]) -> None:
+    """
+    Debug-only: log dtypes of common trainable submodules right after construction.
+
+    Enable by setting `debug_param_dtypes: true` under wagering_method.config in YAML.
+    """
+    if not bool((config or {}).get("debug_param_dtypes", False)):
+        return
+
+    try:
+        import torch  # local import to avoid hard dependency at import time
+    except Exception:
+        return
+
+    def _first_param_dtype(module: Any) -> Optional[str]:
+        try:
+            params = list(module.parameters())
+        except Exception:
+            return None
+        if not params:
+            return None
+        return str(params[0].dtype)
+
+    dtype_report: Dict[str, Optional[str]] = {}
+    for attr in ("encoder", "bert", "expert_embeddings", "router_head", "router"):
+        if hasattr(method, attr):
+            dtype_report[attr] = _first_param_dtype(getattr(method, attr))
+
+    log.warning(
+        "[debug_param_dtypes] method=%s default_dtype=%s dtypes=%s",
+        method.__class__.__name__,
+        str(torch.get_default_dtype()),
+        dtype_report,
+    )
+
+
 def load_wagering_method(
     method_name: str,
     num_models: int,
@@ -81,7 +117,9 @@ def load_wagering_method(
     }
     
     if method_name in methods:
-        return methods[method_name](num_models=num_models, config=config)
+        method = methods[method_name](num_models=num_models, config=config)
+        _maybe_log_method_param_dtypes(method, config or {})
+        return method
     
     raise ValueError(
         f"Unknown wagering method: {method_name}. "

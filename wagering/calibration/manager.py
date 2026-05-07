@@ -39,6 +39,7 @@ from wagering.utils.multi_llm_ensemble import (
     get_model_prompt_variant,
     get_cached_logits_and_hidden_states_for_model,
     set_cached_logits_and_hidden_states_for_model,
+    _get_mixed_context_dataset_type,
 )
 
 log = logging.getLogger("wagering")
@@ -60,6 +61,56 @@ def get_calibration_config(args: Dict[str, Any]) -> Dict[str, Any]:
     if "datasets" not in calibration_config or not calibration_config["datasets"]:
         raise ValueError("Calibration config must define at least one dataset")
     return calibration_config
+
+
+def _coerce_apply_to_model_indices(
+    calibration_config: Dict[str, Any], *, num_models: int
+) -> Optional[List[int]]:
+    """
+    Optional setting to apply calibration to only a subset of ensemble slots.
+
+    Config key:
+      calibration.apply_to_model_indices: int | list[int]
+    """
+    raw = calibration_config.get("apply_to_model_indices")
+    if raw is None:
+        return None
+    if isinstance(raw, (int, np.integer)):
+        indices = [int(raw)]
+    elif isinstance(raw, (list, tuple)):
+        indices = [int(x) for x in raw]
+    else:
+        raise ValueError(
+            "calibration.apply_to_model_indices must be an int or list of ints "
+            f"(got {type(raw).__name__})"
+        )
+    if any(i < 0 or i >= int(num_models) for i in indices):
+        raise ValueError(
+            f"calibration.apply_to_model_indices must be within [0, {int(num_models) - 1}], "
+            f"got {indices}"
+        )
+    return sorted(set(indices))
+
+
+class _SubsetApplyCalibrator:
+    """Wrapper that applies an underlying calibrator to a subset of slots."""
+
+    def __init__(self, calibrator: Any, apply_to_model_indices: List[int]):
+        self._calibrator = calibrator
+        self._apply_to = set(int(i) for i in apply_to_model_indices)
+
+    def apply_to_stacked_logits(self, all_model_logits: np.ndarray, all_hidden_states: Any, **kwargs) -> np.ndarray:
+        logits = np.asarray(all_model_logits, dtype=np.float32)
+        calibrated = self._calibrator.apply_to_stacked_logits(logits, all_hidden_states, **kwargs)
+        if logits.shape != calibrated.shape:
+            raise ValueError("Calibrator returned logits with different shape")
+        for slot_idx in range(logits.shape[0]):
+            if slot_idx not in self._apply_to:
+                calibrated[slot_idx] = logits[slot_idx]
+        return calibrated
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._calibrator, name)
 
 
 def resolve_calibration_artifact_dir(args: Dict[str, Any]) -> Optional[Path]:
@@ -469,7 +520,11 @@ class AdaptiveTemperatureCalibrator(nn.Module):
         canonical = bool(artifact.get("canonical_unique_heads", False))
         head_paths = list(artifact["model_paths"])
         if canonical:
-            slots = list(slot_model_paths) if slot_model_paths is not None else list(artifact.get("slot_model_paths", []))
+            slots = (
+                list(slot_model_paths)
+                if slot_model_paths is not None
+                else list(artifact.get("slot_model_paths", []))
+            )
             if not slots:
                 raise ValueError(
                     "Canonical temperature calibrator requires slot_model_paths (pass current ensemble paths)."
@@ -534,6 +589,182 @@ class AdaptiveTemperatureCalibrator(nn.Module):
         return calibrator
 
 
+class ContextConditionedAdaptiveTemperatureCalibrator(AdaptiveTemperatureCalibrator):
+    """
+    PubMedQA/RACE mixed-context variant.
+
+    Trains and applies two heads per model:
+    - head_role=0: model is the assigned "with_context" expert for this example
+    - head_role=1: model is "without_context" for this example
+    """
+
+    artifact_name = "temperature_calibration_context_conditioned.pt"
+
+    def __init__(
+        self,
+        model_paths: Sequence[str],
+        input_dims: Sequence[int],
+        config: Dict[str, Any],
+        *,
+        slot_model_paths: Optional[Sequence[str]] = None,
+        canonical_unique_heads: bool = False,
+    ):
+        super().__init__(
+            model_paths=model_paths,
+            input_dims=input_dims,
+            config=config,
+            slot_model_paths=slot_model_paths,
+            canonical_unique_heads=canonical_unique_heads,
+        )
+
+        # Replace heads with 2x per model.
+        hidden_layers = self.config.get("head_hidden_layers", self.config.get("hidden_layers", []))
+        dropout = float(self.config.get("dropout", 0.0))
+        min_temperature = float(self.config.get("min_temperature", 0.05))
+        max_temperature = self.config.get("max_temperature", 10.0)
+        init_temperature = float(self.config.get("init_temperature", 1.0))
+
+        conditioned_heads: List[TemperatureScalingHead] = []
+        for input_dim in self.input_dims:
+            conditioned_heads.append(
+                TemperatureScalingHead(
+                    input_dim=input_dim,
+                    hidden_layers=hidden_layers,
+                    min_temperature=min_temperature,
+                    max_temperature=max_temperature,
+                    init_temperature=init_temperature,
+                    dropout=dropout,
+                )
+            )
+            conditioned_heads.append(
+                TemperatureScalingHead(
+                    input_dim=input_dim,
+                    hidden_layers=hidden_layers,
+                    min_temperature=min_temperature,
+                    max_temperature=max_temperature,
+                    init_temperature=init_temperature,
+                    dropout=dropout,
+                )
+            )
+        self.heads = nn.ModuleList(conditioned_heads)
+        self.to(self.device)
+        # Do not freeze here; `fit()` needs trainable parameters.
+        self.eval()
+
+    def _head_index_for_slot_and_role(self, slot_idx: int, role_idx: int) -> int:
+        base = 2 * self._head_index_for_slot(slot_idx)
+        return base + int(role_idx)
+
+    def fit(
+        self,
+        all_model_logits: Any,
+        all_hidden_states: Any,
+        labels: np.ndarray,
+        *,
+        context_model_index_by_example: np.ndarray,
+    ) -> Dict[str, Any]:
+        """Fit separate heads for (with_context, without_context) per model slot."""
+        logits_by_model = self._coerce_logits_by_model(all_model_logits)
+        hidden_states_by_model = self._coerce_hidden_states_by_model(all_hidden_states)
+
+        labels = np.asarray(labels, dtype=np.int64)
+        context_idx = np.asarray(context_model_index_by_example, dtype=np.int64)
+        if context_idx.ndim != 1 or context_idx.shape[0] != labels.shape[0]:
+            raise ValueError("context_model_index_by_example must be 1D and align with labels")
+        if np.any(context_idx < 0) or np.any(context_idx >= len(logits_by_model)):
+            raise ValueError("context_model_index_by_example contains out-of-range model indices")
+
+        metrics: Dict[str, Any] = {"model_metrics": []}
+        for slot_idx, (logits, hidden) in enumerate(zip(logits_by_model, hidden_states_by_model)):
+            if logits.shape[0] != hidden.shape[0] or logits.shape[0] != labels.shape[0]:
+                raise ValueError("Calibration arrays must align across logits, hidden states, and labels")
+
+            mask_with = context_idx == int(slot_idx)
+            mask_wo = ~mask_with
+            if not np.any(mask_with):
+                raise RuntimeError(
+                    f"No with_context examples found for model slot {slot_idx}; "
+                    "did you call assign_pubmedqa_context_models for this dataset?"
+                )
+            if not np.any(mask_wo):
+                raise RuntimeError(f"No without_context examples found for model slot {slot_idx}")
+
+            head_with = self.heads[self._head_index_for_slot_and_role(slot_idx, 0)]
+            head_wo = self.heads[self._head_index_for_slot_and_role(slot_idx, 1)]
+
+            # Temporarily swap .heads so we can reuse _fit_single_model by index.
+            original_heads = self.heads
+            try:
+                self.heads = nn.ModuleList([head_with, head_wo])
+                with_metrics = self._fit_single_model(
+                    0,
+                    logits=np.asarray(logits[mask_with], dtype=np.float32),
+                    hidden_states=np.asarray(hidden[mask_with], dtype=np.float32),
+                    labels=np.asarray(labels[mask_with], dtype=np.int64),
+                )
+                wo_metrics = self._fit_single_model(
+                    1,
+                    logits=np.asarray(logits[mask_wo], dtype=np.float32),
+                    hidden_states=np.asarray(hidden[mask_wo], dtype=np.float32),
+                    labels=np.asarray(labels[mask_wo], dtype=np.int64),
+                )
+            finally:
+                self.heads = original_heads
+
+            metrics["model_metrics"].append(
+                {
+                    "with_context": with_metrics,
+                    "without_context": wo_metrics,
+                    "num_with_context": int(np.sum(mask_with)),
+                    "num_without_context": int(np.sum(mask_wo)),
+                }
+            )
+
+        self.freeze()
+        return metrics
+
+    def apply_to_stacked_logits(
+        self,
+        all_model_logits: np.ndarray,
+        all_hidden_states: Any,
+        *,
+        context_model_index_by_example: np.ndarray,
+    ) -> np.ndarray:
+        """Apply role-conditioned temperature scaling to stacked logits."""
+        model_logits = np.asarray(all_model_logits, dtype=np.float32)
+        hidden_states_by_model = self._coerce_hidden_states_by_model(all_hidden_states)
+        context_idx = np.asarray(context_model_index_by_example, dtype=np.int64)
+        if context_idx.ndim != 1 or context_idx.shape[0] != model_logits.shape[1]:
+            raise ValueError("context_model_index_by_example must be 1D and align with num_examples")
+        if np.any(context_idx < 0) or np.any(context_idx >= model_logits.shape[0]):
+            raise ValueError("context_model_index_by_example contains out-of-range model indices")
+
+        calibrated_logits = np.empty_like(model_logits, dtype=np.float32)
+        for slot_idx in range(model_logits.shape[0]):
+            head_with = self.heads[self._head_index_for_slot_and_role(slot_idx, 0)]
+            head_wo = self.heads[self._head_index_for_slot_and_role(slot_idx, 1)]
+            hidden = np.asarray(hidden_states_by_model[slot_idx], dtype=np.float32)
+            if hidden.shape[0] != model_logits.shape[1]:
+                raise ValueError("Hidden states do not align with logit count")
+
+            mask_with = context_idx == int(slot_idx)
+            mask_wo = ~mask_with
+
+            temps = np.empty((model_logits.shape[1],), dtype=np.float32)
+            if np.any(mask_with):
+                with torch.no_grad():
+                    t = head_with(torch.from_numpy(hidden[mask_with]).float().to(self.device))
+                    temps[mask_with] = t.detach().to(dtype=torch.float32).cpu().numpy()
+            if np.any(mask_wo):
+                with torch.no_grad():
+                    t = head_wo(torch.from_numpy(hidden[mask_wo]).float().to(self.device))
+                    temps[mask_wo] = t.detach().to(dtype=torch.float32).cpu().numpy()
+
+            calibrated_logits[slot_idx] = model_logits[slot_idx] / temps[:, None]
+
+        return calibrated_logits
+
+
 def _prepare_models_for_datasets(
     model_cfgs: Sequence[Dict[str, Any]],
     datasets: Sequence[Dataset],
@@ -593,13 +824,28 @@ def _collect_calibration_arrays(
     option_tokens: Sequence[str],
     balance_datasets: bool,
     shuffle_seed: int,
-) -> Tuple[np.ndarray, List[np.ndarray], np.ndarray]:
+) -> Tuple[np.ndarray, List[np.ndarray], np.ndarray, Optional[np.ndarray]]:
     """Load or collect cached logits and hidden states for calibration datasets."""
     per_dataset_logits: List[np.ndarray] = []
     per_dataset_hidden_states: List[List[np.ndarray]] = []
     per_dataset_labels: List[np.ndarray] = []
+    per_dataset_context_assignments: List[np.ndarray] = []
+    saw_mixed_context = False
 
     for dataset in datasets:
+        dataset_type = _get_mixed_context_dataset_type(dataset)
+        if dataset_type is not None:
+            saw_mixed_context = True
+            raw = getattr(dataset, f"{dataset_type}_context_assignment_by_example", None)
+            if not isinstance(raw, list) or len(raw) != len(dataset.x):
+                raise RuntimeError(
+                    "Mixed-context calibration dataset missing per-example assignments. "
+                    "Call assign_pubmedqa_context_models before calibration cache checks/collection."
+                )
+            per_dataset_context_assignments.append(np.asarray(raw, dtype=np.int64))
+        else:
+            per_dataset_context_assignments.append(np.full((len(dataset.x),), -1, dtype=np.int64))
+
         dataset_model_logits: List[np.ndarray] = []
         dataset_model_hidden_states: List[np.ndarray] = []
         dataset_labels: Optional[np.ndarray] = None
@@ -684,7 +930,10 @@ def _collect_calibration_arrays(
         for model_idx in range(len(models))
     ]
     labels = np.concatenate(per_dataset_labels, axis=0)
-    return stacked_logits, hidden_states_by_model, labels
+    context_assignments = (
+        np.concatenate(per_dataset_context_assignments, axis=0) if saw_mixed_context else None
+    )
+    return stacked_logits, hidden_states_by_model, labels, context_assignments
 
 
 def _fit_or_load_per_model_calibrators(
@@ -766,7 +1015,7 @@ def _fit_or_load_per_model_calibrators(
             cache_path=args.get("cache_path"),
             require_hidden_states=True,
         )
-        all_logits, all_hidden, labels = _collect_calibration_arrays(
+        all_logits, all_hidden, labels, _ = _collect_calibration_arrays(
             models=models,
             datasets=datasets,
             option_tokens=option_tokens,
@@ -809,6 +1058,9 @@ def fit_or_load_logit_calibrator(
         return None, None, False
 
     calibration_config = get_calibration_config(args)
+    apply_to_model_indices = _coerce_apply_to_model_indices(
+        calibration_config, num_models=len(args.get("models") or [])
+    )
     include_pubmedqa = calibration_dataset_configs_include_pubmedqa(calibration_config["datasets"])
     base_root = Path(calibration_path) if calibration_path is not None else Path(
         calibration_config.get(
@@ -818,9 +1070,12 @@ def fit_or_load_logit_calibrator(
     )
 
     if not include_pubmedqa:
-        return _fit_or_load_per_model_calibrators(
+        calibrator, artifact_dir, fitted = _fit_or_load_per_model_calibrators(
             args, calibration_config, base_root, force_refit
         )
+        if apply_to_model_indices is not None:
+            calibrator = _SubsetApplyCalibrator(calibrator, apply_to_model_indices)
+        return calibrator, artifact_dir, fitted
 
     artifact_dir = Path(calibration_path) if calibration_path is not None else generate_calibration_dir(
         base_dir=base_root,
@@ -829,17 +1084,31 @@ def fit_or_load_logit_calibrator(
         calibration_config=calibration_config,
         create_hash=True,
     )
-    artifact_file = artifact_dir / AdaptiveTemperatureCalibrator.artifact_name
     reuse_existing = bool(calibration_config.get("reuse_existing", True))
     ensemble_paths = [model_cfg["path"] for model_cfg in args["models"]]
     all_slots_share_model = len(set(ensemble_paths)) == 1
-    if artifact_file.exists() and reuse_existing and not force_refit:
-        calibrator = AdaptiveTemperatureCalibrator.load_pretrained(
-            artifact_dir,
-            device=str(calibration_config.get("device", "cpu")),
-            slot_model_paths=ensemble_paths,
-        )
-        if all_slots_share_model and not getattr(calibrator, "_canonical_unique_heads", False):
+    conditioned_requested = bool(calibration_config.get("condition_on_context_assignment", False))
+    artifact_file = artifact_dir / AdaptiveTemperatureCalibrator.artifact_name
+    conditioned_file = artifact_dir / ContextConditionedAdaptiveTemperatureCalibrator.artifact_name
+    if (artifact_file.exists() or conditioned_file.exists()) and reuse_existing and not force_refit:
+        # Backwards compatible: prefer conditioned artifact if requested & present.
+        if conditioned_requested and conditioned_file.exists():
+            calibrator = ContextConditionedAdaptiveTemperatureCalibrator.load_pretrained(
+                artifact_dir,
+                device=str(calibration_config.get("device", "cpu")),
+                slot_model_paths=ensemble_paths,
+            )
+        else:
+            calibrator = AdaptiveTemperatureCalibrator.load_pretrained(
+                artifact_dir,
+                device=str(calibration_config.get("device", "cpu")),
+                slot_model_paths=ensemble_paths,
+            )
+        if (
+            all_slots_share_model
+            and not conditioned_requested
+            and not getattr(calibrator, "_canonical_unique_heads", False)
+        ):
             log.warning(
                 "Existing calibrator at %s uses per-slot heads even though all ensemble slots share model path %s. "
                 "Refitting canonical shared-head calibrator.",
@@ -848,6 +1117,8 @@ def fit_or_load_logit_calibrator(
             )
         else:
             log.info("Loaded existing temperature calibrator from %s", artifact_dir)
+            if apply_to_model_indices is not None:
+                calibrator = _SubsetApplyCalibrator(calibrator, apply_to_model_indices)
             return calibrator, str(artifact_dir), False
 
     dataset_split_seed = int(args.get("dataset_split_seed", 42))
@@ -896,7 +1167,7 @@ def fit_or_load_logit_calibrator(
         require_hidden_states=True,
     )
 
-    all_model_logits, all_hidden_states, labels = _collect_calibration_arrays(
+    all_model_logits, all_hidden_states, labels, context_assignments = _collect_calibration_arrays(
         models=models,
         datasets=datasets,
         option_tokens=args.get("option_tokens", ["A", "B", "C", "D"]),
@@ -904,7 +1175,16 @@ def fit_or_load_logit_calibrator(
         shuffle_seed=int(calibration_config.get("shuffle_seed", 42)),
     )
 
-    if all_slots_share_model:
+    if conditioned_requested and context_assignments is None:
+        raise RuntimeError(
+            "condition_on_context_assignment=true requires a mixed-context calibration dataset "
+            "with per-example context assignments (e.g. PubMedQA mixed-context)."
+        )
+
+    # NOTE: For context-conditioned calibration on PubMedQA-style runs, we need
+    # per-slot heads because `context_assignments` is expressed in slot indices.
+    # Collapsing to a single canonical slot would make those indices out-of-range.
+    if all_slots_share_model and not conditioned_requested:
         # When all ensemble entries point to the same HF model path, calibrating
         # separate per-slot heads introduces artificial slot-specific differences.
         # Train one shared canonical head and map every slot to it.
@@ -935,19 +1215,36 @@ def fit_or_load_logit_calibrator(
             labels=shared_labels,
         )
     else:
-        calibrator = AdaptiveTemperatureCalibrator(
-            model_paths=ensemble_paths,
-            input_dims=[hidden_state.shape[1] for hidden_state in all_hidden_states],
-            config=calibration_config,
-            slot_model_paths=None,
-            canonical_unique_heads=False,
-        )
-        metrics = calibrator.fit(
-            all_model_logits=all_model_logits,
-            all_hidden_states=all_hidden_states,
-            labels=labels,
-        )
+        if conditioned_requested:
+            calibrator = ContextConditionedAdaptiveTemperatureCalibrator(
+                model_paths=ensemble_paths,
+                input_dims=[hidden_state.shape[1] for hidden_state in all_hidden_states],
+                config=calibration_config,
+                slot_model_paths=None,
+                canonical_unique_heads=False,
+            )
+            metrics = calibrator.fit(
+                all_model_logits=all_model_logits,
+                all_hidden_states=all_hidden_states,
+                labels=labels,
+                context_model_index_by_example=context_assignments,
+            )
+        else:
+            calibrator = AdaptiveTemperatureCalibrator(
+                model_paths=ensemble_paths,
+                input_dims=[hidden_state.shape[1] for hidden_state in all_hidden_states],
+                config=calibration_config,
+                slot_model_paths=None,
+                canonical_unique_heads=False,
+            )
+            metrics = calibrator.fit(
+                all_model_logits=all_model_logits,
+                all_hidden_states=all_hidden_states,
+                labels=labels,
+            )
     calibrator.save_pretrained(artifact_dir)
     log.info("Saved temperature calibrator to %s", artifact_dir)
     log.info("Calibration metrics: %s", metrics)
+    if apply_to_model_indices is not None:
+        calibrator = _SubsetApplyCalibrator(calibrator, apply_to_model_indices)
     return calibrator, str(artifact_dir), True

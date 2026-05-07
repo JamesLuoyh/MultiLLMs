@@ -156,6 +156,7 @@ class TestWageringTrainer:
             aggregation_function=aggregation_function,
             checkpoint_dir=None,  # No checkpointing for test
             validation_split_ratio=0.0,  # No validation split for tiny test dataset
+            stop_at_last_iteration=True,
         )
         
         # Train for 1 epoch

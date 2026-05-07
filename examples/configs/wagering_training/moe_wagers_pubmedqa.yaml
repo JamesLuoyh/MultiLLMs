@@ -11,7 +11,7 @@ _include_models:
 
 
 # Apply adaptive temperature scaling to cached option logits before wagering.
-calibrated: true
+calibrated: false
 _include_calibration: calibration/adaptive_temperature_pubmedqa_1000samples.yaml
 
 

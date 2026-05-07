@@ -9,7 +9,7 @@ _include_models:
 checkpoint_path: /research/projects/ecoai/yl2310/MultiLLMs/checkpoints/dummy_kl_uniform_wagers
 
 # Apply adaptive temperature scaling to cached option logits before wagering.
-calibrated: true
+calibrated: false
 _include_calibration: calibration/adaptive_temperature_1000samples.yaml
 
 shuffle_data: true  # Shuffle training data across datasets

@@ -37,7 +37,7 @@ def test_load_and_merge_configs_supports_calibration_include(tmp_path):
             [
                 "_include_models:",
                 "  - models/model_a.yaml",
-                "calibrated: true",
+                "calibrated: false",
                 "_include_calibration: calibration/ats.yaml",
                 "wagering_method:",
                 "  name: equal_wagers",

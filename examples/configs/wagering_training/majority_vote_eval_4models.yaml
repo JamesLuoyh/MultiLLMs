@@ -11,7 +11,7 @@ _include_models:
 checkpoint_path: /common/users/yl2310/MultiLLMs/checkpoints/dummy_equal_wagers
 
 # Apply adaptive temperature scaling to cached option logits before wagering.
-calibrated: true
+calibrated: false
 _include_calibration: calibration/adaptive_temperature_1000samples.yaml
 
 
@@ -83,7 +83,7 @@ ood_datasets:
   - display_name: arc_challenge_ood
     eval_split: test
   - display_name: forecastqa_ood
-    eval_split: test
+    eval_split: train
 
 
 # Evaluation parameters

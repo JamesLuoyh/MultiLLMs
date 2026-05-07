@@ -56,6 +56,7 @@ class RouteLLMBertWagers(WageringMethod):
         self.freeze_bert = bool(cfg.get("freeze_bert", False))
         # Default to keeping context (caller can disable it explicitly).
         self.pubmedqa_strip_context = bool(cfg.get("pubmedqa_strip_context", False))
+        self.debug_router_prompts = bool(cfg.get("debug_router_prompts", False))
         self.router_dropout_p = float(cfg.get("router_dropout", 0.1))
         self.ranking_loss_weight = float(cfg.get("ranking_loss_weight", 0.0))
         self.ranking_margin = float(cfg.get("ranking_margin", 0.1))
@@ -71,7 +72,11 @@ class RouteLLMBertWagers(WageringMethod):
         self.expects_per_model_router_prompts = True
 
         self.tokenizer = AutoTokenizer.from_pretrained(self.bert_model_name)
-        self.bert = AutoModel.from_pretrained(self.bert_model_name).to(self.device)
+        # Ensure router encoder stays fp32 (trainer uses plain AdamW, no AMP GradScaler).
+        self.bert = AutoModel.from_pretrained(
+            self.bert_model_name,
+            torch_dtype=torch.float32,
+        ).to(self.device)
         hidden_size = int(self.bert.config.hidden_size)
         router_in_dim = hidden_size * num_models if self.concat_prompt_embeddings else hidden_size
         self.dropout = nn.Dropout(self.router_dropout_p)
@@ -96,12 +101,31 @@ class RouteLLMBertWagers(WageringMethod):
         self._training = True
         self._cached_wagers: Optional[torch.Tensor] = None
         self._cached_router_logits: Optional[torch.Tensor] = None
+        self._debug_logged_once: bool = False
 
     def _encode_questions_batch(self, questions: List[str]) -> torch.Tensor:
         processed = preprocess_pubmedqa_prompts_for_embedding(
             questions,
-            strip_context=self.pubmedqa_strip_context,
+            # Do not regex-strip content here. When pubmedqa_strip_context is enabled for this method,
+            # the trainer/evaluator is responsible for passing the dataset's prompt_without_context
+            # variant verbatim (even if it contains "Context:" text).
+            strip_context=False,
         )
+        if self.debug_router_prompts and (not self._debug_logged_once) and len(questions) > 0:
+            self._debug_logged_once = True
+            q0 = str(questions[0])
+            p0 = str(processed[0]) if len(processed) > 0 else ""
+            print(
+                "[route_llm_bert debug] pubmedqa_strip_context="
+                f"{self.pubmedqa_strip_context} concat_prompt_embeddings={self.concat_prompt_embeddings} "
+                f"expects_per_model_router_prompts={getattr(self, 'expects_per_model_router_prompts', None)}"
+            )
+            print(
+                "[route_llm_bert debug] raw_q0_has_Context="
+                f"{('Context:' in q0)} processed_q0_has_Context={('Context:' in p0)}"
+            )
+            print("[route_llm_bert debug] raw_q0_head:", q0[:220].replace("\n", "\\n"))
+            print("[route_llm_bert debug] processed_q0_head:", p0[:220].replace("\n", "\\n"))
         inputs = self.tokenizer(
             processed,
             return_tensors="pt",
@@ -175,6 +199,31 @@ class RouteLLMBertWagers(WageringMethod):
             )
 
         questions_per_model = kwargs.get("questions_per_model", None)
+        if (
+            self.debug_router_prompts
+            and (not self._debug_logged_once)
+            and questions_per_model is not None
+            and isinstance(questions_per_model, list)
+            and len(questions_per_model) > 0
+            and len(questions_per_model[0]) > 0
+        ):
+            # Leave the "once" flip to _encode_questions_batch() so we still get the processed text log too.
+            print(
+                "[route_llm_bert debug] questions_per_model provided: "
+                f"M={len(questions_per_model)} B={len(questions_per_model[0])}"
+            )
+            max_models_to_print = min(len(questions_per_model), 16)
+            for mi in range(max_models_to_print):
+                p = str(questions_per_model[mi][0])
+                print(
+                    f"[route_llm_bert debug] model{mi}_q0_has_Context={('Context:' in p)} "
+                    f"head={p[:220].replace(chr(10), r'\\n')}"
+                )
+            if len(questions_per_model) > max_models_to_print:
+                print(
+                    "[route_llm_bert debug] (skipping remaining models in questions_per_model; "
+                    f"printed first {max_models_to_print})"
+                )
         if questions_per_model is not None:
             pooled = self._encode_questions_per_model_batch(questions_per_model)
         elif self.concat_prompt_embeddings:
@@ -200,12 +249,24 @@ class RouteLLMBertWagers(WageringMethod):
         router_logits: torch.Tensor,
         model_logits: torch.Tensor,
         gold_label: torch.Tensor,
+        gold_label_distribution: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Prefer higher router scores for experts with lower NLL on the gold class."""
         # model_logits: [B, M, C]
         log_probs = F.log_softmax(model_logits, dim=-1)
-        idx = gold_label.view(-1, 1, 1).expand(-1, self.num_models, 1)
-        nll = -torch.gather(log_probs, dim=2, index=idx).squeeze(2)  # [B, M]
+        if gold_label_distribution is not None:
+            # Expected NLL under soft labels q: -sum_k q_k log p_k
+            q = gold_label_distribution.to(device=log_probs.device, dtype=log_probs.dtype)
+            if q.ndim != 2 or q.shape[0] != log_probs.shape[0] or q.shape[1] != log_probs.shape[2]:
+                raise ValueError(
+                    "gold_label_distribution must be shape [batch_size, num_options], "
+                    f"got {tuple(q.shape)}"
+                )
+            q_expanded = q.unsqueeze(1).expand(-1, self.num_models, -1)  # [B, M, C]
+            nll = -(q_expanded * log_probs).sum(dim=-1)  # [B, M]
+        else:
+            idx = gold_label.view(-1, 1, 1).expand(-1, self.num_models, 1)
+            nll = -torch.gather(log_probs, dim=2, index=idx).squeeze(2)  # [B, M]
 
         # logits[b,m]-logits[b,k]: want > margin when nll[b,m] < nll[b,k]
         z = router_logits.unsqueeze(2) - router_logits.unsqueeze(1)  # [B, M, M]
@@ -244,13 +305,37 @@ class RouteLLMBertWagers(WageringMethod):
         gold_label_tensor = torch.as_tensor(gold_label, dtype=torch.long, device=self.device)
 
         batch_aggregated_probs = LinearPooling.aggregate_torch(model_logits_tensor, wagers)
-        batch_indices = torch.arange(batch_size, device=self.device)
-        probs_at_gold = batch_aggregated_probs[batch_indices, gold_label_tensor]
-        ce_loss = -torch.mean(torch.log(probs_at_gold + 1e-10))
+        gold_label_distribution = kwargs.get("gold_label_distribution", None)
+        if gold_label_distribution is not None:
+            gold_label_distribution_tensor = torch.as_tensor(
+                gold_label_distribution, dtype=torch.float32, device=self.device
+            )
+            if (
+                gold_label_distribution_tensor.ndim != 2
+                or gold_label_distribution_tensor.shape[0] != batch_size
+                or gold_label_distribution_tensor.shape[1] != batch_aggregated_probs.shape[1]
+            ):
+                raise ValueError(
+                    "gold_label_distribution must be shape [batch_size, num_options], "
+                    f"got {tuple(gold_label_distribution_tensor.shape)}"
+                )
+            log_probs = torch.log(batch_aggregated_probs + 1e-10)
+            ce_loss = -torch.mean(torch.sum(gold_label_distribution_tensor * log_probs, dim=-1))
+        else:
+            batch_indices = torch.arange(batch_size, device=self.device)
+            probs_at_gold = batch_aggregated_probs[batch_indices, gold_label_tensor]
+            ce_loss = -torch.mean(torch.log(probs_at_gold + 1e-10))
 
         loss = ce_loss
         if self.ranking_loss_weight > 0.0 and router_logits is not None:
-            rank_loss = self._pairwise_ranking_loss(router_logits, model_logits_tensor, gold_label_tensor)
+            rank_loss = self._pairwise_ranking_loss(
+                router_logits,
+                model_logits_tensor,
+                gold_label_tensor,
+                gold_label_distribution=(
+                    gold_label_distribution_tensor if gold_label_distribution is not None else None
+                ),
+            )
             loss = loss + self.ranking_loss_weight * rank_loss
 
         self.optimizer.zero_grad()

@@ -69,7 +69,11 @@ class MoEWagers(WageringMethod):
         
         # Load BERT model and tokenizer
         self.tokenizer = AutoTokenizer.from_pretrained(self.bert_model_name)
-        self.bert = AutoModel.from_pretrained(self.bert_model_name).to(self.device)
+        # Ensure router encoder stays fp32 (trainer uses plain Adam/AdamW, no AMP GradScaler).
+        self.bert = AutoModel.from_pretrained(
+            self.bert_model_name,
+            torch_dtype=torch.float32,
+        ).to(self.device)
         
         # Freeze BERT if configured
         if self.freeze_bert:

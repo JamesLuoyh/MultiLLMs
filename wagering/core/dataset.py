@@ -246,6 +246,8 @@ class Dataset:
             self.images = [self.images[i] for i in indices]
         if hasattr(self, "probabilistic_labels") and isinstance(self.probabilistic_labels, list):
             self.probabilistic_labels = [self.probabilistic_labels[i] for i in indices]
+        if hasattr(self, "probability_labels") and isinstance(self.probability_labels, list):
+            self.probability_labels = [self.probability_labels[i] for i in indices]
         return self
 
     def train_test_split(self, test_size: int, seed: int, split: str = "train"):
@@ -506,7 +508,11 @@ class Dataset:
                 raise ValueError(
                     f"Column '{probability_label_column}' must contain values in [0, 1]"
                 )
-            formatted_dataset.probabilistic_labels = prob_array.astype(np.float32).tolist()
+            prob_list = prob_array.astype(np.float32).tolist()
+            # Backwards-compatible name + clearer alias aligned with config key
+            # (`probability_label_column`).
+            formatted_dataset.probabilistic_labels = prob_list
+            formatted_dataset.probability_labels = prob_list
 
         positive_label = kwargs.get("positive_label", None)
         if positive_label is not None:
@@ -642,6 +648,9 @@ class Dataset:
         pubmedqa_with_context_prompts = None
         pubmedqa_without_context_prompts = None
         pubmedqa_context_only_prompts = None
+        pubmedqa_questions = None
+        pubmedqa_long_answers = None
+        pubmedqa_context_texts = None
         race_with_context_prompts = None
         race_without_context_prompts = None
 
@@ -1306,6 +1315,9 @@ class Dataset:
             pubmedqa_with_context_prompts = []
             pubmedqa_without_context_prompts = []
             pubmedqa_context_only_prompts = []
+            pubmedqa_questions = []
+            pubmedqa_long_answers = []
+            pubmedqa_context_texts = []
             skipped_count = 0
 
             for inst in dataset:
@@ -1398,6 +1410,9 @@ class Dataset:
                     pubmedqa_with_context_prompts.append(with_context_prompt)
                     pubmedqa_without_context_prompts.append(without_context_prompt)
                     pubmedqa_context_only_prompts.append(context_only_prompt)
+                    pubmedqa_questions.append(question)
+                    pubmedqa_long_answers.append(long_answer)
+                    pubmedqa_context_texts.append(context_text)
 
             if len(x) == 0:
                 raise ValueError(
@@ -1543,6 +1558,17 @@ class Dataset:
             formatted_dataset.pubmedqa_context_only_x = pubmedqa_context_only_prompts
             formatted_dataset.pubmedqa_prompt_strategy = "mixed_context"
             formatted_dataset.pubmedqa_context_model_path = pubmedqa_context_model_path
+            # Preserve the original prompt templates so we can re-render context-bearing prompts
+            # (e.g., "wrong context" routing) without parsing prompt text.
+            formatted_dataset.pubmedqa_prompt_template_with_context = str(prompt or "")
+            formatted_dataset.pubmedqa_prompt_template_without_context = str(prompt_without_context or "")
+            # Keep raw fields for context re-rendering.
+            if pubmedqa_questions is not None:
+                formatted_dataset.pubmedqa_questions = list(pubmedqa_questions)
+            if pubmedqa_long_answers is not None:
+                formatted_dataset.pubmedqa_long_answers = list(pubmedqa_long_answers)
+            if pubmedqa_context_texts is not None:
+                formatted_dataset.pubmedqa_context_texts = list(pubmedqa_context_texts)
 
         if (
             race_with_context_prompts is not None

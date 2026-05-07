@@ -36,6 +36,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from wagering.utils import load_and_merge_configs, load_datasets_from_config
 from wagering.utils.multi_llm_ensemble import (
     assign_pubmedqa_context_models,
+    configure_wagering_cache_dir,
     get_cached_logits_and_hidden_states_for_model,
     get_model_prompt_variant,
 )
@@ -56,6 +57,16 @@ def _mask_to_pattern(mask: int, model_names: List[str]) -> str:
     if mask == 0:
         return "none"
     chosen = [model_names[i] for i in range(len(model_names)) if (mask >> i) & 1]
+    if len(chosen) == 1:
+        return f"only:{chosen[0]}"
+    return "and:(" + ",".join(chosen) + ")"
+
+
+def _mask_to_pattern_names(mask: int, names: List[str]) -> str:
+    """Like _mask_to_pattern, but uses an explicit names list (already role-qualified)."""
+    if mask == 0:
+        return "none"
+    chosen = [names[i] for i in range(len(names)) if (mask >> i) & 1]
     if len(chosen) == 1:
         return f"only:{chosen[0]}"
     return "and:(" + ",".join(chosen) + ")"
@@ -119,6 +130,20 @@ def _compute_correctness_for_dataset(
     correct_matrix = np.stack(per_model_correct, axis=1)  # [N, M]
     preds_matrix = np.stack(per_model_pred, axis=1)  # [N, M]
 
+    # For mixed-context datasets (PubMedQA/RACE), each example chooses one "context model index".
+    # We'll emit additional stats that treat the chosen model as "with_context" and all others as
+    # "without_context". This matches the dataset's prompt routing behavior and avoids any
+    # counterfactual "two+ models with context" cases.
+    mixed_context_assignment: Optional[np.ndarray] = None
+    for attr in ("pubmedqa_context_assignment_by_example", "race_context_assignment_by_example"):
+        raw = getattr(dataset, attr, None)
+        if isinstance(raw, list) and len(raw) == correct_matrix.shape[0]:
+            try:
+                mixed_context_assignment = np.asarray(raw, dtype=np.int32)
+            except Exception:
+                mixed_context_assignment = None
+            break
+
     # Build bitmask per example: bit i set iff model i correct.
     bit_weights = (1 << np.arange(num_models, dtype=np.int64)).astype(np.int64)
     masks = (correct_matrix.astype(np.int64) * bit_weights[None, :]).sum(axis=1).astype(np.int64)
@@ -131,6 +156,12 @@ def _compute_correctness_for_dataset(
             "correct_pattern": [_mask_to_pattern(int(m), model_paths) for m in masks.tolist()],
         }
     )
+    if mixed_context_assignment is not None:
+        per_question["context_model_index"] = mixed_context_assignment.astype(np.int32)
+        per_question["context_model_path"] = [
+            model_paths[int(i)] if 0 <= int(i) < num_models else ""
+            for i in mixed_context_assignment.tolist()
+        ]
 
     for model_idx, model_path in enumerate(model_paths):
         safe = _slugify(model_path)
@@ -163,6 +194,275 @@ def _compute_correctness_for_dataset(
     for i, model_path in enumerate(model_paths):
         only_incorrect_mask = str(all_correct_mask ^ (1 << i))
         summary[f"only_incorrect__{_slugify(model_path)}"] = int(mask_counts.get(only_incorrect_mask, 0))
+
+    if mixed_context_assignment is not None:
+        # Mixed-context breakdown:
+        # - exactly one model is "with_context" per example (the assigned context model)
+        # - all other models are "without_context"
+        # We report:
+        # - per-model correctness rates split by role (with_context vs without_context)
+        # - counts for role-aware correctness patterns (none, only_context, only_wo_model_i, etc.)
+        assignment = mixed_context_assignment
+        if assignment.shape[0] != correct_matrix.shape[0]:
+            raise RuntimeError(
+                f"Context assignment length mismatch for dataset={dataset_name}: "
+                f"assignments={assignment.shape[0]}, examples={correct_matrix.shape[0]}"
+            )
+        if np.any((assignment < 0) | (assignment >= num_models)):
+            raise RuntimeError(
+                f"Invalid context assignment indices for dataset={dataset_name}: "
+                f"expected in [0, {num_models - 1}]"
+            )
+
+        role_counts: Dict[str, int] = {
+            "none_correct": 0,
+            "all_correct": 0,
+            "only_context_correct": 0,
+            "only_without_context_correct": 0,
+            "all_without_context_correct": 0,  # all 3 wo correct and context wrong
+            "two_without_context_only": 0,
+            "one_without_context_only": 0,
+            "one_without_context_plus_context": 0,
+            "two_without_context_plus_context": 0,
+        }
+        only_wo_by_model = {str(i): 0 for i in range(num_models)}
+        only_wc_by_model = {str(i): 0 for i in range(num_models)}
+
+        with_ctx_total = np.zeros((num_models,), dtype=np.int64)
+        with_ctx_correct = np.zeros((num_models,), dtype=np.int64)
+        without_ctx_total = np.zeros((num_models,), dtype=np.int64)
+        without_ctx_correct = np.zeros((num_models,), dtype=np.int64)
+
+        # Iterate once; dataset sizes here are small/moderate (1k-ish), so Python loop is OK.
+        for ex_idx in range(correct_matrix.shape[0]):
+            c = int(assignment[ex_idx])
+            row = correct_matrix[ex_idx, :].astype(bool)
+            c_ok = bool(row[c])
+            wo_idx = [i for i in range(num_models) if i != c]
+            wo_ok = row[wo_idx]
+            n_ok = int(row.sum())
+            n_wo_ok = int(np.sum(wo_ok))
+
+            with_ctx_total[c] += 1
+            with_ctx_correct[c] += int(c_ok)
+            for i in wo_idx:
+                without_ctx_total[i] += 1
+                without_ctx_correct[i] += int(row[i])
+
+            if n_ok == 0:
+                role_counts["none_correct"] += 1
+                continue
+            if n_ok == num_models:
+                role_counts["all_correct"] += 1
+                continue
+
+            if c_ok and n_wo_ok == 0:
+                role_counts["only_context_correct"] += 1
+                only_wc_by_model[str(c)] += 1
+                continue
+            if (not c_ok) and n_wo_ok == 1:
+                role_counts["only_without_context_correct"] += 1
+                # Find which model (must be one of wo_idx).
+                for i in wo_idx:
+                    if row[i]:
+                        only_wo_by_model[str(i)] += 1
+                        break
+                continue
+            if (not c_ok) and n_wo_ok == 3:
+                role_counts["all_without_context_correct"] += 1
+                continue
+
+            if (not c_ok) and n_wo_ok == 2:
+                role_counts["two_without_context_only"] += 1
+                continue
+            if (not c_ok) and n_wo_ok == 1:
+                role_counts["one_without_context_only"] += 1
+                continue
+            if c_ok and n_wo_ok == 1:
+                role_counts["one_without_context_plus_context"] += 1
+                continue
+            if c_ok and n_wo_ok == 2:
+                role_counts["two_without_context_plus_context"] += 1
+                continue
+
+        per_model_role = []
+        for i, path in enumerate(model_paths):
+            per_model_role.append(
+                {
+                    "model_index": int(i),
+                    "model_path": str(path),
+                    "with_context": {
+                        "num_examples": int(with_ctx_total[i]),
+                        "num_correct": int(with_ctx_correct[i]),
+                        "accuracy": float(with_ctx_correct[i] / max(1, with_ctx_total[i])),
+                    },
+                    "without_context": {
+                        "num_examples": int(without_ctx_total[i]),
+                        "num_correct": int(without_ctx_correct[i]),
+                        "accuracy": float(without_ctx_correct[i] / max(1, without_ctx_total[i])),
+                    },
+                    "only_correct_counts": {
+                        "only_correct_when_with_context": int(only_wc_by_model[str(i)]),
+                        "only_correct_when_without_context": int(only_wo_by_model[str(i)]),
+                    },
+                }
+            )
+
+        summary["mixed_context_breakdown"] = {
+            "context_assignment_attr": (
+                "pubmedqa_context_assignment_by_example"
+                if hasattr(dataset, "pubmedqa_context_assignment_by_example")
+                else "race_context_assignment_by_example"
+            ),
+            "role_pattern_counts": role_counts,
+            "only_without_context_correct_by_model_index": only_wo_by_model,
+            "only_with_context_correct_by_model_index": only_wc_by_model,
+            "per_model_role_accuracy": per_model_role,
+        }
+
+        # Treat each model-with-context / model-without-context as distinct "variants".
+        # There are 2*M variant names:
+        #   - "<model_path>|with_context"
+        #   - "<model_path>|without_context"
+        # For each example, exactly one model contributes to the with_context group and
+        # the remaining M-1 contribute to without_context.
+        variant_names: List[str] = []
+        for p in model_paths:
+            variant_names.append(f"{p}|with_context")
+        for p in model_paths:
+            variant_names.append(f"{p}|without_context")
+
+        variant_masks = np.zeros((correct_matrix.shape[0],), dtype=np.int64)
+        for ex_idx in range(correct_matrix.shape[0]):
+            c = int(assignment[ex_idx])
+            row = correct_matrix[ex_idx, :].astype(bool)
+            m = 0
+            # with_context bit for context model only
+            if row[c]:
+                m |= 1 << c
+            # without_context bits for all other models
+            for i in range(num_models):
+                if i == c:
+                    continue
+                if row[i]:
+                    m |= 1 << (num_models + i)
+            variant_masks[ex_idx] = int(m)
+
+        uniq_v, cnt_v = np.unique(variant_masks, return_counts=True)
+        variant_pattern_counts: Dict[str, int] = {}
+        for m, c in zip(uniq_v.tolist(), cnt_v.tolist()):
+            variant_pattern_counts[_mask_to_pattern_names(int(m), variant_names)] = int(c)
+        summary["mixed_context_breakdown"]["variant_pattern_counts"] = dict(
+            sorted(variant_pattern_counts.items(), key=lambda kv: (-kv[1], kv[0]))
+        )
+
+        # Also provide a higher-level aggregation that matches your requested buckets.
+        bucket_counts: Dict[str, int] = {"none": 0, "all_correct": 0}
+        for i, p in enumerate(model_paths):
+            bucket_counts[f"only:{p}|with_context"] = 0
+            bucket_counts[f"only:{p}|without_context"] = 0
+            bucket_counts[f"all_without_context_correct__context_is:{p}"] = 0  # 3 wo correct, wc wrong
+
+        for ex_idx in range(correct_matrix.shape[0]):
+            c = int(assignment[ex_idx])
+            row = correct_matrix[ex_idx, :].astype(bool)
+            c_ok = bool(row[c])
+            wo_idx = [i for i in range(num_models) if i != c]
+            n_wo_ok = int(np.sum(row[wo_idx]))
+            n_ok = int(np.sum(row))
+
+            if n_ok == 0:
+                bucket_counts["none"] += 1
+            elif n_ok == num_models:
+                bucket_counts["all_correct"] += 1
+            elif c_ok and n_wo_ok == 0:
+                bucket_counts[f"only:{model_paths[c]}|with_context"] += 1
+            elif (not c_ok) and n_wo_ok == 1:
+                for i in wo_idx:
+                    if row[i]:
+                        bucket_counts[f"only:{model_paths[i]}|without_context"] += 1
+                        break
+            elif (not c_ok) and n_wo_ok == (num_models - 1):
+                bucket_counts[f"all_without_context_correct__context_is:{model_paths[c]}"] += 1
+
+        summary["mixed_context_breakdown"]["role_aware_buckets"] = bucket_counts
+
+        # Additionally, break everything down by which model was assigned context.
+        # This yields M sub-summaries, one per context model index.
+        by_context_model: Dict[str, Any] = {}
+        for ctx_i in range(num_models):
+            idxs = np.where(assignment == ctx_i)[0]
+            ctx_n = int(idxs.shape[0])
+            ctx_payload: Dict[str, Any] = {
+                "context_model_index": int(ctx_i),
+                "context_model_path": str(model_paths[ctx_i]),
+                "num_examples": ctx_n,
+            }
+            if ctx_n == 0:
+                by_context_model[str(ctx_i)] = ctx_payload
+                continue
+
+            # Recompute role-aware buckets restricted to this context model.
+            # Keep only keys that can be non-zero for this slice:
+            # - exactly one with_context model (ctx_i)
+            # - the remaining models are without_context
+            # - only one all_without_context_correct key (context_is == ctx_i)
+            ctx_bucket_counts: Dict[str, int] = {
+                "none": 0,
+                "all_correct": 0,
+                f"only:{model_paths[ctx_i]}|with_context": 0,
+                f"all_without_context_correct__context_is:{model_paths[ctx_i]}": 0,
+            }
+            for i in range(num_models):
+                if i == ctx_i:
+                    continue
+                ctx_bucket_counts[f"only:{model_paths[i]}|without_context"] = 0
+
+            ctx_variant_masks = np.zeros((ctx_n,), dtype=np.int64)
+            for j, ex_idx in enumerate(idxs.tolist()):
+                row = correct_matrix[ex_idx, :].astype(bool)
+                c_ok = bool(row[ctx_i])
+                wo_idx = [i for i in range(num_models) if i != ctx_i]
+                n_wo_ok = int(np.sum(row[wo_idx]))
+                n_ok = int(np.sum(row))
+
+                if n_ok == 0:
+                    ctx_bucket_counts["none"] += 1
+                elif n_ok == num_models:
+                    ctx_bucket_counts["all_correct"] += 1
+                elif c_ok and n_wo_ok == 0:
+                    ctx_bucket_counts[f"only:{model_paths[ctx_i]}|with_context"] += 1
+                elif (not c_ok) and n_wo_ok == 1:
+                    for i in wo_idx:
+                        if row[i]:
+                            ctx_bucket_counts[f"only:{model_paths[i]}|without_context"] += 1
+                            break
+                elif (not c_ok) and n_wo_ok == (num_models - 1):
+                    ctx_bucket_counts[f"all_without_context_correct__context_is:{model_paths[ctx_i]}"] += 1
+
+                # Variant mask restricted to this context model (same naming/bit scheme).
+                m = 0
+                if row[ctx_i]:
+                    m |= 1 << ctx_i
+                for i in range(num_models):
+                    if i == ctx_i:
+                        continue
+                    if row[i]:
+                        m |= 1 << (num_models + i)
+                ctx_variant_masks[j] = int(m)
+
+            uniq_ctx_v, cnt_ctx_v = np.unique(ctx_variant_masks, return_counts=True)
+            ctx_variant_pattern_counts: Dict[str, int] = {}
+            for m, c in zip(uniq_ctx_v.tolist(), cnt_ctx_v.tolist()):
+                ctx_variant_pattern_counts[_mask_to_pattern_names(int(m), variant_names)] = int(c)
+
+            ctx_payload["role_aware_buckets"] = ctx_bucket_counts
+            ctx_payload["variant_pattern_counts"] = dict(
+                sorted(ctx_variant_pattern_counts.items(), key=lambda kv: (-kv[1], kv[0]))
+            )
+            by_context_model[str(ctx_i)] = ctx_payload
+
+        summary["mixed_context_breakdown"]["by_context_model_index"] = by_context_model
 
     return per_question, summary
 
@@ -210,6 +510,12 @@ def run_correctness_stats(
     splits: List[str],
 ) -> Dict[str, Any]:
     cfg = load_and_merge_configs(config_path)
+
+    # Ensure we read caches from the same directory as training/eval/pipeline.
+    # `cache_path` is a user-provided root; the ensemble cache lives in a stable subdir.
+    cache_root = cfg.get("cache_path")
+    cache_dir = configure_wagering_cache_dir(str(cache_root) if cache_root else None)
+    log.info("Using wagering logits/hidden-states cache dir: %s", cache_dir)
 
     model_cfgs = cfg.get("models") or []
     model_paths = [str(m["path"]) for m in model_cfgs if isinstance(m, dict) and m.get("path")]

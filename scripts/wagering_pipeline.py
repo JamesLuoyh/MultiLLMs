@@ -7,6 +7,8 @@ Keeps wandb run active between training and evaluation phases.
 Usage: python wagering_pipeline.py <config_file.yaml>
 """
 
+from __future__ import annotations
+
 import logging
 import os
 import shutil
@@ -15,9 +17,19 @@ import argparse
 from pathlib import Path
 from typing import Optional
 import importlib.util
+import json
+
+# Prefer running in the project venv when available.
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+_VENV_PYTHON = PROJECT_ROOT / ".venv" / "bin" / "python"
+if __name__ == "__main__" and _VENV_PYTHON.exists():
+    try:
+        if Path(sys.executable).resolve() != _VENV_PYTHON.resolve():
+            os.execv(str(_VENV_PYTHON), [str(_VENV_PYTHON)] + sys.argv)
+    except OSError:
+        pass
 
 # Ensure the local src/ tree is importable
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SRC_PATH = PROJECT_ROOT / "src"
 SCRIPTS_PATH = PROJECT_ROOT / "scripts"
 
@@ -61,7 +73,7 @@ _configure_default_hf_cache_env()
 from wagering.calibration import calibration_enabled, fit_or_load_logit_calibrator
 from wagering.methods.factory import load_wagering_method
 from wagering.utils import load_and_merge_configs
-# from wagering.utils.multi_llm_ensemble import configure_wagering_cache_dir
+from wagering.utils.multi_llm_ensemble import configure_wagering_cache_dir
 
 # Import training and evaluation functions
 def load_module_from_path(module_name, file_path):
@@ -78,6 +90,188 @@ train_main = train_module.main
 eval_main = eval_module.main
 
 log = logging.getLogger("wagering")
+
+
+def _json_default(obj):
+    """Best-effort JSON serializer for result dicts."""
+    try:
+        if isinstance(obj, Path):
+            return str(obj)
+    except Exception:
+        pass
+    if hasattr(obj, "tolist"):
+        try:
+            return obj.tolist()
+        except Exception:
+            pass
+    if hasattr(obj, "__dict__"):
+        try:
+            return obj.__dict__
+        except Exception:
+            pass
+    return str(obj)
+
+
+def _maybe_write_run_artifacts(
+    *,
+    config_path: Path,
+    merged_config: dict,
+    train_results: Optional[dict],
+    eval_results: Optional[dict],
+    calibration_path: Optional[str],
+    checkpoint_path: Optional[str],
+) -> None:
+    """
+    Persist the resolved config and pipeline results to disk.
+
+    Writes into a stable directory under the checkpoint base dir so repeated runs
+    (including wagering_pipeline_repeat) always get per-run artifacts on disk.
+    """
+    try:
+        out_base = merged_config.get("checkpoint_base_dir")
+        base_dir: Optional[Path] = (
+            Path(out_base).expanduser()
+            if isinstance(out_base, str) and out_base.strip()
+            else None
+        )
+        # Prefer a per-run stable directory under the actual checkpoint path to
+        # avoid collisions when multiple runs share the same wandb_name.
+        if checkpoint_path:
+            run_dir = Path(checkpoint_path).expanduser().resolve() / "pipeline_artifacts"
+            run_dir.mkdir(parents=True, exist_ok=True)
+            out_dir = run_dir.parent
+            wandb_name = merged_config.get("wandb_name")
+            base_dir = out_dir.parent
+        else:
+            if base_dir is None:
+                return
+            wandb_name = merged_config.get("wandb_name")
+            if isinstance(wandb_name, str) and wandb_name.strip():
+                out_dir = base_dir / wandb_name.strip()
+            else:
+                out_dir = base_dir
+            run_dir = out_dir / "pipeline_artifacts"
+        run_dir.mkdir(parents=True, exist_ok=True)
+
+        # Save original config for reproducibility (best-effort copy).
+        try:
+            src_copy = run_dir / "config.original.yaml"
+            if config_path.exists() and not src_copy.exists():
+                shutil.copy2(config_path, src_copy)
+        except Exception:
+            pass
+
+        # Save merged/resolved config.
+        try:
+            import yaml
+
+            with (run_dir / "config.merged.yaml").open("w") as f:
+                yaml.safe_dump(merged_config, f, sort_keys=False)
+        except Exception:
+            # yaml is already a dependency in this repo; if something goes wrong, skip silently.
+            pass
+
+        summary = {
+            "config_path": str(config_path),
+            "checkpoint_base_dir": str(base_dir),
+            "output_dir": str(out_dir),
+            "wandb_name": wandb_name,
+            "checkpoint_path": checkpoint_path,
+            "calibration_path": calibration_path,
+        }
+        with (run_dir / "pipeline.summary.json").open("w") as f:
+            json.dump(summary, f, indent=2, default=_json_default)
+
+        if train_results is not None:
+            with (run_dir / "train.results.json").open("w") as f:
+                json.dump(train_results, f, indent=2, default=_json_default)
+        if eval_results is not None:
+            with (run_dir / "eval.results.json").open("w") as f:
+                json.dump(eval_results, f, indent=2, default=_json_default)
+
+            # Also persist a compact metrics-only view (scalar floats + overall means).
+            try:
+                metrics_keys = [
+                    "accuracy",
+                    "nll",
+                    "brier",
+                    "auc",
+                    "ece",
+                    "inverse_hhi",
+                    "avg_inference_time_per_batch_s",
+                    "d_regret",
+                    "brier_d_regret",
+                    "meta_acc",
+                    "meta_nll",
+                    "meta_auc",
+                    "kendall_tau",
+                    "best_model_mrr",
+                ]
+
+                def _to_float(v):
+                    try:
+                        if v is None:
+                            return None
+                        if isinstance(v, (list, tuple)) and v:
+                            v = v[0]
+                        return float(v)
+                    except Exception:
+                        return None
+
+                per_dataset = {}
+                per_dataset_subset_any_model_wrong = {}
+                overall_accum = {k: [] for k in metrics_keys}
+                subset_overall_accum = {k: [] for k in metrics_keys}
+                if isinstance(eval_results, dict):
+                    for ds_name, ds_res in eval_results.items():
+                        if not isinstance(ds_res, dict):
+                            continue
+                        out_row = {}
+                        for k in metrics_keys:
+                            fv = _to_float(ds_res.get(k))
+                            if fv is not None:
+                                out_row[k] = fv
+                                overall_accum[k].append(fv)
+                        if out_row:
+                            per_dataset[str(ds_name)] = out_row
+
+                        subset = ds_res.get("subset_any_model_wrong")
+                        if isinstance(subset, dict):
+                            sub_row = {}
+                            for k in metrics_keys:
+                                fv = _to_float(subset.get(k))
+                                if fv is not None:
+                                    sub_row[k] = fv
+                                    subset_overall_accum[k].append(fv)
+                            if sub_row:
+                                sub_row["num_examples"] = subset.get("num_examples")
+                                per_dataset_subset_any_model_wrong[str(ds_name)] = sub_row
+
+                overall = {}
+                for k, vals in overall_accum.items():
+                    if vals:
+                        overall[k] = sum(vals) / float(len(vals))
+
+                subset_overall = {}
+                for k, vals in subset_overall_accum.items():
+                    if vals:
+                        subset_overall[k] = sum(vals) / float(len(vals))
+
+                metrics_out = {
+                    "per_dataset": per_dataset,
+                    "overall_mean_across_datasets": overall,
+                    "subset_any_model_wrong": {
+                        "per_dataset": per_dataset_subset_any_model_wrong,
+                        "overall_mean_across_datasets": subset_overall,
+                    },
+                }
+                with (run_dir / "eval.metrics.json").open("w") as f:
+                    json.dump(metrics_out, f, indent=2, default=_json_default)
+            except Exception:
+                pass
+    except Exception:
+        # Never fail the pipeline due to logging.
+        return
 
 
 def _parse_gpu_ids(csv: str) -> str:
@@ -158,10 +352,12 @@ def run_pipeline(
         log.info("Using CUDA_VISIBLE_DEVICES=%s", visible_gpus)
 
     args = load_and_merge_configs(config_path)
-    # configure_wagering_cache_dir(args.get("cache_path"))
+    configure_wagering_cache_dir(args.get("cache_path"))
     calibration_path = None
     checkpoint_path = None
     created_checkpoint_path = None
+    train_results = None
+    eval_results = None
 
     wagering_method = load_wagering_method(
         args["wagering_method"]["name"],
@@ -243,6 +439,15 @@ def run_pipeline(
     log.info("\n" + "=" * 80)
     log.info("PIPELINE COMPLETE")
     log.info("=" * 80)
+
+    _maybe_write_run_artifacts(
+        config_path=config_path,
+        merged_config=args,
+        train_results=train_results,
+        eval_results=eval_results,
+        calibration_path=calibration_path,
+        checkpoint_path=checkpoint_path,
+    )
 
     _cleanup_checkpoints(created_checkpoint_path, mode=cleanup_checkpoints)
 

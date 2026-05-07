@@ -2,10 +2,10 @@
 """Generate a PubMedQA-style Bayesian saturation-forecast dataset.
 
 Each example samples:
-- prior_prob in (0.10, 0.90)
-- tpr in (0.75, 0.99)
-- fpr in (0.05, 0.30)
-- evidence in {0, 1}
+- prior_prob in {0.1, 0.9}
+- tpr in [0.80, 0.95]
+- fpr in [0.05, 0.15]
+- evidence W: when prior_prob = 0.1, W = 1; when prior_prob = 0.9, W = 0
 
 Labels:
 - binary_label: 1 if posterior_prob > 0.5 else 0
@@ -56,14 +56,14 @@ def _format_full_prompt(prior_prob: float, tpr: float, fpr: float, evidence: int
         "Let the state space be $\\Omega = \\{0, 1\\}$. Let $S \\in \\Omega$ be the random variable "
         "indicating whether the primary compute cluster will become saturated ($>95\\%$ "
         "capacity) within the next $10$ minutes, where $S=1$ denotes saturation. "
-        f"Based on current time-of-day traffic models, the empirical probability of saturation is $P(S=1) =$ {prior_prob:.4f}.\n\n"
+        f"Based on current time-of-day traffic models, the empirical probability of saturation is $P(S=1) =$ {prior_prob:.2f}.\n\n"
         "Update Rule:To improve forecasting, the mechanism queries a lightweight, predictive monitoring agent. "
         "Let $W \\in \\Omega$ be the random variable representing the agent's output warning. "
         "The agent possesses the following conditional probabilities:"
-        f"True Positive Rate (Probability of a warning given imminent saturation): $P(W=1|S=1) =$ {tpr:.4f}."
-        f"False Positive Rate (Probability of a warning given normal loads): $P(W=1|S=0) =$ {fpr:.4f}.\n\n"
+        f"True Positive Rate (Probability of a warning given imminent saturation): $P(W=1|S=1) =$ {tpr:.2f}."
+        f"False Positive Rate (Probability of a warning given normal loads): $P(W=1|S=0) =$ {fpr:.2f}.\n\n"
         f"Evidence:The monitoring agent analyzes the telemetry and outputs $W=$ {evidence}.\n\n"
-        "Question:It is more likely than not (with probability $> 0.5$) that the cluster will saturate. "
+        "Question:It is more likely than not that the cluster will saturate? "
         "Output exactly one character: 1 if it is more likely that the cluster will saturate, or 0 otherwise."
     )
 
@@ -82,18 +82,23 @@ def _format_prompt_without_context(prior_prob: float, tpr: float, fpr: float, ev
         "Let the state space be $\\Omega = \\{0, 1\\}$. Let $S \\in \\Omega$ be the random variable "
         "indicating whether the primary compute cluster will become saturated ($>95\\%$ "
         "capacity) within the next $10$ minutes, where $S=1$ denotes saturation. "
-        f"Based on current time-of-day traffic models, the empirical probability of saturation is $P(S=1) =$ {prior_prob:.4f}.\n\n"
-        "Question:It is more likely than not (with probability $> 0.5$) that the cluster will saturate. "
+        f"Based on current time-of-day traffic models, the empirical probability of saturation is $P(S=1) =$ {prior_prob:.2f}.\n\n"
+        "Based on this empirical probability, answer the following question."
+        "Question: Is it more likely than not that the cluster will saturate? "
         "Output exactly one character: 1 if it is more likely that the cluster will saturate, or 0 otherwise."
     )
 
 
 def _build_row(example_id: int, rng: random.Random) -> Dict[str, object]:
-    idx = random.choice([0,1])
-    prior = _sample_float(rng, 0.01, 0.1) if idx == 1 else _sample_float(rng, 0.9, 0.99)
-    tpr = _sample_float(rng, 0.80, 0.99)
-    fpr = _sample_float(rng, 0.05, 0.30)
-    evidence = idx# int(rng.randint(0, 1))
+    if rng.choice([True, False]):
+        prior = 0.1
+        evidence = 1
+    else:
+        prior = 0.9
+        evidence = 0
+    prior = round(prior, 2)
+    tpr = _sample_float(rng, 0.90, 0.95, decimals=2)
+    fpr = _sample_float(rng, 0.05, 0.10, decimals=2)
 
     posterior = _posterior(prior=prior, tpr=tpr, fpr=fpr, evidence=evidence)
     binary_label = 1 if posterior > 0.5 else 0

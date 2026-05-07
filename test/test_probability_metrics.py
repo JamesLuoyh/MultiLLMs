@@ -47,9 +47,11 @@ def test_dataset_select_keeps_probabilistic_labels_aligned() -> None:
         batch_size=2,
     )
     dataset.probabilistic_labels = [0.9, 0.2, 0.8]
+    dataset.probability_labels = [0.9, 0.2, 0.8]
 
     dataset.select([2, 0])
 
     assert dataset.x == ["q2", "q0"]
     assert dataset.y == ["1", "1"]
     assert dataset.probabilistic_labels == [0.8, 0.9]
+    assert dataset.probability_labels == [0.8, 0.9]

@@ -26,6 +26,26 @@ from wagering.core.generation_parameters import GenerationParametersFactory
 log = logging.getLogger(__name__)
 
 
+def should_load_prompt_perplexity_models_sequentially(num_models: int) -> bool:
+    """
+    Return True when there are more ensemble models than visible CUDA devices.
+
+    In that situation, ``device_map`` round-robin still places multiple large
+    models on at least one GPU (or subprocesses pin ``CUDA_VISIBLE_DEVICES`` to
+    a single device), which commonly causes OOM. Callers should load one model
+    at a time when computing prompt perplexities instead of loading the full
+    ensemble into VRAM together.
+    """
+    if num_models <= 1:
+        return False
+    if not torch.cuda.is_available():
+        return False
+    visible = int(torch.cuda.device_count())
+    if visible <= 0:
+        return False
+    return num_models > visible
+
+
 def _resolve_device_map_for_model(
     model_cfg: Dict[str, Any],
     model_index: int,
@@ -35,7 +55,13 @@ def _resolve_device_map_for_model(
     Resolve a model's device map.
 
     For multi-model runs, default `device_map: auto` can place every model on the
-    same GPU. To avoid this, distribute models round-robin across visible GPUs.
+    same GPU. To avoid this, distribute models round-robin across visible GPUs
+    when there are enough devices for one model per visible index.
+
+    When ``torch.cuda.device_count()`` is smaller than the ensemble size (for
+    example a driver sets ``CUDA_VISIBLE_DEVICES`` to one id), every model maps
+    to ``cuda:0``; use :func:`should_load_prompt_perplexity_models_sequentially`
+    and sequential perplexity loading instead of loading the full ensemble.
     """
     load_model_args = model_cfg.get("load_model_args", {}) or {}
     requested_device_map = load_model_args.get("device_map", "auto")

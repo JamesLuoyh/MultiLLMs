@@ -26,6 +26,7 @@ test_datasets: []
 
 phase_shift:
   rolling_window_batches: 20
+  baseline_window_batches: 20
   evaluate_after_phase2: false
   metrics: [accuracy, ece, kendall_tau, best_model_mrr, brier_d_regret]
   methods:

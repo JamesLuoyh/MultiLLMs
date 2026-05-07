@@ -78,8 +78,8 @@ class MSEBrWagersV2(WageringMethod):
         self.lr_decay_steps = int(config.get("lr_decay_steps", 1))  # Decay every N optimizer steps
         hidden_state_layers_cfg = config.get("hidden_state_layers")
         if hidden_state_layers_cfg is None:
-            # Default to first, second-last, and last transformer layers.
-            self.hidden_state_layers = [0, -2, -1]
+            # Align with `CentralizedWagers` default: last transformer layer only.
+            self.hidden_state_layers = [-1]
         else:
             if not isinstance(hidden_state_layers_cfg, (list, tuple)):
                 raise ValueError(
@@ -87,6 +87,10 @@ class MSEBrWagersV2(WageringMethod):
                     f"got {type(hidden_state_layers_cfg).__name__}"
                 )
             self.hidden_state_layers = [int(x) for x in hidden_state_layers_cfg]
+
+        # Optional per-model hidden-state layer selection.
+        # This is interpreted by the trainer via `resolve_hidden_state_layers_for_model(...)`.
+        self.hidden_state_layers_per_model = config.get("hidden_state_layers_per_model")
         
         # Initialize scoring function
         
@@ -247,7 +251,18 @@ class MSEBrWagersV2(WageringMethod):
         
         model_logits_tensor = torch.as_tensor(model_logits, dtype=torch.float32).to(self.device)
         gold_label_tensor = torch.as_tensor(gold_label, dtype=torch.long).to(self.device)
-        brs, nash_gap, score_diff, total_payout = self.extract_wagers_brs_and_nash_gap(sigmoid_wagers, model_logits_tensor, gold_label_tensor)  # This will populate the cache with BRs and Nash gaps for the current wagers
+        gold_label_distribution = kwargs.get("gold_label_distribution", None)
+        gold_label_distribution_tensor = None
+        if gold_label_distribution is not None:
+            gold_label_distribution_tensor = torch.as_tensor(
+                gold_label_distribution, dtype=torch.float32, device=self.device
+            )
+        brs, nash_gap, score_diff, total_payout = self.extract_wagers_brs_and_nash_gap(
+            sigmoid_wagers,
+            model_logits_tensor,
+            gold_label_tensor,
+            gold_label_distribution_tensor=gold_label_distribution_tensor,
+        )  # This will populate the cache with BRs and Nash gaps for the current wagers
         # Convert to numpy and validate
         wagers_np = wagers.detach().cpu().numpy()
         nash_gap = nash_gap.detach().cpu().numpy()
@@ -268,26 +283,39 @@ class MSEBrWagersV2(WageringMethod):
             "total_payout": total_payout,
         }
     
-    def extract_wagers_brs_and_nash_gap(self, sigmoid_wagers, model_logits_tensor, gold_label_tensor):
+    def extract_wagers_brs_and_nash_gap(
+        self,
+        sigmoid_wagers,
+        model_logits_tensor,
+        gold_label_tensor,
+        gold_label_distribution_tensor: Optional[torch.Tensor] = None,
+    ):
         
         # def score_function(ground_truth: torch.Tensor, predictions: torch.Tensor, wagers: torch.Tensor = None) -> torch.Tensor:
         
         probs = F.softmax(model_logits_tensor, dim=-1)  # [batch_size, num_models, num_options]
 
         batch_size, num_models, num_options = probs.shape
-        
-        # Create one-hot encoding of ground truth
-        # ground_truth: [batch_size] -> [batch_size, num_options]
-        gt_onehot = F.one_hot(gold_label_tensor, num_classes=num_options).float()  # [batch_size, num_options]
-        
-        # Expand to match predictions: [batch_size, 1, num_options] -> [batch_size, num_models, num_options]
-        gt_onehot_expanded = gt_onehot.unsqueeze(1).expand(batch_size, num_models, num_options)
-        
-        # Compute squared error: [batch_size, num_models, num_options]
-        squared_errors = (probs - gt_onehot_expanded) ** 2
-        
-        # Sum over options (Brier score): [batch_size, num_models]
-        brier_scores = squared_errors.sum(dim=-1)
+
+        if gold_label_distribution_tensor is not None:
+            # Soft-label / distributional ground truth: expected Brier score under gt distribution.
+            #
+            # For a predictive distribution p and ground-truth distribution q, the expected Brier is:
+            #   E_{y~q}[ sum_k (p_k - 1_{y=k})^2 ] = 1 + sum_k p_k^2 - 2 * <q, p>
+            gt_dist = gold_label_distribution_tensor.to(device=probs.device, dtype=probs.dtype)
+            if gt_dist.ndim != 2 or gt_dist.shape[0] != batch_size or gt_dist.shape[1] != num_options:
+                raise ValueError(
+                    "gold_label_distribution_tensor must be shape [batch_size, num_options], "
+                    f"got {tuple(gt_dist.shape)}"
+                )
+            gt_dist_expanded = gt_dist.unsqueeze(1).expand(batch_size, num_models, num_options)
+            brier_scores = 1.0 + (probs**2).sum(dim=-1) - 2.0 * (probs * gt_dist_expanded).sum(dim=-1)
+        else:
+            # Hard label: one-hot ground truth (existing behavior).
+            gt_onehot = F.one_hot(gold_label_tensor, num_classes=num_options).float()  # [batch_size, num_options]
+            gt_onehot_expanded = gt_onehot.unsqueeze(1).expand(batch_size, num_models, num_options)
+            squared_errors = (probs - gt_onehot_expanded) ** 2
+            brier_scores = squared_errors.sum(dim=-1)
         
         # Return negative (since lower Brier score is better, but we want higher scores to be better)
         # scores = 0.5 * (2-brier_scores - sigmoid_wagers)  # Custom modification
@@ -364,6 +392,12 @@ class MSEBrWagersV2(WageringMethod):
         batch_size = model_logits.shape[0]
         model_logits_tensor = torch.as_tensor(model_logits, dtype=torch.float32).to(self.device)
         gold_label_tensor = torch.as_tensor(gold_label, dtype=torch.long).to(self.device)
+        gold_label_distribution = kwargs.get("gold_label_distribution", None)
+        gold_label_distribution_tensor = None
+        if gold_label_distribution is not None:
+            gold_label_distribution_tensor = torch.as_tensor(
+                gold_label_distribution, dtype=torch.float32, device=self.device
+            )
         
         # Convert hidden states to tensors with requires_grad=True for gradient flow
         hidden_states_tensors = []
@@ -424,7 +458,12 @@ class MSEBrWagersV2(WageringMethod):
             # aggregated_probs_torch = LinearPooling.aggregate_torch(
             #     model_logits_tensor, wagers_all
             # )  # [batch_size, num_options]
-            brs, nash_gap, score_diff, _ = self.extract_wagers_brs_and_nash_gap(sigmoid_wagers, model_logits_tensor, gold_label_tensor)
+            brs, nash_gap, score_diff, _ = self.extract_wagers_brs_and_nash_gap(
+                sigmoid_wagers,
+                model_logits_tensor,
+                gold_label_tensor,
+                gold_label_distribution_tensor=gold_label_distribution_tensor,
+            )
             # losses = -torch.log(aggregated_probs_torch[torch.arange(batch_size), gold_label_tensor] + 1e-10) # [batch_size]
             mseloss = F.mse_loss(sigmoid_wagers, brs, reduction='none')#.mean(dim=1)
             # Compute all N losses from the same forward pass tensors
@@ -556,6 +595,7 @@ class MSEBrWagersV2(WageringMethod):
                 "grad_clip_norm": self.grad_clip_norm,
                 "normalize_hidden_states": self.normalize_hidden_states,
                 "hidden_state_layers": self.hidden_state_layers,
+                "hidden_state_layers_per_model": self.hidden_state_layers_per_model,
                 "score_function": self.score_function_name,
                 "device": self.device_str,
                 "frozen_model_indices": sorted(self.frozen_model_indices),

@@ -202,14 +202,30 @@ class CentralizedWagers(WageringMethod):
             model_logits_tensor, wagers
         )  # [batch_size, num_options]
         
-        # Compute cross-entropy loss for each sample
-        gold_label_tensor = torch.as_tensor(gold_label, dtype=torch.long).to(self.device)
-        # Gather probabilities at gold label indices
-        batch_indices = torch.arange(batch_size, device=self.device)
-        probs_at_gold = batch_aggregated_probs[batch_indices, gold_label_tensor]
-        
-        # Compute loss as mean -log(prob[gold_label])
-        loss = -torch.mean(torch.log(probs_at_gold + 1e-10))
+        gold_label_distribution = kwargs.get("gold_label_distribution", None)
+        if gold_label_distribution is not None:
+            # Expected cross-entropy under a soft-label distribution q:
+            #   E_{y~q}[-log p(y)] = -sum_k q_k log p_k
+            gold_label_distribution_tensor = torch.as_tensor(
+                gold_label_distribution, dtype=torch.float32, device=self.device
+            )
+            if (
+                gold_label_distribution_tensor.ndim != 2
+                or gold_label_distribution_tensor.shape[0] != batch_size
+                or gold_label_distribution_tensor.shape[1] != batch_aggregated_probs.shape[1]
+            ):
+                raise ValueError(
+                    "gold_label_distribution must be shape [batch_size, num_options], "
+                    f"got {tuple(gold_label_distribution_tensor.shape)}"
+                )
+            log_probs = torch.log(batch_aggregated_probs + 1e-10)
+            loss = -torch.mean(torch.sum(gold_label_distribution_tensor * log_probs, dim=-1))
+        else:
+            # Standard hard-label cross-entropy.
+            gold_label_tensor = torch.as_tensor(gold_label, dtype=torch.long).to(self.device)
+            batch_indices = torch.arange(batch_size, device=self.device)
+            probs_at_gold = batch_aggregated_probs[batch_indices, gold_label_tensor]
+            loss = -torch.mean(torch.log(probs_at_gold + 1e-10))
         
         # Backward pass with gradient clipping
         self.optimizer.zero_grad()

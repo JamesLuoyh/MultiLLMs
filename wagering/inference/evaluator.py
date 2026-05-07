@@ -7,7 +7,7 @@ import pickle
 import sys
 import time
 from pathlib import Path
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional, Tuple, Union
 import numpy as np
 import pandas as pd
 
@@ -19,12 +19,13 @@ if str(SRC_PATH) not in sys.path:
 
 from wagering.core.model import WhiteboxModel
 from wagering.core.dataset import Dataset
-from wagering.core.metrics import ECE
+from wagering.core.metrics import ECE, bernoulli_kl_divergence, bernoulli_tv_distance
 
 # Local wagering imports
 from wagering.methods.base import WageringMethod
 from wagering.training.analytics import WageringAnalytics
 from wagering.training.trainer import (
+    WageringTrainer,
     _compute_model_brier_scores,
     compute_brier_dynamic_regret,
     compute_dynamic_regret,
@@ -47,6 +48,199 @@ log = logging.getLogger("wagering")
 from sklearn.metrics import roc_auc_score
 
 
+def _kl_qp_categorical_rows(q: np.ndarray, p: np.ndarray, eps: float = 1e-10) -> np.ndarray:
+    """KL(q || p) per row for discrete distributions q, p of shape [batch, num_options]."""
+    q = np.asarray(q, dtype=np.float64)
+    p = np.asarray(p, dtype=np.float64)
+    q = np.clip(q, eps, 1.0)
+    p = np.clip(p, eps, 1.0)
+    return np.sum(q * (np.log(q) - np.log(p)), axis=-1)
+
+
+def _tv_distance_per_model(p: np.ndarray, q: np.ndarray) -> np.ndarray:
+    """
+    Total variation distance d_TV(p, q) = (1/2) * sum_k |p_k - q_k|.
+
+    Args:
+        p: [batch, num_models, num_options]
+        q: [batch, num_options]
+
+    Returns:
+        [batch, num_models]
+    """
+    p = np.asarray(p, dtype=np.float64)
+    q = np.asarray(q, dtype=np.float64)
+    return 0.5 * np.sum(np.abs(p - q[:, np.newaxis, :]), axis=-1)
+
+
+def _softmax_np(logits: np.ndarray) -> np.ndarray:
+    """Stable softmax for arrays with last dim = classes."""
+    x = np.asarray(logits, dtype=np.float64)
+    m = np.max(x, axis=-1, keepdims=True)
+    z = x - m
+    ez = np.exp(z)
+    denom = np.sum(ez, axis=-1, keepdims=True)
+    return ez / (denom + 1e-20)
+
+
+def _compute_model_brier_scores_soft_binary(
+    model_logits: np.ndarray,
+    *,
+    gt_positive_probs: np.ndarray,
+    positive_option_index: int,
+) -> np.ndarray:
+    """
+    Compute per-model Brier scores when the binary ground-truth is a soft probability.
+
+    Args:
+        model_logits: [num_examples, num_models, 2]
+        gt_positive_probs: [num_examples] probability of the positive option
+        positive_option_index: index of the positive option in the 2-way output
+
+    Returns:
+        model_brier: [num_examples, num_models]
+    """
+    logits = np.asarray(model_logits, dtype=np.float64)
+    if logits.ndim != 3 or logits.shape[-1] != 2:
+        raise ValueError("soft-binary Brier expects model_logits shape [N, M, 2]")
+    gt = np.asarray(gt_positive_probs, dtype=np.float64)
+    if gt.ndim != 1 or gt.shape[0] != logits.shape[0]:
+        raise ValueError("gt_positive_probs must be 1D and match model_logits first dim")
+    pos_idx = int(positive_option_index)
+    if pos_idx not in (0, 1):
+        raise ValueError("positive_option_index must be 0 or 1 for binary tasks")
+
+    y = np.zeros((logits.shape[0], 2), dtype=np.float64)
+    y[:, pos_idx] = gt
+    y[:, 1 - pos_idx] = 1.0 - gt
+
+    model_probs = _softmax_np(logits)  # [N, M, 2]
+    return np.sum((model_probs - y[:, np.newaxis, :]) ** 2, axis=2)
+
+
+def _debug_log_eval_batch_prob_align(
+    *,
+    dataset: Dataset,
+    dataset_name: str,
+    option_tokens: List[str],
+    batch_start: int,
+    batch_end: int,
+    batch_model_probs: np.ndarray,  # [B, M, K]
+    batch_labels: np.ndarray,  # [B]
+) -> None:
+    """
+    Inference-time analogue of the training debug logs.
+
+    Uses `dataset.probability_labels` (from `probability_label_column`) when present to build
+    soft ground-truth distributions (binary only), otherwise uses one-hot labels.
+
+    Logs:
+      - which model is best per row by |P(pos)-Q(pos)|
+      - mean KL(q||p_best)
+      - mean over rows of mean KL(q||p_nonbest) (nonbest averaged across models first)
+      - pct_best_model_is_context_slot for |P(pos)-Q(pos)|, TV, and argmin KL
+    """
+    p_all = np.asarray(batch_model_probs, dtype=np.float64)
+    bsz, num_models, num_options = p_all.shape
+    if num_options != 2:
+        log.info(
+            "eval_debug_prob_align dataset=%s rows=[%d:%d): skipped (num_options=%d != 2)",
+            dataset_name,
+            int(batch_start),
+            int(batch_end),
+            int(num_options),
+        )
+        return
+
+    pos_marker = getattr(dataset, "positive_label", None)
+    pos_idx = 0
+    if pos_marker is not None:
+        try:
+            pos_idx = int(option_tokens.index(str(pos_marker).strip()))
+        except ValueError:
+            pos_idx = 0
+
+    prob_labs = getattr(dataset, "probability_labels", None)
+    if prob_labs is None and getattr(dataset, "probabilistic_labels", None) is not None:
+        raise ValueError(
+            "Dataset provides `probabilistic_labels` but not `probability_labels`. "
+            "KL/TV must use `probability_labels` (configured via `probability_label_column`)."
+        )
+
+    if isinstance(prob_labs, (list, tuple)) and len(prob_labs) == len(dataset.x):
+        target_vec = np.asarray(prob_labs[batch_start:batch_end], dtype=np.float64)
+    else:
+        target_vec = (np.asarray(batch_labels, dtype=np.int64) == int(pos_idx)).astype(np.float64)
+
+    q = np.zeros((bsz, 2), dtype=np.float64)
+    q[:, int(pos_idx)] = target_vec
+    q[:, int(1 - int(pos_idx))] = 1.0 - target_vec
+
+    p_pos = p_all[:, :, int(pos_idx)]
+    q_pos = q[:, int(pos_idx)]
+    abs_err = np.abs(p_pos - q_pos[:, np.newaxis])
+    best_m = np.argmin(abs_err, axis=1)
+
+    tv_bm = _tv_distance_per_model(p_all, q)
+    best_m_tv = np.argmin(tv_bm, axis=1)
+
+    kl_all = np.empty((bsz, num_models), dtype=np.float64)
+    for m in range(num_models):
+        kl_all[:, m] = _kl_qp_categorical_rows(q, p_all[:, m, :])
+    best_m_kl = np.argmin(kl_all, axis=1)
+
+    p_best = p_all[np.arange(bsz), best_m, :]
+    kl_best = _kl_qp_categorical_rows(q, p_best)
+
+    other_mask = np.ones((bsz, num_models), dtype=bool)
+    other_mask[np.arange(bsz), best_m] = False
+    n_other = np.maximum(other_mask.sum(axis=1), 1)
+    kl_other_mean_per_ex = (kl_all * other_mask).sum(axis=1) / n_other
+
+    # Context routing assignment (if present) is stored directly on the dataset.
+    ctx_model = np.full(bsz, -1, dtype=np.int64)
+    dataset_type = _get_mixed_context_dataset_type(dataset)
+    if dataset_type is not None:
+        raw = getattr(dataset, f"{dataset_type}_context_assignment_by_example", None)
+        if isinstance(raw, list) and len(raw) == len(dataset.x):
+            try:
+                ctx_model = np.asarray(raw, dtype=np.int64)[batch_start:batch_end]
+            except Exception:
+                ctx_model = np.full(bsz, -1, dtype=np.int64)
+
+    ctx_ok = ctx_model >= 0
+    if np.any(ctx_ok):
+        pct_ctx = 100.0 * float(np.mean(best_m[ctx_ok] == ctx_model[ctx_ok]))
+        pct_ctx_tv = 100.0 * float(np.mean(best_m_tv[ctx_ok] == ctx_model[ctx_ok]))
+        pct_ctx_kl = 100.0 * float(np.mean(best_m_kl[ctx_ok] == ctx_model[ctx_ok]))
+        ctx_pct_str = f"{pct_ctx:.2f}%"
+        ctx_pct_tv_str = f"{pct_ctx_tv:.2f}%"
+        ctx_pct_kl_str = f"{pct_ctx_kl:.2f}%"
+    else:
+        ctx_pct_str = "n/a_no_mixed_context_routing_on_batch"
+        ctx_pct_tv_str = "n/a_no_mixed_context_routing_on_batch"
+        ctx_pct_kl_str = "n/a_no_mixed_context_routing_on_batch"
+
+    counts = np.bincount(best_m, minlength=num_models)
+    log.info(
+        "eval_debug_prob_align dataset=%s rows=[%d:%d) |best_model_counts|=%s | "
+        "mean_KL_best=%.6f mean_of_mean_KL_nonbest=%.6f | "
+        "pct_best_model_is_context_slot=%s pct_best_model_is_context_slot_tv=%s "
+        "pct_best_model_is_context_slot_kl=%s (over %d/%d rows with assignment; TV=d_TV=0.5*L1; KL=KL(q||p))",
+        dataset_name,
+        int(batch_start),
+        int(batch_end),
+        counts.tolist(),
+        float(np.mean(kl_best)),
+        float(np.mean(kl_other_mean_per_ex)),
+        ctx_pct_str,
+        ctx_pct_tv_str,
+        ctx_pct_kl_str,
+        int(np.count_nonzero(ctx_ok)),
+        int(bsz),
+    )
+
+
 class WageringEvaluator:
     """
     Evaluator for multi-LLM wagering methods.
@@ -56,7 +250,7 @@ class WageringEvaluator:
     
     def __init__(
         self,
-        models: List[WhiteboxModel],
+        models: List[Union[WhiteboxModel, str]],
         wagering_method: WageringMethod,
         aggregation_function: AggregationFunction,
         option_tokens: List[str] = ["A", "B", "C", "D"],
@@ -67,12 +261,18 @@ class WageringEvaluator:
         seed: Optional[int] = None,
         wandb_starting_step: Optional[int] = None,
         logit_calibrator: Optional[Any] = None,
+        model_configs_for_sequential_perplexity: Optional[List[Dict[str, Any]]] = None,
+        perplexity_load_cache_kwargs: Optional[Dict[str, Any]] = None,
+        debug_batch_prob_alignment: bool = False,
     ):
         """
         Initialize the evaluator.
         
         Args:
-            models: List of WhiteboxModel instances
+            models: ``WhiteboxModel`` instances and/or string checkpoint paths
+            model_configs_for_sequential_perplexity: Per-slot merged YAML configs for
+                one-at-a-time perplexity loads when VRAM is insufficient for the ensemble.
+            perplexity_load_cache_kwargs: Optional kwargs for sequential model loads.
             wagering_method: WageringMethod instance (should be in eval mode)
             aggregation_function: AggregationFunction instance
             option_tokens: List of option tokens (e.g., ["A", "B", "C", "D"])
@@ -97,61 +297,93 @@ class WageringEvaluator:
         self.method_requires_model_perplexities = bool(
             getattr(self.wagering_method, "requires_model_perplexities", False)
         )
-        
+        self._model_configs_for_sequential_perplexity = model_configs_for_sequential_perplexity
+        self._perplexity_load_cache_kwargs = perplexity_load_cache_kwargs or {}
+        self.debug_batch_prob_alignment = bool(debug_batch_prob_alignment)
+
         if self.checkpoint_dir is not None:
             self.checkpoint_dir = Path(checkpoint_dir)
             self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         
         self.wagering_method.eval_mode()
-        
-        # Global step counter for wandb logging across all datasets
-        # This ensures each dataset gets unique step numbers and time series work correctly
-        # Continue from training's last step if provided to avoid wandb step ordering warnings
+
+        # Global step counter for wandb logging across all datasets.
+        # This ensures each dataset gets unique step numbers and time series work correctly.
+        # Continue from training's last step if provided to avoid wandb step ordering warnings.
         if wandb_starting_step is not None:
-            # Use provided starting step (from training's last step)
+            # Use provided starting step (from training's last step).
             self._global_wandb_step = int(wandb_starting_step)
             run_step = self._get_wandb_run_step()
             if run_step is not None:
                 self._global_wandb_step = max(self._global_wandb_step, run_step)
-            log.info(f"Initialized wandb step counter to {self._global_wandb_step} (continuing from training)")
+            log.info(
+                "Initialized wandb step counter to %s (continuing from training)",
+                self._global_wandb_step,
+            )
         elif self.wandb_logger:
             try:
-                # Get current step from wandb run if it exists (when resuming)
-                # When wandb resumes a run, we need to continue from where training left off
-                if hasattr(self.wandb_logger, 'run') and self.wandb_logger.run is not None:
-                    # Try to get the step from wandb's run object
-                    # wandb tracks the current step internally
+                # Get current step from wandb run if it exists (when resuming).
+                # When wandb resumes a run, we need to continue from where training left off.
+                if hasattr(self.wandb_logger, "run") and self.wandb_logger.run is not None:
                     try:
-                        # The step is available as wandb.run.step or can be queried from the API
-                        # For resumed runs, we need to get the last logged step
                         run = self.wandb_logger.run
-                        # Try accessing step directly (available in newer wandb versions)
-                        if hasattr(run, 'step') and run.step is not None:
-                            self._global_wandb_step = run.step
+                        if hasattr(run, "step") and run.step is not None:
+                            self._global_wandb_step = int(run.step)
                         else:
-                            # Fallback: try to get from summary (may not be available immediately)
-                            # If unavailable, we'll start from 0 and wandb will handle it
-                            # but this may cause warnings - better to use a high starting step
-                            # Check if this is a resumed run by looking at run.id
-                            # For now, start from 0 and let wandb handle step conflicts
                             self._global_wandb_step = 0
-                            log.warning("Could not determine wandb step from run. Starting from 0. "
-                                      "If this is a resumed run, step ordering warnings may occur.")
+                            log.warning(
+                                "Could not determine wandb step from run. Starting from 0. "
+                                "If this is a resumed run, step ordering warnings may occur."
+                            )
                     except Exception as e:
                         self._global_wandb_step = 0
-                        log.warning(f"Error getting wandb step: {e}, starting from 0")
+                        log.warning("Error getting wandb step: %s, starting from 0", e)
                     else:
                         if self._global_wandb_step > 0:
-                            log.info(f"Initialized wandb step counter to {self._global_wandb_step} (resumed from training)")
+                            log.info(
+                                "Initialized wandb step counter to %s (resumed from training)",
+                                self._global_wandb_step,
+                            )
                 else:
                     self._global_wandb_step = 0
                     log.info("Initialized wandb step counter to 0 (wandb run not available)")
             except Exception as e:
-                # If anything goes wrong, start from 0
+                # If anything goes wrong, start from 0.
                 self._global_wandb_step = 0
-                log.warning(f"Could not get wandb step, starting from 0: {e}")
+                log.warning("Could not get wandb step, starting from 0: %s", e)
         else:
             self._global_wandb_step = 0
+
+    def _maybe_load_model_for_collection(
+        self, model: Union[WhiteboxModel, str], model_index: int
+    ) -> Tuple[WhiteboxModel, bool]:
+        """
+        Ensure we have a loaded WhiteboxModel when we need to collect logits/hidden states.
+
+        In memory-saving evaluation modes (e.g. sequential prompt-perplexity), ``self.models``
+        may contain string paths. If a logits cache entry is missing, we can lazily load
+        the model for that index *only* to build the missing cache artifact.
+
+        Returns:
+            (whitebox_model, was_loaded_here)
+        """
+        if not isinstance(model, str):
+            return model, False
+
+        cfgs = self._model_configs_for_sequential_perplexity
+        if cfgs is None or model_index < 0 or model_index >= len(cfgs):
+            raise RuntimeError(
+                f"Cache miss for model path {model}. Model must be loaded to collect logits."
+            )
+
+        from wagering.utils.model_utils import load_models_from_config
+
+        loaded, _ = load_models_from_config(
+            [cfgs[model_index]],
+            cache_kwargs=self._perplexity_load_cache_kwargs,
+            share_identical_models=True,
+        )
+        return loaded[0], True
 
     def _get_wandb_run_step(self) -> Optional[int]:
         """Return current wandb run step if available and parseable."""
@@ -253,6 +485,82 @@ class WageringEvaluator:
 
         return np.concatenate(ppl_batches, axis=0).astype(np.float32, copy=False)
 
+    def _should_use_sequential_perplexity_load(self) -> bool:
+        if self._model_configs_for_sequential_perplexity is None:
+            return False
+        if len(self._model_configs_for_sequential_perplexity) != len(self.models):
+            return False
+        from wagering.utils.model_utils import should_load_prompt_perplexity_models_sequentially
+
+        return should_load_prompt_perplexity_models_sequentially(len(self.models))
+
+    def _compute_prompt_perplexities_sequential(self, dataset: Dataset) -> np.ndarray:
+        import gc
+        import json
+
+        import torch
+        from wagering.utils.model_utils import load_models_from_config
+
+        num_examples = len(dataset.x)
+        num_models = len(self.models)
+        cfgs = self._model_configs_for_sequential_perplexity
+        if cfgs is None or len(cfgs) != num_models:
+            raise RuntimeError("Sequential eval perplexity requires model configs matching ensemble size")
+
+        all_perplexities = np.empty((num_examples, num_models), dtype=np.float32)
+        batch_size = max(1, int(dataset.batch_size))
+        log.info(
+            "Computing eval prompt perplexities sequentially (%d models; %d visible CUDA device(s))",
+            num_models,
+            int(torch.cuda.device_count()) if torch.cuda.is_available() else 0,
+        )
+
+        def _shared_model_key(model_cfg: Dict[str, Any]) -> str:
+            try:
+                return json.dumps(model_cfg, sort_keys=True, default=str)
+            except TypeError:
+                return repr(model_cfg)
+
+        # Group ensemble slots by identical model configs so we only load a given
+        # set of weights once, while still computing per-slot perplexities for
+        # potentially different prompts (e.g. mixed-context prompt routing).
+        key_to_indices: Dict[str, List[int]] = {}
+        for model_index, cfg in enumerate(cfgs):
+            key_to_indices.setdefault(_shared_model_key(cfg), []).append(model_index)
+
+        for shared_key, model_indices in key_to_indices.items():
+            loaded, _ = load_models_from_config(
+                [cfgs[model_indices[0]]],
+                cache_kwargs=self._perplexity_load_cache_kwargs,
+                share_identical_models=True,
+            )
+            wb = loaded[0]
+            try:
+                for model_index in model_indices:
+                    model_prompts = get_model_specific_prompts(dataset, model_index=model_index)
+                    if len(model_prompts) != num_examples:
+                        raise ValueError(
+                            "Prompt/label length mismatch while computing eval prompt perplexities. "
+                            f"prompts={len(model_prompts)}, examples={num_examples}"
+                        )
+                    all_perplexities[:, model_index] = WageringTrainer._compute_prompt_perplexities_for_model(
+                        wb,
+                        model_prompts,
+                        batch_size,
+                    )
+            finally:
+                try:
+                    del wb.model
+                    del wb.tokenizer
+                except Exception:
+                    pass
+                del loaded, wb
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+        return all_perplexities
+
     def _compute_prompt_perplexities(self, dataset: Dataset) -> np.ndarray:
         """
         Compute prompt perplexities for all models.
@@ -260,6 +568,9 @@ class WageringEvaluator:
         Returns:
             np.ndarray with shape [num_examples, num_models].
         """
+        if self._should_use_sequential_perplexity_load():
+            return self._compute_prompt_perplexities_sequential(dataset)
+
         num_examples = len(dataset.x)
         num_models = len(self.models)
         all_perplexities = np.empty((num_examples, num_models), dtype=np.float32)
@@ -268,7 +579,8 @@ class WageringEvaluator:
             if isinstance(model, str):
                 raise RuntimeError(
                     "Prompt-perplexity wagering requires loaded model objects, "
-                    f"but model at index {model_index} is a string path: {model}"
+                    f"but model at index {model_index} is a string path: {model}. "
+                    "With more models than visible GPUs, pass model_configs_for_sequential_perplexity."
                 )
 
             model_prompts = get_model_specific_prompts(dataset, model_index=model_index)
@@ -366,21 +678,20 @@ class WageringEvaluator:
                     else:
                         log.info(f"Model {i+1}/{len(self.models)}: Hidden states not cached - will collect")
                         # Need to collect for this model
-                        if isinstance(model, str):
-                            raise RuntimeError(
-                                f"Cache miss for model path {model}. Model must be loaded to collect logits."
-                            )
+                        wb_model, loaded_here = self._maybe_load_model_for_collection(model, i)
                         model_logits, model_hidden_states_all_layers, model_labels = collect_option_logits_and_hidden_states_for_model(
-                            model,
+                            wb_model,
                             dataset,
                             self.option_tokens,
                             model_identifier=str(model_path),
                             model_index=i,
                             hidden_state_layers=self.hidden_state_layers,
+                            model_prompts=get_model_specific_prompts(dataset, model_index=i),
+                            prompt_variant=prompt_variant,
                         )
                         # Update cache with hidden states
                         set_cached_logits_and_hidden_states_for_model(
-                            model,
+                            wb_model,
                             dataset,
                             self.option_tokens,
                             model_logits,
@@ -390,6 +701,18 @@ class WageringEvaluator:
                             model_index=i,
                             hidden_state_layers=self.hidden_state_layers,
                         )
+                        if loaded_here:
+                            try:
+                                import gc
+                                import torch
+
+                                del wb_model.model
+                                del wb_model.tokenizer
+                                gc.collect()
+                                if torch.cuda.is_available():
+                                    torch.cuda.empty_cache()
+                            except Exception:
+                                pass
                         model_hidden_states = extract_hidden_state_features(
                             model_hidden_states_all_layers,
                             self.hidden_state_layers,
@@ -418,22 +741,21 @@ class WageringEvaluator:
             else:
                 # Cache miss - collect both logits and hidden states
                 log.info(f"Model {i+1}/{len(self.models)}: Cache miss - collecting logits and hidden states")
-                if isinstance(model, str):
-                    raise RuntimeError(
-                        f"Cache miss for model path {model}. Model must be loaded to collect logits."
-                    )
+                wb_model, loaded_here = self._maybe_load_model_for_collection(model, i)
                 model_logits, model_hidden_states_all_layers, model_labels = collect_option_logits_and_hidden_states_for_model(
-                    model,
+                    wb_model,
                     dataset,
                     self.option_tokens,
                     model_identifier=str(model_path),
                     model_index=i,
                     hidden_state_layers=self.hidden_state_layers,
+                    model_prompts=get_model_specific_prompts(dataset, model_index=i),
+                    prompt_variant=prompt_variant,
                 )
                 
                 # Cache the results for this model
                 set_cached_logits_and_hidden_states_for_model(
-                    model,
+                    wb_model,
                     dataset,
                     self.option_tokens,
                     model_logits,
@@ -443,6 +765,18 @@ class WageringEvaluator:
                     model_index=i,
                     hidden_state_layers=self.hidden_state_layers,
                 )
+                if loaded_here:
+                    try:
+                        import gc
+                        import torch
+
+                        del wb_model.model
+                        del wb_model.tokenizer
+                        gc.collect()
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                    except Exception:
+                        pass
 
                 model_hidden_states = extract_hidden_state_features(
                     model_hidden_states_all_layers,
@@ -499,10 +833,30 @@ class WageringEvaluator:
             else:
                 calibration_hidden_states = all_model_calibration_hidden_states_list
 
-            all_model_logits = self.logit_calibrator.apply_to_stacked_logits(
-                all_model_logits,
-                calibration_hidden_states,
-            )
+            context_assignments = None
+            dataset_type = _get_mixed_context_dataset_type(dataset)
+            if dataset_type is not None:
+                raw = getattr(dataset, f"{dataset_type}_context_assignment_by_example", None)
+                if isinstance(raw, list) and len(raw) == len(dataset.x):
+                    context_assignments = np.asarray(raw, dtype=np.int64)
+
+            try:
+                if context_assignments is not None:
+                    all_model_logits = self.logit_calibrator.apply_to_stacked_logits(
+                        all_model_logits,
+                        calibration_hidden_states,
+                        context_model_index_by_example=context_assignments,
+                    )
+                else:
+                    all_model_logits = self.logit_calibrator.apply_to_stacked_logits(
+                        all_model_logits,
+                        calibration_hidden_states,
+                    )
+            except TypeError:
+                all_model_logits = self.logit_calibrator.apply_to_stacked_logits(
+                    all_model_logits,
+                    calibration_hidden_states,
+                )
             log.info("Applied frozen temperature scaling to cached evaluation logits")
 
         num_examples = all_model_logits.shape[1]
@@ -523,6 +877,8 @@ class WageringEvaluator:
         all_predictions = []
         all_aggregated_probs = []
         wagers_history = []  # Track wagers for each example
+        total_payout_history = []  # Track per-example per-model net payout when available
+        sigmoid_wagers_history = []  # Track unnormalized wagers when provided
 
         # Per-batch inference timing (seconds) for compute_wagers + aggregation.
         inference_times_s: List[float] = []
@@ -541,16 +897,37 @@ class WageringEvaluator:
             batch_logits = all_model_logits[:, batch_start:batch_end, :]  # [num_models, batch_size, num_options]
             batch_logits_transposed = np.transpose(batch_logits, (1, 0, 2))  # [batch_size, num_models, num_options]
             batch_labels = labels[batch_start:batch_end]  # [batch_size]
+
+            if self.debug_batch_prob_alignment:
+                # Per-model predicted class distributions for this batch.
+                batch_model_probs = _softmax_np(batch_logits_transposed)
+                _debug_log_eval_batch_prob_align(
+                    dataset=dataset,
+                    dataset_name=dataset_name,
+                    option_tokens=self.option_tokens,
+                    batch_start=batch_start,
+                    batch_end=batch_end,
+                    batch_model_probs=batch_model_probs,
+                    batch_labels=batch_labels,
+                )
             
             # Get questions for batch (for wagering methods that need them)
             batch_questions = dataset.x[batch_start:batch_end]  # List of question strings
             batch_questions_per_model = None
             if bool(getattr(self.wagering_method, "expects_per_model_router_prompts", False)):
                 if _get_mixed_context_dataset_type(dataset) is not None:
-                    batch_questions_per_model = [
-                        get_model_specific_prompts(dataset, model_index=mi)[batch_start:batch_end]
-                        for mi in range(len(self.models))
-                    ]
+                    if bool(getattr(self.wagering_method, "pubmedqa_strip_context", False)):
+                        without_ctx = getattr(dataset, "pubmedqa_without_context_x", None)
+                        if isinstance(without_ctx, list) and len(without_ctx) >= batch_end:
+                            slice_without = without_ctx[batch_start:batch_end]
+                        else:
+                            slice_without = batch_questions
+                        batch_questions_per_model = [list(slice_without) for _ in range(len(self.models))]
+                    else:
+                        batch_questions_per_model = [
+                            get_model_specific_prompts(dataset, model_index=mi)[batch_start:batch_end]
+                            for mi in range(len(self.models))
+                        ]
             
             # Prepare hidden states for batch if available
             batch_hidden_states = None
@@ -582,6 +959,8 @@ class WageringEvaluator:
                 **wagering_kwargs,
             )  # [batch_size, num_models]
             batch_wagers = res_dict["wagers"]
+            batch_total_payout = res_dict.get("total_payout", None)
+            batch_sigmoid_wagers = res_dict.get("sigmoid_wagers", None)
             # Aggregate predictions for batch
             batch_aggregated_log_probs, batch_aggregated_probs = self.aggregation_function.aggregate(
                 batch_logits_transposed, batch_wagers
@@ -593,6 +972,16 @@ class WageringEvaluator:
             all_predictions.extend(batch_predictions.tolist())
             all_aggregated_probs.extend(batch_aggregated_probs.tolist())
             wagers_history.extend(batch_wagers.tolist())
+            if batch_total_payout is not None:
+                try:
+                    total_payout_history.extend(np.asarray(batch_total_payout).tolist())
+                except Exception:
+                    pass
+            if batch_sigmoid_wagers is not None:
+                try:
+                    sigmoid_wagers_history.extend(np.asarray(batch_sigmoid_wagers).tolist())
+                except Exception:
+                    pass
             
             # Compute batch metrics using vectorized operations
             batch_correct = (batch_predictions == batch_labels)
@@ -649,6 +1038,20 @@ class WageringEvaluator:
         all_predictions = np.array(all_predictions, dtype=np.int32)
         all_aggregated_probs = np.stack(all_aggregated_probs, axis=0)
         wagers_history = np.stack(wagers_history, axis=0)  # [num_examples, num_models]
+        if total_payout_history:
+            try:
+                total_payout_history = np.asarray(total_payout_history, dtype=np.float32)
+            except Exception:
+                total_payout_history = None
+        else:
+            total_payout_history = None
+        if sigmoid_wagers_history:
+            try:
+                sigmoid_wagers_history = np.asarray(sigmoid_wagers_history, dtype=np.float32)
+            except Exception:
+                sigmoid_wagers_history = None
+        else:
+            sigmoid_wagers_history = None
 
         # Effective number of models / inverse HHI over examples.
         inverse_hhi = float("nan")
@@ -681,6 +1084,52 @@ class WageringEvaluator:
         num_options = all_aggregated_probs.shape[1]
         one_hot_labels = np.eye(num_options, dtype=np.float64)[labels]
         brier = np.mean(np.sum((all_aggregated_probs - one_hot_labels) ** 2, axis=1))
+
+        # Bernoulli KL / TV for binary tasks: D_KL(Bernoulli(target) || Bernoulli(pred)),
+        # TV = mean |p_pred - p_target|. Target is soft if dataset provides probability labels.
+        bernoulli_kl = float("nan")
+        bernoulli_tv = float("nan")
+        prob_labs = None
+        if num_options == 2:
+            pos_marker = getattr(dataset, "positive_label", None)
+            pos_idx = 0
+            if pos_marker is not None:
+                try:
+                    pos_idx = int(self.option_tokens.index(str(pos_marker).strip()))
+                except ValueError:
+                    pos_idx = 0
+            pred_vec = all_aggregated_probs[:, pos_idx].astype(np.float64, copy=False)
+            # Strict: use `probability_labels` (fed by `probability_label_column`, e.g. posterior_prob).
+            prob_labs = getattr(dataset, "probability_labels", None)
+            if prob_labs is None and getattr(dataset, "probabilistic_labels", None) is not None:
+                raise ValueError(
+                    "Dataset provides `probabilistic_labels` but not `probability_labels`. "
+                    "KL/TV must use `probability_labels` (configured via `probability_label_column`)."
+                )
+            if (
+                isinstance(prob_labs, (list, tuple))
+                and len(prob_labs) == num_examples
+            ):
+                target_vec = np.asarray(prob_labs, dtype=np.float64)
+            else:
+                target_vec = (labels == pos_idx).astype(np.float64)
+            try:
+                # print(target_vec)
+                # print("-"*50)
+                # print(pred_vec)
+                # 0/0
+                bernoulli_kl = bernoulli_kl_divergence(pred_vec.tolist(), target_vec.tolist())
+                bernoulli_tv = bernoulli_tv_distance(pred_vec.tolist(), target_vec.tolist())
+            except ValueError as e_kl:
+                log.warning("Could not compute Bernoulli KL/TV for %s: %s", dataset_name, e_kl)
+
+            # If soft labels are present, also compute Brier against the soft distribution.
+            if isinstance(prob_labs, (list, tuple)) and len(prob_labs) == num_examples:
+                gt_pos = np.asarray(prob_labs, dtype=np.float64)
+                y_soft = np.zeros((num_examples, 2), dtype=np.float64)
+                y_soft[:, int(pos_idx)] = gt_pos
+                y_soft[:, int(1 - int(pos_idx))] = 1.0 - gt_pos
+                brier = float(np.mean(np.sum((all_aggregated_probs - y_soft) ** 2, axis=1)))
         
         # Compute AUC
         auc = None
@@ -743,10 +1192,36 @@ class WageringEvaluator:
             d_regret, best_expert_ids = compute_dynamic_regret(
                 model_logits, all_aggregated_probs, labels
             )
-            brier_d_regret = compute_brier_dynamic_regret(
-                model_logits, all_aggregated_probs, labels
-            )
-            model_brier_scores = _compute_model_brier_scores(model_logits, labels)
+            # For binary datasets with soft ground-truth (e.g. cluster_saturation_bayesX),
+            # align Brier dynamic regret with training/validation by using probability labels
+            # when available (otherwise fall back to one-hot via `labels`).
+            if num_options == 2 and isinstance(prob_labs, (list, tuple)) and len(prob_labs) == num_examples:
+                pos_marker = getattr(dataset, "positive_label", None)
+                pos_idx = 0
+                if pos_marker is not None:
+                    try:
+                        pos_idx = int(self.option_tokens.index(str(pos_marker).strip()))
+                    except ValueError:
+                        pos_idx = 0
+                brier_d_regret = compute_brier_dynamic_regret(
+                    model_logits,
+                    all_aggregated_probs,
+                    labels,
+                    gt_positive_probs=np.asarray(prob_labs, dtype=np.float64),
+                    positive_option_index=int(pos_idx),
+                )
+            else:
+                brier_d_regret = compute_brier_dynamic_regret(
+                    model_logits, all_aggregated_probs, labels
+                )
+            if num_options == 2 and isinstance(prob_labs, (list, tuple)) and len(prob_labs) == num_examples:
+                model_brier_scores = _compute_model_brier_scores_soft_binary(
+                    model_logits,
+                    gt_positive_probs=np.asarray(prob_labs, dtype=np.float64),
+                    positive_option_index=int(pos_idx),
+                )
+            else:
+                model_brier_scores = _compute_model_brier_scores(model_logits, labels)
 
             meta_metrics = compute_meta_metrics(
                 wagers_history,
@@ -773,6 +1248,40 @@ class WageringEvaluator:
         except Exception as e:
             log.warning(f"Could not compute d_regret/meta metrics: {e}")
         
+        # Average wagers / net payout per model (when provided by the wagering method).
+        avg_wager_per_model = None
+        avg_wager_total = None
+        try:
+            avg_wager_per_model = np.mean(np.asarray(wagers_history, dtype=np.float64), axis=0).astype(np.float64)
+            avg_wager_total = float(np.mean(np.sum(np.asarray(wagers_history, dtype=np.float64), axis=1)))
+        except Exception:
+            avg_wager_per_model = None
+            avg_wager_total = None
+
+        avg_sigmoid_wager_per_model = None
+        avg_sigmoid_wager_total = None
+        if sigmoid_wagers_history is not None:
+            try:
+                sw = np.asarray(sigmoid_wagers_history, dtype=np.float64)
+                if sw.ndim == 2 and sw.shape[0] == wagers_history.shape[0]:
+                    avg_sigmoid_wager_per_model = np.mean(sw, axis=0).astype(np.float64)
+                    avg_sigmoid_wager_total = float(np.mean(np.sum(sw, axis=1)))
+            except Exception:
+                avg_sigmoid_wager_per_model = None
+                avg_sigmoid_wager_total = None
+
+        avg_net_payout_per_model = None
+        avg_net_payout_total = None
+        if total_payout_history is not None:
+            try:
+                payout_arr = np.asarray(total_payout_history, dtype=np.float64)
+                if payout_arr.ndim == 2 and payout_arr.shape[0] == wagers_history.shape[0]:
+                    avg_net_payout_per_model = np.mean(payout_arr, axis=0).astype(np.float64)
+                    avg_net_payout_total = float(np.mean(np.sum(payout_arr, axis=1)))
+            except Exception:
+                avg_net_payout_per_model = None
+                avg_net_payout_total = None
+
         results = {
             "dataset_name": dataset_name,
             "num_examples": num_examples,
@@ -780,11 +1289,20 @@ class WageringEvaluator:
             "aggregated_probs": all_aggregated_probs,
             "labels": labels,
             "wagers_history": wagers_history,
+            # NOTE: per-example payout arrays can be very large; we persist them to disk below when available.
+            "avg_wager_per_model": avg_wager_per_model,
+            "avg_wager_total": avg_wager_total,
+            "avg_sigmoid_wager_per_model": avg_sigmoid_wager_per_model,
+            "avg_sigmoid_wager_total": avg_sigmoid_wager_total,
+            "avg_net_payout_per_model": avg_net_payout_per_model,
+            "avg_net_payout_total": avg_net_payout_total,
             "inverse_hhi": inverse_hhi,
             "avg_inference_time_per_batch_s": avg_inference_time_per_batch_s,
             "accuracy": accuracy,
             "nll": nll,
             "brier": brier,
+            "bernoulli_kl": bernoulli_kl,
+            "bernoulli_tv": bernoulli_tv,
             "auc": auc,
             "ece": ece,
             "d_regret": d_regret,
@@ -799,6 +1317,188 @@ class WageringEvaluator:
             "brier_best_wager_prob_mean": brier_best_wager_prob_mean,
             "brier_best_wager_prob_var": brier_best_wager_prob_var,
         }
+
+        # ------------------------------------------------------------------
+        # Subset metrics: only examples where at least one base model is wrong.
+        # (i.e., exclude examples where all models' argmax prediction is correct)
+        # ------------------------------------------------------------------
+        try:
+            # model_logits is [num_examples, num_models, num_options] when available.
+            if "model_logits" not in locals():
+                model_logits = np.transpose(all_model_logits, (1, 0, 2))
+
+            base_preds = np.argmax(model_logits, axis=2)  # [num_examples, num_models]
+            base_correct = base_preds == labels[:, None]
+            subset_mask = ~np.all(base_correct, axis=1)
+            subset_n = int(np.sum(subset_mask))
+
+            subset_metrics: Dict[str, Any] = {
+                "subset_name": "any_model_wrong",
+                "num_examples": subset_n,
+            }
+
+            if subset_n > 0:
+                sub_labels = labels[subset_mask]
+                sub_probs = all_aggregated_probs[subset_mask]
+                sub_preds = all_predictions[subset_mask]
+                sub_wagers = wagers_history[subset_mask]
+                sub_model_logits = model_logits[subset_mask]
+
+                subset_metrics["accuracy"] = float(np.mean(sub_preds == sub_labels))
+                correct_probs = sub_probs[np.arange(len(sub_labels)), sub_labels]
+                subset_metrics["nll"] = float(-np.mean(np.log(correct_probs + 1e-10)))
+
+                num_options = sub_probs.shape[1]
+                one_hot = np.eye(num_options, dtype=np.float64)[sub_labels]
+                subset_metrics["brier"] = float(np.mean(np.sum((sub_probs - one_hot) ** 2, axis=1)))
+
+                # AUC on correctness vs confidence (max prob)
+                conf = sub_probs.max(axis=1)
+                corr = (sub_preds == sub_labels).astype(int)
+                if len(np.unique(corr)) >= 2:
+                    try:
+                        subset_metrics["auc"] = float(roc_auc_score(corr, conf))
+                    except Exception:
+                        subset_metrics["auc"] = float("nan")
+                else:
+                    subset_metrics["auc"] = float("nan")
+
+                # ECE
+                try:
+                    ece_metric = ECE(normalize=False, n_bins=20)
+                    finite_mask = np.isfinite(conf) & np.isfinite(corr.astype(float))
+                    if np.any(finite_mask):
+                        subset_metrics["ece"] = float(
+                            ece_metric(conf[finite_mask].tolist(), corr.astype(float)[finite_mask].tolist())
+                        )
+                    else:
+                        subset_metrics["ece"] = float("nan")
+                except Exception:
+                    subset_metrics["ece"] = float("nan")
+
+                # Inverse HHI on subset
+                try:
+                    w = np.asarray(sub_wagers, dtype=np.float64)
+                    sum_w = np.sum(w, axis=1)
+                    sum_w2 = np.sum(w * w, axis=1)
+                    with np.errstate(divide="ignore", invalid="ignore"):
+                        n_eff = np.divide(sum_w * sum_w, sum_w2)
+                    subset_metrics["inverse_hhi"] = float(np.nanmean(n_eff))
+                except Exception:
+                    subset_metrics["inverse_hhi"] = float("nan")
+
+                # Avg inference time per batch doesn't change with filtering; keep same.
+                subset_metrics["avg_inference_time_per_batch_s"] = avg_inference_time_per_batch_s
+
+                # Dynamic regret + meta metrics on subset
+                try:
+                    sub_d_regret, sub_best_expert_ids = compute_dynamic_regret(
+                        sub_model_logits, sub_probs, sub_labels
+                    )
+                    subset_metrics["d_regret"] = sub_d_regret
+                    if num_options == 2 and isinstance(prob_labs, (list, tuple)) and len(prob_labs) == num_examples:
+                        pos_marker = getattr(dataset, "positive_label", None)
+                        pos_idx = 0
+                        if pos_marker is not None:
+                            try:
+                                pos_idx = int(self.option_tokens.index(str(pos_marker).strip()))
+                            except ValueError:
+                                pos_idx = 0
+                        gt_pos = np.asarray(prob_labs, dtype=np.float64)[subset_mask]
+                        subset_metrics["brier_d_regret"] = compute_brier_dynamic_regret(
+                            sub_model_logits,
+                            sub_probs,
+                            sub_labels,
+                            gt_positive_probs=gt_pos,
+                            positive_option_index=int(pos_idx),
+                        )
+                    else:
+                        subset_metrics["brier_d_regret"] = compute_brier_dynamic_regret(
+                            sub_model_logits, sub_probs, sub_labels
+                        )
+                    if num_options == 2 and isinstance(prob_labs, (list, tuple)) and len(prob_labs) == num_examples:
+                        pos_marker = getattr(dataset, "positive_label", None)
+                        pos_idx = 0
+                        if pos_marker is not None:
+                            try:
+                                pos_idx = int(self.option_tokens.index(str(pos_marker).strip()))
+                            except ValueError:
+                                pos_idx = 0
+                        gt_pos = np.asarray(prob_labs, dtype=np.float64)[subset_mask]
+                        sub_model_brier_scores = _compute_model_brier_scores_soft_binary(
+                            sub_model_logits,
+                            gt_positive_probs=gt_pos,
+                            positive_option_index=int(pos_idx),
+                        )
+                    else:
+                        sub_model_brier_scores = _compute_model_brier_scores(sub_model_logits, sub_labels)
+                    sub_meta = compute_meta_metrics(sub_wagers, sub_best_expert_ids, sub_model_brier_scores)
+                    subset_metrics["meta_acc"] = sub_meta.get("meta_acc")
+                    subset_metrics["meta_nll"] = sub_meta.get("meta_nll")
+                    subset_metrics["meta_auc"] = sub_meta.get("meta_auc")
+                    subset_metrics["kendall_tau"] = sub_meta.get("kendall_tau")
+                    subset_metrics["best_model_mrr"] = sub_meta.get("best_model_mrr")
+                except Exception as e_sub:
+                    log.warning("Could not compute subset d_regret/meta metrics: %s", e_sub)
+
+                if sub_probs.shape[1] == 2:
+                    sub_pos_marker = getattr(dataset, "positive_label", None)
+                    sub_pos_idx = 0
+                    if sub_pos_marker is not None:
+                        try:
+                            sub_pos_idx = int(self.option_tokens.index(str(sub_pos_marker).strip()))
+                        except ValueError:
+                            sub_pos_idx = 0
+                    sub_pred_vec = sub_probs[:, sub_pos_idx].astype(np.float64, copy=False)
+                    sub_pl = getattr(dataset, "probability_labels", None)
+                    if sub_pl is None and getattr(dataset, "probabilistic_labels", None) is not None:
+                        raise ValueError(
+                            "Dataset provides `probabilistic_labels` but not `probability_labels`. "
+                            "KL/TV must use `probability_labels` (configured via `probability_label_column`)."
+                        )
+                    if (
+                        isinstance(sub_pl, (list, tuple))
+                        and len(sub_pl) == num_examples
+                    ):
+                        sub_target_vec = np.asarray(sub_pl, dtype=np.float64)[subset_mask]
+                    else:
+                        sub_target_vec = (sub_labels == sub_pos_idx).astype(np.float64)
+                    try:
+                        subset_metrics["bernoulli_kl"] = bernoulli_kl_divergence(
+                            sub_pred_vec.tolist(), sub_target_vec.tolist()
+                        )
+                        subset_metrics["bernoulli_tv"] = bernoulli_tv_distance(
+                            sub_pred_vec.tolist(), sub_target_vec.tolist()
+                        )
+                    except ValueError:
+                        subset_metrics["bernoulli_kl"] = float("nan")
+                        subset_metrics["bernoulli_tv"] = float("nan")
+
+            results["subset_any_model_wrong"] = subset_metrics
+
+            # Console output
+            if subset_n > 0:
+                acc_s = subset_metrics.get("accuracy")
+                nll_s = subset_metrics.get("nll")
+                ece_s = subset_metrics.get("ece")
+                dr_s = subset_metrics.get("d_regret")
+                sub_kl = subset_metrics.get("bernoulli_kl")
+                sub_tv = subset_metrics.get("bernoulli_tv")
+                log.info(
+                    "%s - Subset(any model wrong; n=%d) Accuracy: %s, NLL: %s, KL: %s, TV: %s, ECE: %s, DRegret: %s",
+                    dataset_name,
+                    subset_n,
+                    f"{float(acc_s):.4f}" if acc_s is not None and np.isfinite(acc_s) else "N/A",
+                    f"{float(nll_s):.4f}" if nll_s is not None and np.isfinite(nll_s) else "N/A",
+                    f"{float(sub_kl):.4f}" if sub_kl is not None and np.isfinite(sub_kl) else "N/A",
+                    f"{float(sub_tv):.4f}" if sub_tv is not None and np.isfinite(sub_tv) else "N/A",
+                    f"{float(ece_s):.4f}" if ece_s is not None and np.isfinite(ece_s) else "N/A",
+                    f"{float(dr_s):.4f}" if dr_s is not None and np.isfinite(dr_s) else "N/A",
+                )
+            else:
+                log.info("%s - Subset(any model wrong) is empty (n=0); skipped subset metrics.", dataset_name)
+        except Exception as e:
+            log.warning("Could not compute subset(any model wrong) metrics: %s", e)
         
         brier_str = f"{brier:.4f}" if brier is not None and not np.isnan(brier) else "N/A"
         auc_str = f"{auc:.4f}" if auc is not None and not np.isnan(auc) else "N/A"
@@ -808,9 +1508,18 @@ class WageringEvaluator:
         meta_acc_str = f"{meta_acc:.4f}" if meta_acc is not None and not np.isnan(meta_acc) else "N/A"
         kendall_tau_str = f"{kendall_tau:.4f}" if kendall_tau is not None and not np.isnan(kendall_tau) else "N/A"
         best_model_mrr_str = f"{best_model_mrr:.4f}" if best_model_mrr is not None and not np.isnan(best_model_mrr) else "N/A"
-        log.info(f"{dataset_name} - Accuracy: {accuracy:.4f}, NLL: {nll:.4f}, Brier: {brier_str}, AUC: {auc_str}, ECE: {ece_str}, "
-               f"DRegret: {d_regret_str}, BrierDRegret: {brier_d_regret_str}, MetaAcc: {meta_acc_str}, "
-               f"KendallTau: {kendall_tau_str}, BestModelMRR: {best_model_mrr_str}")
+        bernoulli_kl_str = (
+            f"{bernoulli_kl:.4f}" if bernoulli_kl is not None and not np.isnan(bernoulli_kl) else "N/A"
+        )
+        bernoulli_tv_str = (
+            f"{bernoulli_tv:.4f}" if bernoulli_tv is not None and not np.isnan(bernoulli_tv) else "N/A"
+        )
+        log.info(
+            f"{dataset_name} - Accuracy: {accuracy:.4f}, NLL: {nll:.4f}, Brier: {brier_str}, "
+            f"KL: {bernoulli_kl_str}, TV: {bernoulli_tv_str}, AUC: {auc_str}, ECE: {ece_str}, "
+            f"DRegret: {d_regret_str}, BrierDRegret: {brier_d_regret_str}, MetaAcc: {meta_acc_str}, "
+            f"KendallTau: {kendall_tau_str}, BestModelMRR: {best_model_mrr_str}"
+        )
         
         # Log average wagers per model
         avg_wagers = np.mean(wagers_history, axis=0)
@@ -856,6 +1565,24 @@ class WageringEvaluator:
             analytics_path = self.checkpoint_dir / f"analytics_{dataset_name}.csv"
             analytics_df.to_csv(analytics_path, index=False)
             log.debug(f"Saved analytics dataframe to {analytics_path}")
+
+            if total_payout_history is not None:
+                try:
+                    payout_path = self.checkpoint_dir / f"total_payout_history_{dataset_name}.npy"
+                    np.save(payout_path, np.asarray(total_payout_history, dtype=np.float32))
+                    results["total_payout_history_path"] = str(payout_path)
+                    log.debug("Saved total payout history to %s", payout_path)
+                except Exception as e:
+                    log.warning("Could not save total payout history array: %s", e)
+
+            if sigmoid_wagers_history is not None:
+                try:
+                    sw_path = self.checkpoint_dir / f"sigmoid_wagers_history_{dataset_name}.npy"
+                    np.save(sw_path, np.asarray(sigmoid_wagers_history, dtype=np.float32))
+                    results["sigmoid_wagers_history_path"] = str(sw_path)
+                    log.debug("Saved sigmoid wagers history to %s", sw_path)
+                except Exception as e:
+                    log.warning("Could not save sigmoid wagers history array: %s", e)
         
         # Log final evaluation metrics to wandb separately from batch metrics
         # These represent the overall evaluation results, not per-batch metrics
@@ -870,6 +1597,8 @@ class WageringEvaluator:
                 "accuracy": accuracy,
                 "nll": nll,
                 "brier": brier if brier is not None and not np.isnan(brier) else None,
+                "bernoulli_kl": bernoulli_kl if bernoulli_kl is not None and not np.isnan(bernoulli_kl) else None,
+                "bernoulli_tv": bernoulli_tv if bernoulli_tv is not None and not np.isnan(bernoulli_tv) else None,
                 "auc": auc if auc is not None and not np.isnan(auc) else None,
                 "ece": ece if ece is not None and not np.isnan(ece) else None,
                 "d_regret": d_regret if d_regret is not None and not np.isnan(d_regret) else None,

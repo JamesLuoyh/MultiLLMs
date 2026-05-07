@@ -1,0 +1,21 @@
+{
+  "dataset": "MMLU",
+  "base_config": "/common/home/yl2310/MultiLLMs/examples/configs/wagering_training/mse_br_wagers_v2_4models_mmlu.yaml",
+  "eval_dataset_name": "mmlu_full_test",
+  "models": [
+    "Gemma2",
+    "Llama_3.1_8B_Instruct",
+    "Llama3_Aloe_8B_Alpha",
+    "BioMistral_7B"
+  ],
+  "runs": {
+    "uncalibrated": {
+      "config": "/common/home/yl2310/MultiLLMs/examples/configs/wagering_training/mse_br_wagers_v2_4models_mmlu__uncalibrated.yaml",
+      "checkpoint_dir": "/research/projects/ecoai/yl2310/MultiLLMs/checkpoints/models_BioMistral_BioMistral-7B_HPAI-BSC_Llama3-Aloe-8B-A_google_gemma-2-9b-it_meta-llama_Llama-3_1-8B-I_datasets_full_wagering_mse_br_wagers_v2_aug_agg_linear_pooling_7d47ad1e"
+    },
+    "gemma2_calibrated": {
+      "config": "/common/home/yl2310/MultiLLMs/examples/configs/wagering_training/mse_br_wagers_v2_4models_mmlu__gemma2_calibrated.yaml",
+      "checkpoint_dir": "/research/projects/ecoai/yl2310/MultiLLMs/checkpoints/models_BioMistral_BioMistral-7B_HPAI-BSC_Llama3-Aloe-8B-A_google_gemma-2-9b-it_meta-llama_Llama-3_1-8B-I_datasets_full_wagering_mse_br_wagers_v2_aug_agg_linear_pooling_cal_adaptive_temperature_d5d7487e"
+    }
+  }
+}

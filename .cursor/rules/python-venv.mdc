@@ -20,6 +20,11 @@ If `.venv` is missing, create it from the repo root (e.g. `python3 -m venv .venv
 
 Do not assume a global or user-level Python when executing tooling for this workspace.
 
+## Fail-fast rules (no silent fallback)
+
+- **Hidden-state layer selection must be strict**: when `hidden_state_layers` is configured, the run should **error** if any requested layer index is invalid for the model (no skipping, no clamping, no fallback-to-last-layer).
+- **Per-model staggered layers must be explicit**: if you want “model0 = 4th-from-last, model1 = 3rd-from-last, …”, set `hidden_state_layers_per_model` (e.g. for 4 models: `{0: [-4], 1: [-3], 2: [-2], 3: [-1]}`) rather than relying on implicit behavior.
+
 ---
 description: Behavioral guidelines to reduce common LLM coding mistakes. Use when writing, reviewing, or refactoring code to avoid overcomplication, make surgical changes, surface assumptions, and define verifiable success criteria.
 alwaysApply: true

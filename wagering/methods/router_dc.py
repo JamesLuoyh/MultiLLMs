@@ -48,6 +48,11 @@ class RouterDCWagers(WageringMethod):
         super().__init__(num_models, config or {})
         cfg = self.config
 
+        # RouterDC routes using the question text via its own encoder and does not
+        # require LLM hidden states. Opt out so the trainer does not load/cache
+        # hidden states for every ensemble model.
+        self.requires_hidden_states = False
+
         self.encoder_model_name = str(
             cfg.get("encoder_model_name", cfg.get("bert_model_name", "microsoft/mdeberta-v3-base"))
         )
@@ -97,16 +102,26 @@ class RouterDCWagers(WageringMethod):
         self.concat_prompt_embeddings = not self.pubmedqa_strip_context
         # Used by trainer/evaluator to decide whether to pass per-model prompt variants.
         self.expects_per_model_router_prompts = True
+        # Micro-batch size for DeBERTa encoding (caps peak VRAM usage).
+        self.micro_batch_size = int(cfg.get("micro_batch_size", 0) or 0)
 
         self.tokenizer = AutoTokenizer.from_pretrained(
             self.encoder_model_name, truncation_side="left", padding=True
         )
-        self.encoder = AutoModel.from_pretrained(self.encoder_model_name).to(self.device)
+        # Root-cause fix: RouterDC fine-tunes the encoder with plain AdamW (no AMP GradScaler /
+        # fp32 master weights). Therefore, we must keep router encoder parameters in fp32.
+        #
+        # If some upstream code or environment forces fp16/bf16, `from_pretrained()` may produce
+        # half-precision weights; stepping those with AdamW can yield NaNs immediately.
+        self.encoder = AutoModel.from_pretrained(
+            self.encoder_model_name,
+            torch_dtype=torch.float32,
+        ).to(device=self.device)
         hidden_size = int(self.encoder.config.hidden_size)
 
         expert_dim = hidden_size * num_models if self.concat_prompt_embeddings else hidden_size
         std_dev = float(cfg.get("expert_embedding_std", 0.78))
-        self.expert_embeddings = torch.nn.Embedding(num_models, expert_dim).to(self.device)
+        self.expert_embeddings = torch.nn.Embedding(num_models, expert_dim).to(device=self.device, dtype=torch.float32)
         with torch.no_grad():
             torch.nn.init.normal_(self.expert_embeddings.weight, mean=0.0, std=std_dev)
 
@@ -169,24 +184,76 @@ class RouterDCWagers(WageringMethod):
         return normalized
 
     def _encode_questions_batch(self, questions: List[str]) -> torch.Tensor:
+        if not hasattr(self, "_logged_first_encode_batch"):
+            setattr(self, "_logged_first_encode_batch", False)
         processed = preprocess_pubmedqa_prompts_for_embedding(
             questions,
-            strip_context=self.pubmedqa_strip_context,
+            # Do not regex-strip content here. When pubmedqa_strip_context is enabled for this method,
+            # the trainer/evaluator is responsible for passing the dataset's prompt_without_context
+            # variant verbatim (even if it contains "Context:" text).
+            strip_context=False,
         )
-        inputs = self.tokenizer(
-            processed,
-            return_tensors="pt",
-            truncation=True,
-            max_length=self.max_seq_length,
-            padding=True,
-        ).to(self.device)
+        if not getattr(self, "_logged_first_encode_batch", False):
+            try:
+                if torch.cuda.is_available() and self.device.type == "cuda":
+                    dev = torch.cuda.current_device()
+                    alloc = float(torch.cuda.memory_allocated(dev)) / (1024**3)
+                    resv = float(torch.cuda.memory_reserved(dev)) / (1024**3)
+                    logger.info(
+                        "[router_dc] encode_batch: n_prompts=%d max_seq_length=%d device=%s cuda_dev=%s alloc=%.2fGiB reserved=%.2fGiB",
+                        len(processed),
+                        int(self.max_seq_length),
+                        str(self.device),
+                        str(dev),
+                        alloc,
+                        resv,
+                    )
+                else:
+                    logger.info(
+                        "[router_dc] encode_batch: n_prompts=%d max_seq_length=%d device=%s",
+                        len(processed),
+                        int(self.max_seq_length),
+                        str(self.device),
+                    )
+            except Exception:
+                pass
+        mbs = int(self.micro_batch_size) if int(self.micro_batch_size) > 0 else len(processed)
+        chunks: List[torch.Tensor] = []
+        for start in range(0, len(processed), mbs):
+            end = min(start + mbs, len(processed))
+            inputs = self.tokenizer(
+                processed[start:end],
+                return_tensors="pt",
+                truncation=True,
+                max_length=self.max_seq_length,
+                padding=True,
+            ).to(self.device)
+            if not getattr(self, "_logged_first_encode_batch", False):
+                try:
+                    if torch.cuda.is_available() and self.device.type == "cuda":
+                        dev = torch.cuda.current_device()
+                        alloc = float(torch.cuda.memory_allocated(dev)) / (1024**3)
+                        resv = float(torch.cuda.memory_reserved(dev)) / (1024**3)
+                        input_shape = tuple(getattr(inputs, "input_ids", torch.empty(0)).shape)
+                        logger.info(
+                            "[router_dc] after_tokenize_to_device: input_ids_shape=%s alloc=%.2fGiB reserved=%.2fGiB micro_batch_size=%d",
+                            str(input_shape),
+                            alloc,
+                            resv,
+                            int(mbs),
+                        )
+                except Exception:
+                    pass
+                setattr(self, "_logged_first_encode_batch", True)
 
-        grad_enc = self._training and not self.freeze_encoder
-        with torch.set_grad_enabled(grad_enc):
-            outputs = self.encoder(**inputs)
-        # First token representation (matches RouterDC reference code)
-        hidden = outputs.last_hidden_state[:, 0, :]
-        return hidden
+            grad_enc = self._training and not self.freeze_encoder
+            with torch.set_grad_enabled(grad_enc):
+                outputs = self.encoder(**inputs)
+            chunks.append(outputs.last_hidden_state[:, 0, :])
+
+        if not chunks:
+            return torch.empty((0, int(self.encoder.config.hidden_size)), device=self.device, dtype=torch.float32)
+        return torch.cat(chunks, dim=0)
 
     def _encode_questions_per_model_batch(self, questions_per_model: List[List[str]]) -> torch.Tensor:
         """
@@ -335,8 +402,9 @@ class RouterDCWagers(WageringMethod):
             stacked = torch.cat([pos_logit.unsqueeze(1), neg_logits], dim=1)
             log_probs = F.log_softmax(stacked, dim=1)
             term = -log_probs[:, 0]
-            denom = mask.float().sum().clamp_min(1.0)
-            total = total + (term * mask.float()).sum() / denom
+            # Match the reference RouterDC implementation: average over the full batch,
+            # so rare masked positives do not get upweighted (which can cause unstable steps).
+            total = total + (term * mask.float()).mean()
             n_terms += 1
 
         return total / max(n_terms, 1)
@@ -368,8 +436,29 @@ class RouterDCWagers(WageringMethod):
         gold_label_tensor = torch.as_tensor(gold_label, dtype=torch.long, device=self.device)
 
         probs = F.softmax(model_logits_tensor, dim=-1)
-        idx = gold_label_tensor.view(-1, 1, 1).expand(-1, self.num_models, 1)
-        p_gold = torch.gather(probs, dim=2, index=idx).squeeze(2)
+        gold_label_distribution = kwargs.get("gold_label_distribution", None)
+        if gold_label_distribution is not None:
+            gold_label_distribution_tensor = torch.as_tensor(
+                gold_label_distribution, dtype=torch.float32, device=self.device
+            )
+            if (
+                gold_label_distribution_tensor.ndim != 2
+                or gold_label_distribution_tensor.shape[0] != batch_size
+                or gold_label_distribution_tensor.shape[1] != probs.shape[2]
+            ):
+                raise ValueError(
+                    "gold_label_distribution must be shape [batch_size, num_options], "
+                    f"got {tuple(gold_label_distribution_tensor.shape)}"
+                )
+            # Expected probability mass each expert assigns to the (soft) label distribution:
+            #   p_gold[b,m] = sum_k q[b,k] * p[b,m,k]
+            q_expanded = gold_label_distribution_tensor.to(dtype=probs.dtype).unsqueeze(1).expand(
+                -1, self.num_models, -1
+            )
+            p_gold = torch.sum(probs * q_expanded, dim=-1)
+        else:
+            idx = gold_label_tensor.view(-1, 1, 1).expand(-1, self.num_models, 1)
+            p_gold = torch.gather(probs, dim=2, index=idx).squeeze(2)
 
         loss = self._sample_llm_contrastive_loss(router_logits, p_gold)
         if not torch.isfinite(loss):
@@ -391,12 +480,18 @@ class RouterDCWagers(WageringMethod):
         self.optimizer.zero_grad()
         loss.backward()
 
-        trainable_params = list(self.expert_embeddings.parameters())
+        # Keep named parameters for better debugging if an optimizer step overflows.
+        named_trainable_params: List[tuple[str, torch.nn.Parameter]] = [
+            (f"expert_embeddings.{n}", p) for n, p in self.expert_embeddings.named_parameters()
+        ]
         if not self.freeze_encoder:
-            trainable_params.extend(list(self.encoder.parameters()))
+            named_trainable_params.extend(
+                [(f"encoder.{n}", p) for n, p in self.encoder.named_parameters()]
+            )
+        trainable_params = [p for _, p in named_trainable_params]
 
         grads_finite = True
-        for p in trainable_params:
+        for _, p in named_trainable_params:
             if p.grad is not None and not torch.isfinite(p.grad).all():
                 grads_finite = False
                 break
@@ -415,12 +510,14 @@ class RouterDCWagers(WageringMethod):
                 self.optimizer.step()
                 self.scheduler.step()
 
-                # Fail fast if optimizer produced invalid parameters (common with unstable Adam updates).
-                for p in trainable_params:
+                # Fail fast if optimizer produced invalid parameters.
+                for name, p in named_trainable_params:
                     if not torch.isfinite(p).all():
                         raise RuntimeError(
-                            "router_dc parameters became non-finite after optimizer step; "
-                            "consider reducing learning_rate / grad_clip_norm"
+                            "router_dc parameters became non-finite after optimizer step "
+                            f"(first bad tensor: {name}, dtype={p.dtype}). "
+                            "Root cause is usually fp16/bf16 weights being stepped without AMP. "
+                            "Ensure router encoder params are fp32 or use proper AMP training."
                         )
 
         batch_aggregated_probs = LinearPooling.aggregate_torch(model_logits_tensor, wagers)

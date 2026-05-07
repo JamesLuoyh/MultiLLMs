@@ -150,7 +150,11 @@ class NIRTRouterWagers(WageringMethod):
                 else:
                     raise slow_exc
 
-        self.encoder = AutoModel.from_pretrained(self.encoder_model_name).to(self.device)
+        # Ensure router encoder stays fp32 (trainer uses plain AdamW, no AMP GradScaler).
+        self.encoder = AutoModel.from_pretrained(
+            self.encoder_model_name,
+            torch_dtype=torch.float32,
+        ).to(self.device)
         hidden_size = int(self.encoder.config.hidden_size)
         router_in_dim = hidden_size * num_models if self.concat_prompt_embeddings else hidden_size
 
@@ -218,10 +222,12 @@ class NIRTRouterWagers(WageringMethod):
         return kv
 
     def _encode_questions_batch(self, questions: List[str]) -> torch.Tensor:
-        strip_context = self.pubmedqa_strip_context and (not self.use_concatenated_prompt_context)
         processed = preprocess_pubmedqa_prompts_for_embedding(
             questions,
-            strip_context=strip_context,
+            # Do not regex-strip content here. When pubmedqa_strip_context is enabled for this method,
+            # the trainer/evaluator is responsible for passing the dataset's prompt_without_context
+            # variant verbatim (even if it contains "Context:" text).
+            strip_context=False,
         )
         inputs = self.tokenizer(
             processed,
@@ -373,16 +379,44 @@ class NIRTRouterWagers(WageringMethod):
 
         model_logits_tensor = torch.as_tensor(model_logits, dtype=torch.float32, device=self.device)
         gold_label_tensor = torch.as_tensor(gold_label, dtype=torch.long, device=self.device)
+        gold_label_distribution = kwargs.get("gold_label_distribution", None)
+        gold_label_distribution_tensor = None
+        if gold_label_distribution is not None:
+            gold_label_distribution_tensor = torch.as_tensor(
+                gold_label_distribution, dtype=torch.float32, device=self.device
+            )
+            if (
+                gold_label_distribution_tensor.ndim != 2
+                or gold_label_distribution_tensor.shape[0] != batch_size
+                or gold_label_distribution_tensor.shape[1] != model_logits_tensor.shape[2]
+            ):
+                raise ValueError(
+                    "gold_label_distribution must be shape [batch_size, num_options], "
+                    f"got {tuple(gold_label_distribution_tensor.shape)}"
+                )
 
         model_pred = torch.argmax(model_logits_tensor, dim=-1)
-        correctness = (model_pred == gold_label_tensor.view(-1, 1)).to(torch.float32)
+        if gold_label_distribution_tensor is not None:
+            # Expected correctness under soft labels q:
+            #   E[1{pred == y}] = q[pred]
+            correctness = torch.gather(
+                gold_label_distribution_tensor,
+                dim=1,
+                index=model_pred.to(dtype=torch.long),
+            ).to(torch.float32)
+        else:
+            correctness = (model_pred == gold_label_tensor.view(-1, 1)).to(torch.float32)
 
         bce_loss = F.binary_cross_entropy(p_correct, correctness)
 
         batch_aggregated_probs = LinearPooling.aggregate_torch(model_logits_tensor, wagers)
-        batch_indices = torch.arange(batch_size, device=self.device)
-        probs_at_gold = batch_aggregated_probs[batch_indices, gold_label_tensor]
-        ce_loss = -torch.mean(torch.log(probs_at_gold + 1e-10))
+        if gold_label_distribution_tensor is not None:
+            log_probs = torch.log(batch_aggregated_probs + 1e-10)
+            ce_loss = -torch.mean(torch.sum(gold_label_distribution_tensor * log_probs, dim=-1))
+        else:
+            batch_indices = torch.arange(batch_size, device=self.device)
+            probs_at_gold = batch_aggregated_probs[batch_indices, gold_label_tensor]
+            ce_loss = -torch.mean(torch.log(probs_at_gold + 1e-10))
 
         reg = torch.tensor(0.0, device=self.device)
         reg = reg + torch.mean(self.model_embeddings.weight ** 2)

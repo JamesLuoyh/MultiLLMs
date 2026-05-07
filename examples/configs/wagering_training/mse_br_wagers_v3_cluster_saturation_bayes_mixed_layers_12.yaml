@@ -15,18 +15,18 @@ _include_models:
   - models/gemma_2_9b_it.yaml
   - models/gemma_2_9b_it.yaml
   - models/gemma_2_9b_it.yaml
+  - models/gemma_2_9b_it.yaml
+  - models/gemma_2_9b_it.yaml
+  - models/gemma_2_9b_it.yaml
+  - models/gemma_2_9b_it.yaml
 
-  - models/gemma_2_9b_it.yaml
-  - models/gemma_2_9b_it.yaml
-  - models/gemma_2_9b_it.yaml
-  - models/gemma_2_9b_it.yaml
 
 # Apply adaptive temperature scaling to cached option logits before wagering.
 calibrated: false
 
 # Wagering method (must match between training and evaluation)
 wagering_method:
-  name: mse_br_wagers_v2
+  name: mse_br_wagers_v3
   config:
     hidden_dim: 4096
     hidden_layers: [512, 256]
@@ -46,17 +46,17 @@ aggregation:
 
 # Binary option tokens for this synthetic dataset.
 option_tokens: ["1", "0"]
-cache_path: /filer/tmp1/yl2310/MultiLLMs/wagering_model_logits_states_caches
+cache_path: /research/projects/ecoai/yl2310/MultiLLMs/cache
 
 # ============================================================================
 # TRAINING CONFIGURATION
 # ============================================================================
 
 _include_datasets:
-  - datasets/cluster_saturation_bayes_extreme.yaml
+  - datasets/cluster_saturation_bayesX.yaml
 
-num_epochs: 5
-checkpoint_base_dir: /filer/tmp1/yl2310/MultiLLMs/checkpoints
+num_epochs: 20
+checkpoint_base_dir: /research/projects/ecoai/yl2310/MultiLLMs/checkpoints
 save_every: 100
 training_batch_size: 100
 
@@ -64,21 +64,22 @@ auto_resume: false
 balance_training_datasets: true
 shuffle_data: true
 shuffle_seed: 18
-early_stopping_patience: 5
-early_stopping_criterion: validation
+early_stopping_patience: 1500  # Stop training if no improvement for 20 epochs (default: 10)
+early_stopping_criterion: online_learning  # Use validation performance for early stopping (default: "validation")
+# use_brier_d_regret_for_early_stopping: true
+use_min_kl_for_early_stopping: true
 
 report_to_wandb: true
 wandb_project: multi-llm-wagering
 wandb_entity: null
-wandb_name: centralized_wagers_cluster_saturation_bayes_mixed_layers
+wandb_name: mse_br_wagers_v3_cluster_saturation_bayesX_mixed_layers_12
 
 # ============================================================================
 # EVALUATION CONFIGURATION
 # ============================================================================
 
-_include_test_datasets:
-  - datasets/cluster_saturation_bayes_extreme.yaml
 
-test_datasets:
-  - display_name: cluster_saturation_bayes_test
+_include_test_datasets:
+  - datasets/cluster_saturation_bayesX.yaml
+
     # size: 2  # Use a small sample size for quick evaluation during development

@@ -13,7 +13,7 @@ _include_models:
   # - models/llama_2_7b.yaml
 
 # Apply adaptive temperature scaling to cached option logits before wagering.
-calibrated: true
+calibrated: false
 _include_calibration: calibration/adaptive_temperature_1000samples.yaml
 
 
@@ -61,9 +61,9 @@ datasets:
   - train_split: train
 
 # Training parameters
-num_epochs: 50  # Default: 100 epochs
+num_epochs: 5  # Default: 100 epochs
 # Base directory for checkpoints (unique subdirectory will be generated)
-checkpoint_base_dir: /common/users/yl2310/MultiLLMs/checkpoints
+checkpoint_base_dir: /research/projects/ecoai/yl2310/MultiLLMs/checkpoints
 save_every: 100  # Save checkpoint every 100 batches
 training_batch_size: 100  # Batch size for training loop (different from batch size for collecting hidden states)
 wager_score_plot_every: 500  # Plot wager score distributions every 100 batches (set to None to disable)

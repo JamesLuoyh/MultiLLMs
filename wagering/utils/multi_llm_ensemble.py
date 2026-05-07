@@ -121,9 +121,33 @@ class LogitCache:
         return logits, labels
 
 
-# Disk-based cache directory for logits and hidden states
+# Disk-based cache directory for logits and hidden states.
+#
+# NOTE: This cache can be redirected at runtime by calling
+# `configure_wagering_cache_dir(...)` (used by `scripts/wagering_pipeline.py`).
 _WAGERING_CACHE_DIR = Path("/common/users/yl2310/MultiLLMs/wagering_model_logits_states_caches")
 _WAGERING_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def configure_wagering_cache_dir(cache_path: Optional[str]) -> Path:
+    """
+    Configure the disk cache directory for logits/hidden-states caches.
+
+    `cache_path` is expected to be a user-provided root cache directory (often set
+    in YAML as `cache_path:`). We store wagering artifacts in a stable subfolder
+    to avoid mixing with unrelated caches.
+    """
+    global _WAGERING_CACHE_DIR
+
+    if cache_path is None:
+        return _WAGERING_CACHE_DIR
+
+    root = Path(str(cache_path)).expanduser()
+    # Treat `cache_path` as a root; keep a stable subdir name for these artifacts.
+    target = root / "wagering_model_logits_states_caches"
+    target.mkdir(parents=True, exist_ok=True)
+    _WAGERING_CACHE_DIR = target
+    return _WAGERING_CACHE_DIR
 
 
 def _get_model_path_key(model: WhiteboxModel) -> str:
@@ -155,8 +179,9 @@ def _get_legacy_dataset_signature(dataset: Dataset) -> Tuple:
     artifacts remain reusable.
     """
     dataset_size = len(dataset.x)
-    # Create a hash from first 3 examples for uniqueness
-    sample_text = "\n".join(dataset.x[:min(3, len(dataset.x))]) if dataset.x else ""
+    # Create a hash from first 3 examples for uniqueness (coerce: CSV numeric text_column, etc.)
+    sample_parts = dataset.x[: min(3, len(dataset.x))] if dataset.x else []
+    sample_text = "\n".join(str(s) for s in sample_parts)
     content_hash = hashlib.md5(sample_text.encode('utf-8')).hexdigest()[:8]
     return (dataset_size, content_hash)
 
@@ -358,14 +383,14 @@ def _resolve_transformer_layer_indices(
                     f"Requested hidden_state_layers entry {layer} is out of range for "
                     f"{num_transformer_layers} transformer layers"
                 )
-            resolved_indices.append(layer)
+            resolved_indices.append(int(layer))
         else:
             if -layer > num_transformer_layers:
                 raise ValueError(
                     f"Requested hidden_state_layers entry {layer} is out of range for "
                     f"{num_transformer_layers} transformer layers"
                 )
-            resolved_indices.append(num_transformer_layers + layer)
+            resolved_indices.append(int(num_transformer_layers + layer))
 
     return tuple(resolved_indices)
 
@@ -427,6 +452,41 @@ def extract_hidden_state_features(
     raise ValueError(f"Unexpected cached hidden_states shape: {hidden_states_array.shape}")
 
 
+def _extract_hidden_state_features_from_layer_map(
+    hidden_states_by_layer: Dict[int, np.ndarray],
+    hidden_state_layers: Optional[Sequence[int]],
+) -> Optional[np.ndarray]:
+    """
+    Extract selected hidden-state features from a per-layer mapping.
+
+    Mapping keys are configured layer ids (e.g. -1, -12, 0) and values are arrays
+    of shape [num_examples, hidden_dim]. Multiple requested layers are concatenated
+    along the feature dimension.
+    """
+    if not hidden_states_by_layer:
+        return None
+
+    requested = _normalize_hidden_state_layers(hidden_state_layers)
+    if requested is None:
+        # Mirror the "default last layer" behavior. Prefer -1 when present.
+        if -1 in hidden_states_by_layer:
+            return np.asarray(hidden_states_by_layer[-1], dtype=np.float32)
+        best_key = sorted(hidden_states_by_layer.keys())[-1]
+        return np.asarray(hidden_states_by_layer[best_key], dtype=np.float32)
+
+    missing = [layer for layer in requested if int(layer) not in hidden_states_by_layer]
+    if missing:
+        raise RuntimeError(
+            "Cached hidden states do not include requested layers. "
+            f"requested={list(requested)}, cached={sorted(hidden_states_by_layer.keys())}"
+        )
+
+    parts = [np.asarray(hidden_states_by_layer[int(layer)], dtype=np.float32) for layer in requested]
+    if len(parts) == 1:
+        return parts[0]
+    return np.concatenate(parts, axis=1)
+
+
 def _cache_key_to_filename(cache_key: Tuple) -> str:
     """Convert a cache key to a filename-safe string using MD5 hash."""
     key_str = json.dumps(cache_key, sort_keys=True, default=str)
@@ -464,6 +524,98 @@ def _build_pubmedqa_balanced_assignments(
     return assignments.astype(np.int32, copy=False)
 
 
+def _build_pubmedqa_wrong_context_assignments(
+    *,
+    num_examples: int,
+    num_models: int,
+    seed: int,
+    right_context_assignments: np.ndarray,
+) -> np.ndarray:
+    """Choose a distinct 'wrong-context model' index per example.
+
+    - For num_models==2: wrong assignment is always the other model.
+    - For num_models>2: uniformly sample from the remaining models.
+    """
+    if num_models < 2:
+        raise ValueError("pubmedqa_wrong_context_routing requires at least 2 models")
+    if num_examples <= 0:
+        return np.empty((0,), dtype=np.int32)
+
+    assignments = np.asarray(right_context_assignments, dtype=np.int32)
+    if assignments.shape != (num_examples,):
+        raise ValueError("right_context_assignments must be 1D and match num_examples")
+    if np.any(assignments < 0) or np.any(assignments >= num_models):
+        raise ValueError("right_context_assignments contains out-of-range model indices")
+
+    if num_models == 2:
+        return (1 - assignments).astype(np.int32, copy=False)
+
+    rng = np.random.RandomState(int(seed))
+    wrong = np.empty((num_examples,), dtype=np.int32)
+    for i in range(num_examples):
+        right_idx = int(assignments[i])
+        # Sample from [0..num_models-2] then shift to skip right_idx.
+        r = int(rng.randint(0, num_models - 1))
+        wrong[i] = r if r < right_idx else r + 1
+    return wrong.astype(np.int32, copy=False)
+
+
+def _build_pubmedqa_wrong_context_example_indices(
+    *,
+    num_examples: int,
+    seed: int,
+) -> np.ndarray:
+    """Choose an alternate example index per example to source wrong context from."""
+    if num_examples <= 0:
+        return np.empty((0,), dtype=np.int32)
+    if num_examples == 1:
+        # Degenerate: no other example exists; fall back to self.
+        return np.zeros((1,), dtype=np.int32)
+
+    rng = np.random.RandomState(int(seed))
+    out = np.empty((num_examples,), dtype=np.int32)
+    for i in range(num_examples):
+        # Sample from [0..num_examples-2], then shift to skip i.
+        r = int(rng.randint(0, num_examples - 1))
+        out[i] = r if r < i else r + 1
+    return out.astype(np.int32, copy=False)
+
+
+def _build_pubmedqa_wrong_context_example_indices_by_model(
+    *,
+    num_examples: int,
+    num_models: int,
+    seed: int,
+) -> np.ndarray:
+    """Choose wrong-context source rows per example *and* per model.
+
+    For each example i, we pick a random permutation of candidate source rows
+    (all rows except i). Each model m is assigned a (cyclic) choice from that
+    permutation so different models tend to receive different wrong contexts.
+
+    Returns shape [num_examples, num_models].
+    """
+    if num_models <= 0:
+        raise ValueError(f"num_models must be positive, got {num_models}")
+    if num_examples <= 0:
+        return np.empty((0, num_models), dtype=np.int32)
+    if num_examples == 1:
+        return np.zeros((1, num_models), dtype=np.int32)
+
+    rng = np.random.RandomState(int(seed))
+    out = np.empty((num_examples, num_models), dtype=np.int32)
+    for i in range(num_examples):
+        candidates = np.arange(num_examples, dtype=np.int32)
+        candidates = candidates[candidates != i]
+        perm = rng.permutation(candidates)
+        # Randomly rotate the permutation per example so model indices don't always map
+        # to the same candidate position across examples.
+        shift = int(rng.randint(0, len(perm)))
+        for m in range(num_models):
+            out[i, m] = int(perm[(m + shift) % len(perm)])
+    return out.astype(np.int32, copy=False)
+
+
 def assign_pubmedqa_context_model(
     dataset: Dataset,
     model_paths: Sequence[str],
@@ -488,6 +640,13 @@ def assign_pubmedqa_context_model(
     num_models = len(paths)
 
     normalized_seed: Optional[int] = None if random_seed is None else int(random_seed)
+    # Persist dataset_index so any later deterministic "rebuild" logic can exactly
+    # mirror the seed construction used during assignment.
+    if dataset_index is not None:
+        try:
+            dataset.pubmedqa_context_dataset_index = int(dataset_index)
+        except Exception:
+            pass
 
     assignment_attr = f"{dataset_type}_context_assignment_by_example"
     counts_attr = f"{dataset_type}_context_assignment_counts"
@@ -529,6 +688,71 @@ def assign_pubmedqa_context_model(
     setattr(dataset, hash_attr, assignment_hash)
     setattr(dataset, run_seed_attr, normalized_seed)
 
+    # Optional: assign an additional model per example to receive "wrong context" prompts.
+    wrong_context_enabled = bool(
+        dataset_type == "pubmedqa" and bool(getattr(dataset, "pubmedqa_wrong_context_routing", False))
+    )
+    wrong_context_all_others = bool(
+        dataset_type == "pubmedqa" and bool(getattr(dataset, "pubmedqa_wrong_context_all_others", False))
+    )
+    wrong_assignment_hash = None
+    wrong_counts: Optional[List[int]] = None
+    if wrong_context_enabled:
+        if not wrong_context_all_others:
+            wrong_seed_components = [
+                f"{dataset_type}_wrong_context_model",
+                str(_get_dataset_signature(dataset)),
+                "||".join(paths),
+            ]
+            if dataset_index is not None:
+                wrong_seed_components.append(f"dataset_index={int(dataset_index)}")
+            wrong_seed_input = "::".join(wrong_seed_components)
+            wrong_seed = int(hashlib.md5(wrong_seed_input.encode("utf-8")).hexdigest()[:8], 16)
+            wrong_assignments = _build_pubmedqa_wrong_context_assignments(
+                num_examples=num_examples,
+                num_models=num_models,
+                seed=wrong_seed,
+                right_context_assignments=assignments,
+            )
+            wrong_assignment_hash = hashlib.md5(wrong_assignments.tobytes()).hexdigest()[:12]
+            wrong_counts = np.bincount(wrong_assignments, minlength=num_models).astype(np.int32).tolist()
+
+            dataset.pubmedqa_wrong_context_assignment_by_example = wrong_assignments.tolist()
+            dataset.pubmedqa_wrong_context_assignment_counts = wrong_counts
+            dataset.pubmedqa_wrong_context_assignment_hash = wrong_assignment_hash
+        else:
+            # Still produce a stable hash for cache-keying even though we don't use a per-model
+            # wrong-context assignment.
+            wrong_assignment_hash = "all_others"
+            wrong_counts = None
+
+        # Also choose, per example, which *other* example to pull context from.
+        example_seed_components = [
+            f"{dataset_type}_wrong_context_source_row",
+            str(_get_dataset_signature(dataset)),
+        ]
+        if dataset_index is not None:
+            example_seed_components.append(f"dataset_index={int(dataset_index)}")
+        example_seed_input = "::".join(example_seed_components)
+        example_seed = int(hashlib.md5(example_seed_input.encode("utf-8")).hexdigest()[:8], 16)
+        if wrong_context_all_others:
+            by_model = _build_pubmedqa_wrong_context_example_indices_by_model(
+                num_examples=num_examples,
+                num_models=num_models,
+                seed=example_seed,
+            )
+            dataset.pubmedqa_wrong_context_source_example_by_example_by_model = by_model.tolist()
+            dataset.pubmedqa_wrong_context_source_hash_by_model = [
+                hashlib.md5(by_model[:, m].tobytes()).hexdigest()[:12] for m in range(num_models)
+            ]
+        else:
+            source_indices = _build_pubmedqa_wrong_context_example_indices(
+                num_examples=num_examples,
+                seed=example_seed,
+            )
+            dataset.pubmedqa_wrong_context_source_example_by_example = source_indices.tolist()
+            dataset.pubmedqa_wrong_context_source_hash = hashlib.md5(source_indices.tobytes()).hexdigest()[:12]
+
     # Preserve existing PubMedQA fields for backwards compatibility.
     if dataset_type == "pubmedqa":
         dataset.pubmedqa_context_model_index = None
@@ -540,7 +764,63 @@ def assign_pubmedqa_context_model(
         "num_examples": int(num_examples),
         "model_context_counts": context_counts,
         "routing_seed": normalized_seed,
+        "wrong_context_enabled": bool(wrong_context_enabled),
+        "wrong_assignment_hash": wrong_assignment_hash,
+        "wrong_context_counts": wrong_counts,
     }
+
+
+def _ensure_pubmedqa_wrong_context_sources_materialized(dataset: Dataset, *, num_models: int) -> None:
+    """
+    Ensure PubMedQA wrong-context source indices + hashes exist on the dataset object.
+
+    This is required for stable `prompt_variant` values (and therefore stable disk-cache keys)
+    when `pubmedqa_wrong_context_all_others` is enabled.
+    """
+    if not bool(getattr(dataset, "pubmedqa_wrong_context_routing", False)):
+        return
+    if not bool(getattr(dataset, "pubmedqa_wrong_context_all_others", False)):
+        # In the non-all-others mode, prompt_variant uses wrong_context_assignment_hash only.
+        return
+
+    n = len(getattr(dataset, "x", []) or [])
+    if n <= 0:
+        return
+
+    existing = getattr(dataset, "pubmedqa_wrong_context_source_example_by_example_by_model", None)
+    hashes = getattr(dataset, "pubmedqa_wrong_context_source_hash_by_model", None)
+    if (
+        isinstance(existing, list)
+        and len(existing) == n
+        and all(isinstance(row, list) and len(row) >= num_models for row in existing)
+        and isinstance(hashes, list)
+        and len(hashes) >= num_models
+        and all(isinstance(h, str) and h for h in hashes[:num_models])
+    ):
+        return
+
+    dataset_index = getattr(dataset, "pubmedqa_context_dataset_index", None)
+    seed_components = [
+        "pubmedqa_wrong_context_source_row",
+        str(_get_dataset_signature(dataset)),
+    ]
+    if dataset_index is not None:
+        try:
+            seed_components.append(f"dataset_index={int(dataset_index)}")
+        except Exception:
+            pass
+    seed_input = "::".join(seed_components)
+    seed = int(hashlib.md5(seed_input.encode("utf-8")).hexdigest()[:8], 16)
+
+    by_model = _build_pubmedqa_wrong_context_example_indices_by_model(
+        num_examples=n,
+        num_models=int(num_models),
+        seed=seed,
+    )
+    dataset.pubmedqa_wrong_context_source_example_by_example_by_model = by_model.tolist()
+    dataset.pubmedqa_wrong_context_source_hash_by_model = [
+        hashlib.md5(by_model[:, m].tobytes()).hexdigest()[:12] for m in range(int(num_models))
+    ]
 
 
 def assign_pubmedqa_context_models(
@@ -599,6 +879,21 @@ def get_model_prompt_variant(
         setattr(dataset, f"{dataset_type}_context_assignment_hash", assignment_hash)
 
     if dataset_type == "pubmedqa":
+        wrong_hash = getattr(dataset, "pubmedqa_wrong_context_assignment_hash", None)
+        all_others = bool(getattr(dataset, "pubmedqa_wrong_context_all_others", False))
+        if all_others:
+            # Ensure the per-model wrong-context source hashes exist so prompt_variant is stable.
+            counts = getattr(dataset, "pubmedqa_context_assignment_counts", None)
+            num_models = int(len(counts)) if isinstance(counts, list) and len(counts) > 0 else int(model_index) + 1
+            _ensure_pubmedqa_wrong_context_sources_materialized(dataset, num_models=num_models)
+            source_hashes = getattr(dataset, "pubmedqa_wrong_context_source_hash_by_model", None)
+            if isinstance(source_hashes, list) and model_index < len(source_hashes):
+                source_hash = source_hashes[model_index]
+                if isinstance(source_hash, str) and source_hash:
+                    return f"balanced_random_context_all_wrong_m{model_index}_{assignment_hash}_{source_hash}"
+            return f"balanced_random_context_all_wrong_m{model_index}_{assignment_hash}"
+        if isinstance(wrong_hash, str) and wrong_hash:
+            return f"balanced_random_context_wrong_m{model_index}_{assignment_hash}_{wrong_hash}"
         return f"balanced_random_context_m{model_index}_{assignment_hash}"
     return f"article_random_context_m{model_index}_{assignment_hash}"
 
@@ -633,12 +928,197 @@ def get_model_specific_prompts(
                     f"assignments={len(assignments)}, prompts={len(with_context_prompts)}"
                 )
 
+            # Optional PubMedQA-only behavior: one model gets correct context, one model gets wrong context,
+            # remaining models get the without-context prompt.
+            if dataset_type == "pubmedqa" and bool(getattr(dataset, "pubmedqa_wrong_context_routing", False)):
+                all_others = bool(getattr(dataset, "pubmedqa_wrong_context_all_others", False))
+                if all_others:
+                    wrong_by_model = getattr(dataset, "pubmedqa_wrong_context_x_by_model", None)
+                    if not isinstance(wrong_by_model, list):
+                        wrong_by_model = []
+                    while len(wrong_by_model) <= model_index:
+                        wrong_by_model.append(None)
+                    if not isinstance(wrong_by_model[model_index], list) or len(wrong_by_model[model_index]) != len(assignments):
+                        wrong_by_model[model_index] = _build_pubmedqa_wrong_context_prompts(
+                            dataset, model_index=model_index
+                        )
+                        dataset.pubmedqa_wrong_context_x_by_model = wrong_by_model
+                    wrong_prompts = wrong_by_model[model_index]
+
+                    out: List[str] = []
+                    for idx in range(len(assignments)):
+                        if int(assignments[idx]) == model_index:
+                            out.append(with_context_prompts[idx])
+                        else:
+                            out.append(wrong_prompts[idx])
+                    return out
+
+                wrong_prompts = getattr(dataset, "pubmedqa_wrong_context_x", None)
+                if not isinstance(wrong_prompts, list) or len(wrong_prompts) != len(assignments):
+                    wrong_prompts = _build_pubmedqa_wrong_context_prompts(dataset, model_index=None)
+                    dataset.pubmedqa_wrong_context_x = wrong_prompts
+
+                wrong_assignments = getattr(dataset, "pubmedqa_wrong_context_assignment_by_example", None)
+                if not isinstance(wrong_assignments, list) or len(wrong_assignments) != len(assignments):
+                    raise RuntimeError(
+                        "pubmedqa_wrong_context_routing enabled but wrong-context assignments are missing. "
+                        "Ensure assign_pubmedqa_context_models ran before cache checks/collection."
+                    )
+
+                out: List[str] = []
+                for idx in range(len(assignments)):
+                    if int(assignments[idx]) == model_index:
+                        out.append(with_context_prompts[idx])
+                    elif int(wrong_assignments[idx]) == model_index:
+                        out.append(wrong_prompts[idx])
+                    else:
+                        out.append(without_context_prompts[idx])
+                return out
+
             return [
                 with_context_prompts[idx] if int(assignments[idx]) == model_index else without_context_prompts[idx]
                 for idx in range(len(assignments))
             ]
 
     return dataset.x
+
+
+def _build_pubmedqa_wrong_context_prompts(
+    dataset: Dataset,
+    model_index: Optional[int] = None,
+) -> List[str]:
+    """Render per-example 'wrong context' prompts for PubMedQA.
+
+    Uses the same question/long_answer as the current example, but swaps in the context
+    from a different randomly chosen example.
+    """
+    questions = getattr(dataset, "pubmedqa_questions", None)
+    long_answers = getattr(dataset, "pubmedqa_long_answers", None)
+    contexts = getattr(dataset, "pubmedqa_context_texts", None)
+    template = getattr(dataset, "pubmedqa_prompt_template_with_context", None)
+    if model_index is None:
+        source_rows = getattr(dataset, "pubmedqa_wrong_context_source_example_by_example", None)
+    else:
+        source_rows = getattr(dataset, "pubmedqa_wrong_context_source_example_by_example_by_model", None)
+
+    if not (isinstance(questions, list) and isinstance(long_answers, list) and isinstance(contexts, list)):
+        raise RuntimeError(
+            "PubMedQA wrong-context routing requires dataset to expose pubmedqa_questions, "
+            "pubmedqa_long_answers, and pubmedqa_context_texts. Ensure you are using a standard "
+            "PubMedQA dataset variant that stores these fields."
+        )
+    if not (len(questions) == len(long_answers) == len(contexts)):
+        raise RuntimeError("PubMedQA raw field arrays must have identical lengths")
+
+    n = len(questions)
+    if model_index is None:
+        if not isinstance(source_rows, list) or len(source_rows) != n:
+            # Be robust to dataset transforms or older cached objects that may have dropped
+            # the per-example wrong-context source indices. Rebuild deterministically.
+            seed_components = [
+                "pubmedqa_wrong_context_source_row",
+                str(_get_dataset_signature(dataset)),
+            ]
+            dataset_index = getattr(dataset, "pubmedqa_context_dataset_index", None)
+            if dataset_index is not None:
+                try:
+                    seed_components.append(f"dataset_index={int(dataset_index)}")
+                except Exception:
+                    pass
+            seed_input = "::".join(seed_components)
+            seed = int(hashlib.md5(seed_input.encode("utf-8")).hexdigest()[:8], 16)
+            rebuilt = _build_pubmedqa_wrong_context_example_indices(num_examples=n, seed=seed).tolist()
+            dataset.pubmedqa_wrong_context_source_example_by_example = rebuilt
+            source_rows = rebuilt
+    else:
+        if (
+            not isinstance(source_rows, list)
+            or len(source_rows) != n
+            or not all(isinstance(row, list) and len(row) > model_index for row in source_rows)
+        ):
+            # Be robust to older cached dataset objects that don't yet have per-model
+            # wrong-context indices (e.g. after enabling pubmedqa_wrong_context_all_others).
+            # IMPORTANT: this rebuild must use the *same seed construction* as the
+            # initial assignment in `assign_pubmedqa_context_model`, otherwise the
+            # derived per-model source hashes (used in prompt_variant -> cache keys)
+            # can drift across runs even when the user changes nothing.
+            counts = getattr(dataset, "pubmedqa_context_assignment_counts", None)
+            if isinstance(counts, list) and len(counts) > 0:
+                num_models = int(len(counts))
+            else:
+                assignments = getattr(dataset, "pubmedqa_context_assignment_by_example", None)
+                if isinstance(assignments, list) and assignments:
+                    num_models = int(max(int(a) for a in assignments) + 1)
+                else:
+                    num_models = int(model_index) + 1
+
+            seed_components = [
+                "pubmedqa_wrong_context_source_row",
+                str(_get_dataset_signature(dataset)),
+            ]
+            seed_input = "::".join(seed_components)
+            seed = int(hashlib.md5(seed_input.encode("utf-8")).hexdigest()[:8], 16)
+
+            rebuilt = _build_pubmedqa_wrong_context_example_indices_by_model(
+                num_examples=n,
+                num_models=num_models,
+                seed=seed,
+            ).tolist()
+            dataset.pubmedqa_wrong_context_source_example_by_example_by_model = rebuilt
+            dataset.pubmedqa_wrong_context_source_hash_by_model = [
+                hashlib.md5(np.asarray([row[m] for row in rebuilt], dtype=np.int32).tobytes()).hexdigest()[:12]
+                for m in range(num_models)
+            ]
+            source_rows = rebuilt
+
+    rendered: List[str] = []
+    for i in range(n):
+        src_idx = int(source_rows[i][model_index]) if model_index is not None else int(source_rows[i])
+        if src_idx < 0 or src_idx >= n:
+            raise RuntimeError("Wrong-context source index out of range")
+
+        question = str(questions[i])
+        long_answer = str(long_answers[i])
+        wrong_context = str(contexts[src_idx])
+
+        # Best-effort rendering: prefer the original prompt template if available.
+        if isinstance(template, str) and template.strip():
+            try:
+                rendered.append(
+                    template.format(
+                        question=question,
+                        context=wrong_context,
+                        long_answer=long_answer,
+                        text=question,
+                        answer=long_answer,
+                    )
+                )
+                continue
+            except KeyError:
+                # Fall back to default builder below.
+                pass
+
+        # Default fallback matches the built-in PubMedQA prompt.
+        rendered.append(
+            _build_pubmedqa_prompt_fallback(
+                question=question,
+                long_answer=long_answer,
+                context_text=wrong_context,
+            )
+        )
+
+    return rendered
+
+
+def _build_pubmedqa_prompt_fallback(question: str, long_answer: str, context_text: str) -> str:
+    """Local fallback prompt builder matching wagering.core.dataset defaults."""
+    return (
+        f"Question:\n{question}\n"
+        f"Context:\n{context_text}\n"
+        f"Long Answer:\n{long_answer}\n"
+        "Is the long answer provided correct or incorrect? "
+        "Answer with YES or NO. Answer:"
+    )
 
 
 def get_concatenated_router_prompts(
@@ -813,12 +1293,36 @@ def get_cached_logits_and_hidden_states_for_model(
             if "hidden_states_pickle" in data:
                 hidden_states = pickle.loads(data["hidden_states_pickle"].item())
 
+            hidden_states_by_layer: Optional[Dict[int, np.ndarray]] = None
+            if "hidden_states_by_layer_pickle" in data:
+                raw = pickle.loads(data["hidden_states_by_layer_pickle"].item())
+                if isinstance(raw, dict):
+                    parsed: Dict[int, np.ndarray] = {}
+                    for k, v in raw.items():
+                        try:
+                            kk = int(k)
+                        except Exception:
+                            continue
+                        if v is None:
+                            continue
+                        arr = np.asarray(v, dtype=np.float32)
+                        if arr.ndim != 2:
+                            continue
+                        parsed[kk] = arr
+                    hidden_states_by_layer = parsed
+
             try:
-                hidden_states = extract_hidden_state_features(
-                    hidden_states,
-                    hidden_state_layers,
-                    cached_requested_hidden_state_layers=cached_requested_hidden_state_layers,
-                )
+                if hidden_states_by_layer is not None:
+                    hidden_states = _extract_hidden_state_features_from_layer_map(
+                        hidden_states_by_layer,
+                        hidden_state_layers,
+                    )
+                else:
+                    hidden_states = extract_hidden_state_features(
+                        hidden_states,
+                        hidden_state_layers,
+                        cached_requested_hidden_state_layers=cached_requested_hidden_state_layers,
+                    )
             except RuntimeError as layer_err:
                 log.debug(
                     "Cache layer mismatch for model %s (prompt_variant=%s): %s",
@@ -911,6 +1415,7 @@ def set_cached_logits_and_hidden_states_for_model(
     
     # Load existing cache entry if present
     existing_data = {}
+    existing_hidden_states_by_layer: Dict[int, np.ndarray] = {}
     if cache_path.exists():
         try:
             existing = np.load(cache_path, allow_pickle=True)
@@ -922,6 +1427,20 @@ def set_cached_logits_and_hidden_states_for_model(
                 existing_data["hidden_states"] = pickle.loads(existing["hidden_states_pickle"].item())
             if "labels" in existing:
                 existing_data["labels"] = existing["labels"]
+            if "hidden_states_by_layer_pickle" in existing:
+                raw = pickle.loads(existing["hidden_states_by_layer_pickle"].item())
+                if isinstance(raw, dict):
+                    for k, v in raw.items():
+                        try:
+                            kk = int(k)
+                        except Exception:
+                            continue
+                        if v is None:
+                            continue
+                        arr = np.asarray(v, dtype=np.float32)
+                        if arr.ndim != 2:
+                            continue
+                        existing_hidden_states_by_layer[kk] = arr
         except Exception as e:
             log.warning(f"Corrupted cache at {cache_path}: {e}. Deleting and rebuilding.")
             try:
@@ -929,6 +1448,7 @@ def set_cached_logits_and_hidden_states_for_model(
             except Exception as delete_err:
                 log.warning(f"Failed to delete corrupted cache file {cache_path}: {delete_err}")
             existing_data = {}
+            existing_hidden_states_by_layer = {}
 
     row_map = getattr(dataset, "cache_source_row_indices", None)
     n_src = int(getattr(dataset, "cache_source_num_examples", 0) or 0)
@@ -1010,13 +1530,34 @@ def set_cached_logits_and_hidden_states_for_model(
             save_dict["logits"] = cache_dict["logits"].astype(np.float32) if isinstance(cache_dict["logits"], np.ndarray) else cache_dict["logits"]
         if "labels" in cache_dict and cache_dict["labels"] is not None:
             save_dict["labels"] = cache_dict["labels"].astype(np.int32) if isinstance(cache_dict["labels"], np.ndarray) else cache_dict["labels"]
+        normalized_requested_layers = _normalize_hidden_state_layers(hidden_state_layers)
+
+        # Incremental hidden-state caching: store per-layer arrays so different layer
+        # requests (e.g., calibration [-1] vs wagering [-12]) can coexist.
+        hidden_states_by_layer: Dict[int, np.ndarray] = dict(existing_hidden_states_by_layer)
+        if (
+            "hidden_states" in cache_dict
+            and isinstance(cache_dict["hidden_states"], np.ndarray)
+            and cache_dict["hidden_states"] is not None
+            and normalized_requested_layers is not None
+        ):
+            hs = np.asarray(cache_dict["hidden_states"], dtype=np.float32)
+            if hs.ndim == 3 and hs.shape[1] == len(normalized_requested_layers):
+                for pos, layer_id in enumerate(normalized_requested_layers):
+                    hidden_states_by_layer[int(layer_id)] = hs[:, pos, :].astype(np.float32, copy=False)
+            elif hs.ndim == 2 and len(normalized_requested_layers) == 1:
+                hidden_states_by_layer[int(normalized_requested_layers[0])] = hs.astype(np.float32, copy=False)
+
+        if hidden_states_by_layer:
+            save_dict["hidden_states_by_layer_pickle"] = np.void(pickle.dumps(hidden_states_by_layer))
+
+        # Keep legacy fields for backward compatibility / inspection.
         if "hidden_states" in cache_dict and cache_dict["hidden_states"] is not None:
             # Handle different data types for hidden_states
             if isinstance(cache_dict["hidden_states"], list):
                 save_dict["hidden_states_pickle"] = np.void(pickle.dumps(cache_dict["hidden_states"]))
             else:
                 save_dict["hidden_states"] = cache_dict["hidden_states"].astype(np.float32) if isinstance(cache_dict["hidden_states"], np.ndarray) else cache_dict["hidden_states"]
-        normalized_requested_layers = _normalize_hidden_state_layers(hidden_state_layers)
         if normalized_requested_layers is not None:
             save_dict["requested_hidden_state_layers"] = np.asarray(normalized_requested_layers, dtype=np.int32)
         
@@ -1236,6 +1777,8 @@ def collect_option_logits_and_hidden_states_for_model(
     model_index: int = 0,
     hidden_state_layers: Optional[Sequence[int]] = None,
     collect_hidden_states: bool = True,
+    model_prompts: Optional[List[str]] = None,
+    prompt_variant: Optional[str] = None,
 ) -> Tuple[np.ndarray, Optional[np.ndarray], np.ndarray]:
     """
     Collect per-option log-probabilities AND hidden states for a model in a single forward pass.
@@ -1254,8 +1797,10 @@ def collect_option_logits_and_hidden_states_for_model(
     model_device = model.device()
     model_path = str(model_identifier) if model_identifier is not None else str(model.model_path)
 
-    model_prompts = get_model_specific_prompts(dataset, model_index=model_index)
-    prompt_variant = get_model_prompt_variant(dataset, model_index=model_index)
+    if model_prompts is None:
+        model_prompts = get_model_specific_prompts(dataset, model_index=model_index)
+    if prompt_variant is None:
+        prompt_variant = get_model_prompt_variant(dataset, model_index=model_index)
 
     if len(model_prompts) != len(dataset.y):
         raise ValueError(
@@ -1312,16 +1857,31 @@ def collect_option_logits_and_hidden_states_for_model(
         # Extract hidden states when requested.
         if collect_hidden_states and hasattr(generation, 'hidden_states') and generation.hidden_states is not None:
             try:
-                if len(generation.hidden_states) > 1:
-                    selected_step_hidden = generation.hidden_states[1]
-                else:
-                    selected_step_hidden = generation.hidden_states[0]
+                # Different HF model implementations populate `generation.hidden_states`
+                # differently across steps. Some steps may only include a subset of
+                # layers, so choose the step that exposes the *most* layers to keep
+                # `hidden_state_layers` selection strict and meaningful.
+                steps = list(generation.hidden_states)
+                if len(steps) == 0:
+                    raise ValueError("Model returned empty generation.hidden_states")
+
+                def _layer_count(step_obj: object) -> int:
+                    if isinstance(step_obj, tuple):
+                        # Many models include an embedding slot; count transformer layers only.
+                        return max(0, len(step_obj) - 1)
+                    return 0
+
+                best_step_idx = max(range(len(steps)), key=lambda i: _layer_count(steps[i]))
+                selected_step_hidden = steps[best_step_idx]
 
                 if isinstance(selected_step_hidden, tuple):
                     # Exclude embedding slot; keep only requested transformer layers.
                     transformer_hidden_states = selected_step_hidden[1:] if len(selected_step_hidden) > 1 else selected_step_hidden
                     if len(transformer_hidden_states) == 0:
-                        raise ValueError("Model returned an empty transformer hidden-state tuple")
+                        raise ValueError(
+                            "Model returned an empty transformer hidden-state tuple "
+                            f"(selected_step={best_step_idx}, tuple_len={len(selected_step_hidden)})"
+                        )
 
                     if selected_layer_indices is None:
                         selected_layer_indices = _resolve_transformer_layer_indices(
